@@ -39,6 +39,8 @@ node bin/cao.mjs performance report --run demo
 
 权限、认证、陈旧 nonce、越界修改、未完成/未知子任务、检查失败和不明确的控制器状态都会需要处理。监督器不会批准权限、重试实现、切换提供商、新建任务、清除 hold、提交或推送。缺少可信进展会要求诊断，不会仅因终端安静就判断进程已停止。
 
+Herdr `blocked` 等待会把 `lastError` 记为 `permission_required` 或 `worker_blocked`。先 `inspect --output`，只对已检查的对话框发 `cao input`，再 `resume`。pane 离开 `blocked` 后，collect 会恢复 `running`。监督 attention 使用该错误码；旧的 `:failed` attention key 不迁移。提供商满载记在 `providerObservation`，不替换 `lastError`；monitor waiting 不是 CAO retry。`inspect.retryAdvice` 说明 worktree 越界要换新任务，还是 checkout 可以 retry。
+
 ## 可选任务截止时间
 
 任务 JSON 可添加 UTC 绝对时间 `deadlineAt`，例如 `"2030-01-02T03:04:05.000Z"`，请换成实际截止时间。重试沿用同一 deadline，不重新计算预算；省略则保持旧行为。

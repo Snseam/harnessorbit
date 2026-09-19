@@ -24,8 +24,14 @@ Codex Agent Orchestrator（**CAO**）是本地运行、零运行依赖的 Node.j
 请为我的 Codex 安装官方 Codex Agent Orchestrator（CAO）技能：
 https://github.com/Snseam/codex-agent-orchestrator
 
-先查找并复用本机已有的 CAO 仓库；没有的话，克隆到目标项目之外一个未被占用、可以长期保留的目录。保留已有文件和未提交改动。
-阅读仓库的 README.md 和 skills/cao/SKILL.md，检查 Node.js 22.13+ 以及 CLI 帮助，然后执行：
+按下面顺序 stat 恰好这一条路径来定位已有 CAO 仓库。不要列出父目录。不要遍历 ~/.codex/sessions。不要打开 jsonl 或 sqlite。路径不存在就试下一条。全部没有时，克隆到目标项目之外一个未被占用、可以长期保留的目录。保留已有文件和未提交改动。
+
+1. 本对话 handoff 里已有的 CAO wrapper / checkout 绝对路径（若有）
+2. $CODEX_HOME/skills/cao（仅当 CODEX_HOME 已设置）
+3. ~/.codex/skills/cao
+4. ~/.agents/skills/cao
+
+命中后 realpath 解析 symlink 得到 checkout，然后只执行：
 node <仓库绝对路径>/bin/cao.mjs skill install
 node <仓库绝对路径>/bin/cao.mjs skill status
 node <仓库绝对路径>/bin/cao.mjs doctor
@@ -56,13 +62,13 @@ Codex 会报告技能安装位置与就绪情况。技能通过链接指向你�
 
 后续每项开发任务无需再调用 CAO。Codex 会读取当前对话的偏好并驱动 CAO 工作流；普通问答和方案讨论不会启动 worker。只启用、没有开发任务时，仅检查就绪情况。
 
-| 你想做什么 | 在当前对话中发送 |
-| --- | --- |
-| 查看进度 | “显示当前 CAO 模式、run、任务状态和阻塞原因。” |
+| 你想做什么     | 在当前对话中发送                                     |
+| -------------- | ---------------------------------------------------- |
+| 查看进度       | “显示当前 CAO 模式、run、任务状态和阻塞原因。”       |
 | 更换执行 Agent | “后续 CAO 任务使用我已经配置好的 Pi，先检查兼容性。” |
-| 单次直接开发 | “仅这项任务直接开发，不使用 CAO。” |
-| 关闭默认方式 | “当前对话停止默认使用 CAO。” |
-| 再次启用 | 再调用一次 CAO。 |
+| 单次直接开发   | “仅这项任务直接开发，不使用 CAO。”                   |
+| 关闭默认方式   | “当前对话停止默认使用 CAO。”                         |
+| 再次启用       | 再调用一次 CAO。                                     |
 
 每个对话分别保存启用状态。安装技能不会把全部对话一起启用，也不会创建后台调度器。若要换个对话继续已有任务，请提供原项目、状态目录和 run ID，让 Codex 先检查原有运行记录。
 
@@ -244,12 +250,12 @@ node bin/cao.mjs monitor start --open
 
 ## Agent 支持
 
-| Agent | 任务字段值 | 当前验证情况 |
-| --- | --- | --- |
-| Claude Code | `claude` | 本机真实流程与受控失败修复已验证；profiled 本地 relay 已用模拟 Anthropic API 检查 |
-| Pi | `pi` | 隔离的 Kimi `k3` 自适应 Herdr 流程已通过独立验收、集成和清理；其他配置仍待验证 |
-| OpenCode | `opencode` | 已实现启动与 profiled runtime 适配；真实流程待验证 |
-| Codex CLI | `codex` | 原生 CLI 配置请求已通过模拟 API 验证；完整 Herdr 流程待验证 |
+| Agent       | 任务字段值 | 当前验证情况                                                                      |
+| ----------- | ---------- | --------------------------------------------------------------------------------- |
+| Claude Code | `claude`   | 本机真实流程与受控失败修复已验证；profiled 本地 relay 已用模拟 Anthropic API 检查 |
+| Pi          | `pi`       | 隔离的 Kimi `k3` 自适应 Herdr 流程已通过独立验收、集成和清理；其他配置仍待验证    |
+| OpenCode    | `opencode` | 已实现启动与 profiled runtime 适配；真实流程待验证                                |
+| Codex CLI   | `codex`    | 原生 CLI 配置请求已通过模拟 API 验证；完整 Herdr 流程待验证                       |
 
 继承模式下 `agentArgs` 透传 CLI 启动参数。Profiled task 会拒绝与 profile 管理的模型、provider、session、config 或 worktree 设置冲突的参数；Codex 允许部分 reasoning/verbosity `-c` override。`nativeInstructions` 说明如何使用实际可用的原生工具。`maxChildren` 是报告预算，不是运行时硬限制；自适应 Claude 还会在验收前核对可用的 hook 证据。详见[适配器架构](docs/zh-CN/architecture.md)、[执行配置](docs/zh-CN/execution-profiles.md)和[真实联调边界](docs/zh-CN/adaptive-validation.md)。
 
@@ -288,23 +294,23 @@ npm run smoke -- --live           # 受控失败 → 修复 → 集成
 
 ## 文档
 
-| 资料 | 内容 |
-| --- | --- |
-| [架构与模块](docs/zh-CN/architecture.md) | CLI、状态存储、Herdr 适配、Git 隔离、验证与 profiled execution |
-| [执行配置与路由](docs/zh-CN/execution-profiles.md) | Profile CRUD、secret、CC Switch 导入、路由、gateway 生命周期 |
-| [本地 Agent Monitor](docs/zh-CN/monitor.md) | CAO、Codex、Claude metadata 的只读本地看板 |
-| [任务状态与恢复](docs/zh-CN/states.md) | 结果契约、重试、交互、checkout 与集成阻塞 |
-| [监督与性能记录](docs/zh-CN/supervision.md) | 前台控制器、预检、报告提交、截止时间和耗时证据 |
-| [资源发现与校准](docs/zh-CN/resources.md) | 原生/NVM 安装发现、CC Switch Pi 配置、隔离探针和缓存 |
-| [任务交接与 shadow 调度](docs/zh-CN/shadow-routing.md) | 建议选择、对话偏好与证据边界 |
-| [显式自适应派发](docs/zh-CN/adaptive-dispatch.md) | 实际资源选择、attempt 配置绑定和原生子代理验收证据 |
-| [配对基准评估](docs/zh-CN/benchmark-evaluation.md) | 预先登记试验、完整分母、配对结果与默认上线限制 |
-| [自适应真实联调](docs/zh-CN/adaptive-validation.md) | 已验证的 Claude/Pi 流程、隔离、实际故障与覆盖边界 |
-| [当前 Codex 的 host 任务](docs/zh-CN/host-work.md) | 不启动外部会话，登记、提交并独立验收原位修改 |
-| [Token 用量报告](docs/zh-CN/usage.md) | 可选 Tokscale 集成、JSON 形状与归属边界 |
-| [CAO Codex 技能](docs/zh-CN/codex-skill.md) | 复制指令安装、`/CAO` 启用、对话偏好和更新 |
-| [更新日志](CHANGELOG.md) | 版本变化 |
-| [English documentation](README.md) | 英文概览与快速开始 |
+| 资料                                                   | 内容                                                           |
+| ------------------------------------------------------ | -------------------------------------------------------------- |
+| [架构与模块](docs/zh-CN/architecture.md)               | CLI、状态存储、Herdr 适配、Git 隔离、验证与 profiled execution |
+| [执行配置与路由](docs/zh-CN/execution-profiles.md)     | Profile CRUD、secret、CC Switch 导入、路由、gateway 生命周期   |
+| [本地 Agent Monitor](docs/zh-CN/monitor.md)            | CAO、Codex、Claude metadata 的只读本地看板                     |
+| [任务状态与恢复](docs/zh-CN/states.md)                 | 结果契约、重试、交互、checkout 与集成阻塞                      |
+| [监督与性能记录](docs/zh-CN/supervision.md)            | 前台控制器、预检、报告提交、截止时间和耗时证据                 |
+| [资源发现与校准](docs/zh-CN/resources.md)              | 原生/NVM 安装发现、CC Switch Pi 配置、隔离探针和缓存           |
+| [任务交接与 shadow 调度](docs/zh-CN/shadow-routing.md) | 建议选择、对话偏好与证据边界                                   |
+| [显式自适应派发](docs/zh-CN/adaptive-dispatch.md)      | 实际资源选择、attempt 配置绑定和原生子代理验收证据             |
+| [配对基准评估](docs/zh-CN/benchmark-evaluation.md)     | 预先登记试验、完整分母、配对结果与默认上线限制                 |
+| [自适应真实联调](docs/zh-CN/adaptive-validation.md)    | 已验证的 Claude/Pi 流程、隔离、实际故障与覆盖边界              |
+| [当前 Codex 的 host 任务](docs/zh-CN/host-work.md)     | 不启动外部会话，登记、提交并独立验收原位修改                   |
+| [Token 用量报告](docs/zh-CN/usage.md)                  | 可选 Tokscale 集成、JSON 形状与归属边界                        |
+| [CAO Codex 技能](docs/zh-CN/codex-skill.md)            | 复制指令安装、`/CAO` 启用、对话偏好和更新                      |
+| [更新日志](CHANGELOG.md)                               | 版本变化                                                       |
+| [English documentation](README.md)                     | 英文概览与快速开始                                             |
 
 ## 贡献与支持
 

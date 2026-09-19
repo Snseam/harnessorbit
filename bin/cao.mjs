@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -402,7 +403,18 @@ export async function main(argv = process.argv.slice(2)) {
         try { const r = await runCommand([name === 'tokscale' ? process.env.CAO_TOKSCALE_BIN || name : name, '--version'], { timeoutMs: 10000 }); tools[name] = { available: r.code === 0, version: r.stdout.trim() || r.stderr.trim() }; }
         catch (error) { tools[name] = { available: false, error: error.code || 'error' }; }
       }
-      return { tools, capabilities, tokenUsage: { backend: 'tokscale', optional: true, testedVersion: '4.16.0' }, note: 'Native child reporting is a contract, not verified telemetry or a hard concurrency limit.' };
+      let hasCompletedOnboarding = null;
+      try {
+        const raw = JSON.parse(await fs.readFile(path.join(os.homedir(), '.claude.json'), 'utf8'));
+        hasCompletedOnboarding = raw?.hasCompletedOnboarding === true;
+      } catch {
+        hasCompletedOnboarding = null;
+      }
+      return {
+        tools, capabilities, tokenUsage: { backend: 'tokscale', optional: true, testedVersion: '4.16.0' },
+        claudeOnboarding: { hasCompletedOnboarding, advisory: true },
+        note: 'Native child reporting is a contract, not verified telemetry or a hard concurrency limit. claudeOnboarding is advisory and does not gate dispatch.',
+      };
     }
   }
 }

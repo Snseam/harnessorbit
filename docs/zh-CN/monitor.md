@@ -4,7 +4,7 @@
 
 Agent Monitor 是本地只读状态页，用来查看 CAO 任务及其关联的 Codex/Claude 原生 children。它适合检查并行工作：哪些 CAO attempt 正在运行、等待、accepted 或 rework；哪些 Codex subagent thread 与 coordinator 有关联；哪些 Claude subagent 通过 CAO 管理的 hook 或本地 metadata 被观察到。
 
-它不是控制面。页面不执行命令、不发送输入、不取消任务、不停止 agent、不读取终端输出、不显示 prompt、不显示 tool input、不显示 tool output，也不显示模型回复。停止 monitor 只会停止 monitor web server。
+它不是控制面。页面不执行命令、不发送输入、不取消任务、不停止 agent、不读取终端输出、不显示 prompt、不显示 tool input、不显示 tool output，也不显示模型回复。停止 monitor 只会停止 monitor web server。失败 attempt 的原因码可能以有界的 `performance.lastErrorCode` 出现；`herdr-server.log` 仍是 Herdr stdio。等待文案可能带有 `Provider saturated · not a CAO retry`，这不是 retry 指令。
 
 ## 快速开始
 
@@ -60,17 +60,17 @@ node bin/cao.mjs monitor snapshot \
 
 Scope 参数：
 
-| 参数 | 含义 |
-| --- | --- |
-| 省略 | 使用当前工作目录的 Git root 作为 `--project`。 |
-| `--project PATH` | 显示一个项目，路径会解析为 real path。 |
-| `--run ID` | 显示一个 CAO run 及其关联的原生 children。该 run 必须存在于同一个 state directory。 |
-| `--all` | 显式显示所有可读 CAO runs 和范围内原生 metadata。它与 `--project`、`--run` 互斥。 |
-| `--coordinator ID` | 当环境变量无法识别旧的或跨目录 Codex coordinator thread 时，显式关联它。不带 `--run` 时，CAO 也会读取 `CODEX_THREAD_ID` 或 `CODEX_SESSION_ID`。 |
-| `--codex-home PATH` | 要检查的 Codex 配置/数据根。默认 `CODEX_HOME` 或 `~/.codex`。 |
-| `--claude-home PATH` | 要检查的 Claude 配置/数据根。默认 `CLAUDE_CONFIG_DIR` 或 `~/.claude`。 |
-| `--id NAME` | Monitor server 名称。默认 `default`；不同 scope 可用不同 id。 |
-| `--port N` | 本地端口。`0` 表示让系统分配空闲端口。 |
+| 参数                 | 含义                                                                                                                                            |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| 省略                 | 使用当前工作目录的 Git root 作为 `--project`。                                                                                                  |
+| `--project PATH`     | 显示一个项目，路径会解析为 real path。                                                                                                          |
+| `--run ID`           | 显示一个 CAO run 及其关联的原生 children。该 run 必须存在于同一个 state directory。                                                             |
+| `--all`              | 显式显示所有可读 CAO runs 和范围内原生 metadata。它与 `--project`、`--run` 互斥。                                                               |
+| `--coordinator ID`   | 当环境变量无法识别旧的或跨目录 Codex coordinator thread 时，显式关联它。不带 `--run` 时，CAO 也会读取 `CODEX_THREAD_ID` 或 `CODEX_SESSION_ID`。 |
+| `--codex-home PATH`  | 要检查的 Codex 配置/数据根。默认 `CODEX_HOME` 或 `~/.codex`。                                                                                   |
+| `--claude-home PATH` | 要检查的 Claude 配置/数据根。默认 `CLAUDE_CONFIG_DIR` 或 `~/.claude`。                                                                          |
+| `--id NAME`          | Monitor server 名称。默认 `default`；不同 scope 可用不同 id。                                                                                   |
+| `--port N`           | 本地端口。`0` 表示让系统分配空闲端口。                                                                                                          |
 
 monitor 命令和要观察的 CAO runs 必须使用同一个 `--state-dir`。在一个 state directory 创建的 run，对另一个 state directory 启动的 monitor 不可见。
 
@@ -133,16 +133,16 @@ Monitor snapshot 可能在 `nodes.tokens` 和规范化 `tokenUsage` 字段中包
 
 CAO delivery 和原生 runtime state 是不同信号。
 
-| 信号 | 含义 |
-| --- | --- |
-| `accepted` / `integrated` delivery | CAO 独立验收通过该 attempt，或集成完成。 |
+| 信号                                   | 含义                                                                   |
+| -------------------------------------- | ---------------------------------------------------------------------- |
+| `accepted` / `integrated` delivery     | CAO 独立验收通过该 attempt，或集成完成。                               |
 | 原生 `finished`、`completed` 或 `idle` | 原生 runtime 或 subagent 看起来结束一轮或空闲。这不是 CAO acceptance。 |
-| `submitted` delivery | CAO 已收集 result JSON，等待 verify。 |
-| `rework` delivery | CAO 验证拒绝候选，任务等待 retry/rework。 |
-| `running` | CAO 或原生 metadata 表示正在运行。 |
-| `waiting` | agent 可能需要输入，或任务需要 rework/retry。 |
-| `unknown` | CAO 无法安全判断 live 状态。 |
-| `stale` | 观察结果过旧，或来自 fallback 而不是 live source。 |
+| `submitted` delivery                   | CAO 已收集 result JSON，等待 verify。                                  |
+| `rework` delivery                      | CAO 验证拒绝候选，任务等待 retry/rework。                              |
+| `running`                              | CAO 或原生 metadata 表示正在运行。                                     |
+| `waiting`                              | agent 可能需要输入，或任务需要 rework/retry。                          |
+| `unknown`                              | CAO 无法安全判断 live 状态。                                           |
+| `stale`                                | 观察结果过旧，或来自 fallback 而不是 live source。                     |
 
 每个节点都有 source 和 confidence。`live` 表示 CAO 能观察当前 runtime 或 hook stream；`observed` 表示本地 metadata 或 CAO 记录显示某个状态，但不一定 live；`unknown` 表示 source 无法证明当前状态。stale flag 可与任何 source 同时出现。
 

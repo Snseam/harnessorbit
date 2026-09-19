@@ -20,6 +20,16 @@ const taskStatus = status => {
   return 'running';
 };
 
+function waitingLabel(attempt) {
+  const base = attempt.status === 'rework'
+    ? 'rework'
+    : attempt.status === 'needs_input' && attempt.lastObservedState === 'blocked'
+      ? 'needs_input · blocked'
+      : attempt.status;
+  if (attempt.providerObservation?.code) return `Provider saturated · not a CAO retry · ${base}`;
+  return base;
+}
+
 async function readRuns(root, { project, runId, limit = 200 }) {
   let entries;
   try { entries = await fs.readdir(path.join(root, 'runs'), { withFileTypes: true }); }
@@ -50,7 +60,8 @@ function taskNode(run, task, attempt, now) {
     label: `${task.definition.id} · ${attempt.number || 1}`, role: task.definition.role || 'implementer',
     model: attempt.execution?.model || null, projectId: run.project, runId: run.id, taskId: task.definition.id,
     attemptId: attempt.id, nativeSessionId: attempt.nativeSession?.id || attempt.telemetry?.nativeSessionId || null,
-    status: taskStatus(attempt.status), statusLabel: attempt.status,
+    status: taskStatus(attempt.status),
+    statusLabel: ['needs_input', 'rework'].includes(attempt.status) ? waitingLabel(attempt) : attempt.status,
     performance: attempt.performance ? publicPerformance(attempt, { now: new Date(now).toISOString(), taskId: task.definition.id }) : null,
     delivery: ['submitted', 'accepted', 'integrated', 'rework'].includes(attempt.status) ? attempt.status : null,
     startedAt: attempt.createdAt, updatedAt: run.updatedAt,
@@ -187,7 +198,7 @@ export class MonitorCollector {
           if (!same) { entry.node.status = 'unknown'; entry.node.statusLabel = 'Runtime unavailable'; entry.node.stale = true; continue; }
           entry.node.confidence = 'live';
           if (entry.attempt.status === 'uncertain') { entry.node.status = 'unknown'; entry.node.statusLabel = 'Task delivery uncertain'; continue; }
-          if (agent.agent_status === 'blocked') { entry.node.status = 'waiting'; entry.node.statusLabel = 'Awaiting input'; }
+          if (agent.agent_status === 'blocked') { entry.node.status = 'waiting'; entry.node.statusLabel = waitingLabel(entry.attempt); }
           else if (['idle', 'done'].includes(agent.agent_status)) { entry.node.status = 'idle'; entry.node.statusLabel = 'Idle · not yet accepted'; }
           else { entry.node.status = 'running'; entry.node.statusLabel = 'Running'; }
         }

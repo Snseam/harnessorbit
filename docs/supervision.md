@@ -39,6 +39,8 @@ Without `--integrate`, accepted worktree patches stay ready for review. Checkout
 
 Permission prompts, authentication, stale nonces, scope violations, unknown/running children, failed checks, and ambiguous controller state require attention. Supervision does not approve prompts, retry implementation, change providers, create new tasks, clear holds, commit, or push. Lack of confirmed progress triggers attention rather than guessing that a silent process has stopped.
 
+A Herdr `blocked` wait records `lastError` as `permission_required` or `worker_blocked`. Inspect with `inspect --output`, send `cao input` only for that inspected dialog, then `resume`. After the pane leaves `blocked`, collect restores `running`. Supervisor attention uses that error code; leftover `:failed` attention keys are not migrated. Provider saturation is recorded as `providerObservation` and does not replace `lastError`; monitor waiting is not a CAO retry. `inspect.retryAdvice` tells whether a scope violation needs a new worktree task or a checkout retry.
+
 ## Optional task deadline
 
 Set `deadlineAt` to an absolute UTC timestamp in task JSON, for example `"2030-01-02T03:04:05.000Z"` (replace with your actual deadline). It is preserved across attempts, preventing retries from resetting the task's budget. Omit it to retain legacy behavior.

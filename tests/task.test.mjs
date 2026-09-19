@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { OrchestratorError } from '../src/errors.mjs';
-import { outsideScope, pathAllowed, scopesOverlap, taskDigest, validateTask } from '../src/task.mjs';
+import { outsideScope, pathAllowed, scopesOverlap, taskDigest, validateTask, assessScope, retryAdvice } from '../src/task.mjs';
 
 function validTask(overrides = {}) {
   return {
@@ -141,6 +141,42 @@ test('outsideScope returns sorted paths outside allowed paths', () => {
     outsideScope(['src/task.mjs', 'tests/task.test.mjs', 'docs/readme.md'], ['src/task.mjs', 'tests/']),
     ['docs/readme.md'],
   );
+});
+
+test('assessScope flags missing directory slashes without a file-count cap', () => {
+  const files = {
+    'src/task.mjs': { hash: 'a', mode: '100644', type: 'file' },
+    'tests/task.test.mjs': { hash: 'b', mode: '100644', type: 'file' },
+    '.claude/worktrees/bug-audit': { hash: 'c', mode: '160000', type: 'gitlink' },
+  };
+  assert.deepEqual(assessScope(['src'], files), {
+    root: false,
+    ambiguousDirectories: ['src'],
+    matchedFiles: 0,
+    sample: [],
+  });
+  const legal = assessScope(['src/', 'tests/'], files);
+  assert.equal(legal.root, false);
+  assert.deepEqual(legal.ambiguousDirectories, []);
+  assert.equal(legal.matchedFiles, 2);
+  assert.deepEqual(legal.sample, ['src/task.mjs', 'tests/task.test.mjs']);
+  assert.deepEqual(assessScope(['.'], files).root, true);
+  assert.deepEqual(assessScope(['.'], files).ambiguousDirectories, []);
+  assert.deepEqual(assessScope(['.claude/worktrees/bug-audit'], files).ambiguousDirectories, []);
+});
+
+test('retryAdvice stays a sibling of attempt and does not widen worktree leftovers', () => {
+  assert.deepEqual(
+    retryAdvice({ isolation: 'worktree' }, { status: 'needs_input', lastError: { code: 'scope_violation' }, outsideScope: ['unexpected.txt'] }),
+    { action: 'dispatch_new_task', reason: 'scope_violation' },
+  );
+  assert.deepEqual(
+    retryAdvice({ isolation: 'checkout' }, { status: 'needs_input', outsideScope: ['unexpected.txt'], executorKind: 'host' }),
+    { action: 'retry_with_feedback', reason: 'scope_violation' },
+  );
+  assert.deepEqual(retryAdvice({ isolation: 'worktree' }, { status: 'rework', number: 1 }), { action: 'retry_with_feedback', reason: 'rework' });
+  assert.deepEqual(retryAdvice({ isolation: 'worktree' }, { status: 'rework', number: 2 }), { action: 'revise_or_split', reason: 'rework' });
+  assert.equal(retryAdvice({ isolation: 'worktree' }, { status: 'running' }), null);
 });
 
 test('taskDigest is deterministic for normalized task input', () => {

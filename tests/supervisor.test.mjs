@@ -359,6 +359,20 @@ test('a blocked sibling does not prevent normal sibling progress', async (t) => 
   assert.equal(JSON.stringify(result).includes('secret'), false);
 });
 
+test('failed HOLD attention is keyed by lastError code', async (t) => {
+  const { root, runId } = await makeRun(t, {
+    [taskId]: task('failed', {
+      lastError: { code: 'unsupported_submodule', message: 'secret git details', details: { token: 'secret' } },
+      paneId: null,
+    }),
+  });
+  const result = await new Supervisor({ orchestrator: new FakeOrchestrator(root), now }).step(runId);
+  const event = result.events.find((item) => item.type === 'supervisor.attention' && item.reason === 'unsupported_submodule');
+  assert.ok(event);
+  assert.equal(event.key, `${taskId}:${taskId}-a1:unsupported_submodule`);
+  assert.equal(JSON.stringify(result).includes('secret'), false);
+});
+
 test('same attention is emitted once across repeated supervisor calls', async (t) => {
   const { root, runId } = await makeRun(t, {
     [taskId]: task('needs_input', {

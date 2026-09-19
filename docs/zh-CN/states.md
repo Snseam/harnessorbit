@@ -34,25 +34,25 @@ integration_failed/integration_cancelled -> recover -> integrating -> integrated
 
 状态含义：
 
-| 状态 | 含义 |
-| --- | --- |
-| `preparing` | attempt 已预留，正在准备目录、worktree 或 checkout。 |
-| `launching` | Herdr workspace/pane 已创建，正在启动 agent。 |
-| `ready` | agent 已就绪，尚未发送任务。 |
-| `sending` | CAO 已声明将发送 prompt；失败后进入 `uncertain`，不能盲目重发。 |
-| `running` | prompt 已交给 agent，等待 result JSON。 |
-| `uncertain` | 提交或观察失败，可能已经送达；用 `resume`/`collect` 对账。 |
-| `needs_input` | agent 阻塞、result 要求输入、child 未完成、unresolved 非空、越界修改或 result 无效。 |
-| `submitted` | 已收集有效候选，可进入 `verify`。 |
-| `verifying` | worker 已关闭，正在运行 checks。 |
-| `accepted` | checks 通过；worktree 任务已有已验 patch。 |
-| `rework` | 验证失败，可 `retry`。 |
-| `integrating` | 正在把已验 patch 应用到目标项目并复验。 |
-| `integrated` | patch 已应用，目标项目复验通过。 |
+| 状态                 | 含义                                                                                                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `preparing`          | attempt 已预留，正在准备目录、worktree 或 checkout。                                                                                                                      |
+| `launching`          | Herdr workspace/pane 已创建，正在启动 agent。                                                                                                                             |
+| `ready`              | agent 已就绪，尚未发送任务。                                                                                                                                              |
+| `sending`            | CAO 已声明将发送 prompt；失败后进入 `uncertain`，不能盲目重发。                                                                                                           |
+| `running`            | prompt 已交给 agent，等待 result JSON。                                                                                                                                   |
+| `uncertain`          | 提交或观察失败，可能已经送达；用 `resume`/`collect` 对账。                                                                                                                |
+| `needs_input`        | agent 阻塞、result 要求输入、child 未完成、unresolved 非空、越界修改或 result 无效。                                                                                      |
+| `submitted`          | 已收集有效候选，可进入 `verify`。                                                                                                                                         |
+| `verifying`          | worker 已关闭，正在运行 checks。                                                                                                                                          |
+| `accepted`           | checks 通过；worktree 任务已有已验 patch。                                                                                                                                |
+| `rework`             | 验证失败，可 `retry`。                                                                                                                                                    |
+| `integrating`        | 正在把已验 patch 应用到目标项目并复验。                                                                                                                                   |
+| `integrated`         | patch 已应用，目标项目复验通过。                                                                                                                                          |
 | `integration_failed` | patch 应用失败或应用后复验失败。若 patch 已经成功 apply，改动会保留在目标项目中，供人工检查/修复；此 hold 会阻止同项目新 dispatch 和其他 integration，直到 recover 成功。 |
-| `cancelled` | 已取消。 |
-| `interrupted` | worker 缺失、CLI 中断或启动流程无法安全恢复。 |
-| `failed` | 启动或流程失败且没有可继续的 worker。 |
+| `cancelled`          | 已取消。                                                                                                                                                                  |
+| `interrupted`        | worker 缺失、CLI 中断或启动流程无法安全恢复。                                                                                                                             |
+| `failed`             | 启动或流程失败且没有可继续的 worker。原因码在 `inspect` 的 `lastError` 和 `attempt.state.errorCode` 上；`herdr-server.log` 是 Herdr stdio，不是该原因。                   |
 
 ## 隔离模式
 
@@ -75,9 +75,13 @@ worker 直接写目标项目 checkout。CAO 会在相同 stateRoot 下加项目�
 `allowedPaths` 用于收集后的验收判断，不是进程沙箱。agent 仍以本机用户权限运行。CAO 的保护点是：
 
 - 任务路径必须是相对路径或目录前缀，不允许 glob、绝对路径、反斜杠、路径穿越和 `.git`。
+- 目录前缀必须以 `/` 结尾；没有尾斜杠的路径是精确文件。当快照里已有该路径下的文件时，preflight、dispatch 和 host start 会以 `directory_scope_missing_slash` 失败。`src/` 和 `.` 仍然合法，没有文件数上限。
 - `collect` 比较候选快照，发现 tracked/unignored 文件超出 `allowedPaths` 会进入 `needs_input`。
 - `verify` 拒绝带越界修改的候选。
 - 未追踪且被 Git 忽略的文件不在快照、changedPaths 或 patch 中，因此不会被 `integrate` 覆盖。
+- `inspect.retryAdvice` 是 `attempt` 的兄弟字段，不写入 attempt。worktree 的 `scope_violation` 为 `dispatch_new_task`；checkout/host 为 `retry_with_feedback`；`rework` 为 `retry_with_feedback`；后续 rework（`number >= 2`）为 `revise_or_split`。
+- worktree 在 `outsideScope` 之后 `retry` 会抛 `scope_retry_forbidden`。checkout/host 在 cancel 之后仍可 retry，以便清 `checkoutHold`。`recover` 对残留编辑继续 fail-closed。
+- 提供商满载记在 `attempt.providerObservation.code`，不是 `lastError`，也不授权 `retry`。`retry` 仍只在 `rework`、`failed`、`interrupted`、`cancelled` 合法。
 
 ## Result contract
 
@@ -92,7 +96,11 @@ agent 必须最后写入 attempt 的 `result.json`。字段必须匹配 prompt �
   "summary": "完成了 add 实现修复。",
   "changedFiles": ["src/math.mjs"],
   "checks": [
-    { "name": "node tests", "status": "passed", "command": "node --test tests/math.test.mjs" }
+    {
+      "name": "node tests",
+      "status": "passed",
+      "command": "node --test tests/math.test.mjs"
+    }
   ],
   "children": [],
   "unresolved": []

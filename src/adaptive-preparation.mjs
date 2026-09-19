@@ -6,7 +6,7 @@ const POLICIES = new Set(['off', 'on-demand']);
 const MAX_PROBE_BUDGET_MS = 60000;
 const DEFAULT_PROBE_BUDGET_MS = 30000;
 const PREPARABLE_REASONS = new Set(['call_verification_not_verified', 'call_verification_stale']);
-const PREFLIGHT_BLOCKING_CODES = new Set(['run_closed', 'dependency_not_ready', 'dependency_not_integrated', 'capacity_exceeded', 'checkout_busy', 'integration_recovery_required', 'deadline_exceeded', 'unsupported_submodule', 'execution_required', 'route_unavailable']);
+const PREFLIGHT_BLOCKING_CODES = new Set(['run_closed', 'dependency_not_ready', 'dependency_not_integrated', 'capacity_exceeded', 'checkout_busy', 'integration_recovery_required', 'deadline_exceeded', 'unsupported_submodule', 'execution_required', 'route_unavailable', 'directory_scope_missing_slash']);
 
 function nowMs(now) {
   const value = typeof now === 'function' ? now() : now;

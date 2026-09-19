@@ -66,6 +66,42 @@ test('reported running children and out-of-scope changes block submission', asyn
   assert.deepEqual(result.attempt.outsideScope, ['unexpected.txt']);
 });
 
+test('missing directory slash fails before reserving an attempt', async t => {
+  const { service, run } = await setup(t);
+  await assert.rejects(service.preflight(run.id, task({ allowedPaths: ['src'] })), e => {
+    assert.equal(e.code, 'directory_scope_missing_slash');
+    assert.equal(e.details.scope.root, false);
+    assert.deepEqual(e.details.scope.ambiguousDirectories, ['src']);
+    return true;
+  });
+  await assert.rejects(service.dispatch(run.id, task({ allowedPaths: ['src'] })), e => e.code === 'directory_scope_missing_slash');
+  assert.equal((await service.status(run.id)).tasks.length, 0);
+  const ready = await service.preflight(run.id, task({ allowedPaths: ['src/'] }));
+  assert.equal(ready.authentication, 'not_checked');
+  assert.equal(ready.modelCall, false);
+  assert.equal(ready.scope.root, false);
+});
+
+test('worktree scope leftovers cannot retry while checkout retry remains legal', async t => {
+  const worktree = await setup(t, new FakeHerdr(async p => { const d = await writeResult(p); await fs.writeFile(path.join(d.cwd, 'unexpected.txt'), 'outside'); }));
+  await worktree.service.dispatch(worktree.run.id, task());
+  const blocked = await worktree.service.collect(worktree.run.id, task().id);
+  assert.equal(blocked.attempt.status, 'needs_input');
+  assert.deepEqual(blocked.retryAdvice, { action: 'dispatch_new_task', reason: 'scope_violation' });
+  assert.equal((await worktree.service.cancel(worktree.run.id, task().id)).attempt.status, 'cancelled');
+  await assert.rejects(worktree.service.retry(worktree.run.id, task().id), e => e.code === 'scope_retry_forbidden');
+  assert.equal((await worktree.service.inspect(worktree.run.id, task().id)).attempt.status, 'cancelled');
+
+  const checkout = await setup(t, new FakeHerdr(async p => { const d = await writeResult(p); await fs.writeFile(path.join(d.cwd, 'unexpected.txt'), 'outside'); }));
+  await checkout.service.dispatch(checkout.run.id, task({ isolation: 'checkout' }));
+  const checkoutBlocked = await checkout.service.collect(checkout.run.id, task().id);
+  assert.deepEqual(checkoutBlocked.retryAdvice, { action: 'retry_with_feedback', reason: 'scope_violation' });
+  assert.equal((await checkout.service.cancel(checkout.run.id, task().id)).attempt.status, 'cancelled');
+  const retried = await checkout.service.retry(checkout.run.id, task().id);
+  assert.notEqual(retried.attempt.id, checkoutBlocked.attempt.id);
+  assert.equal(retried.attempt.status, 'running');
+});
+
 test('failed verification starts a distinct retry preserving partial work', async t => {
   let calls = 0;
   const { service, run } = await setup(t, new FakeHerdr(p => writeResult(p, { fix: ++calls > 1 })));

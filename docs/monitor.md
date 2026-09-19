@@ -4,7 +4,7 @@
 
 Agent Monitor is a local, read-only status page for CAO tasks and related native Codex/Claude children. It is meant for checking parallel work: which CAO attempts are running, waiting, accepted, or held for rework; which Codex subagent threads are related to a coordinator; and which Claude subagents were observed through CAO-managed hooks or local metadata.
 
-It is not a control plane. The page does not execute commands, send input, cancel tasks, stop agents, read terminal output, show prompts, show tool inputs, show tool output, or show model replies. Stopping the monitor stops only the monitor web server.
+It is not a control plane. The page does not execute commands, send input, cancel tasks, stop agents, read terminal output, show prompts, show tool inputs, show tool output, or show model replies. Stopping the monitor stops only the monitor web server. Failed-attempt reason codes may appear as bounded `performance.lastErrorCode`; `herdr-server.log` remains Herdr stdio. Waiting labels may include `Provider saturated · not a CAO retry`; that is not a retry instruction.
 
 ## Quick start
 
@@ -60,17 +60,17 @@ node bin/cao.mjs monitor snapshot \
 
 Scope options:
 
-| Option | Meaning |
-| --- | --- |
-| omitted | Use the current working directory's Git root as `--project`. |
-| `--project PATH` | Show one project. The path is resolved to its real path. |
-| `--run ID` | Show one CAO run and its linked native children. The run must exist in the same state directory. |
-| `--all` | Explicitly show all readable CAO runs and native metadata in scope. It is mutually exclusive with `--project` and `--run`. |
-| `--coordinator ID` | Explicitly associate a known Codex coordinator and its native descendant tree, including cross-directory work. Use only a thread that belongs to this project. Without `--run`, environment thread IDs are also discovered, but clearly foreign project children are excluded unless a CAO run records the association. |
-| `--codex-home PATH` | Codex configuration/data root to inspect. Defaults to `CODEX_HOME` or `~/.codex`. |
-| `--claude-home PATH` | Claude configuration/data root to inspect. Defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`. |
-| `--id NAME` | Monitor server name. Defaults to `default`; use another id for another scope. |
-| `--port N` | Local port. `0` asks the OS for a free port. |
+| Option               | Meaning                                                                                                                                                                                                                                                                                                                 |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| omitted              | Use the current working directory's Git root as `--project`.                                                                                                                                                                                                                                                            |
+| `--project PATH`     | Show one project. The path is resolved to its real path.                                                                                                                                                                                                                                                                |
+| `--run ID`           | Show one CAO run and its linked native children. The run must exist in the same state directory.                                                                                                                                                                                                                        |
+| `--all`              | Explicitly show all readable CAO runs and native metadata in scope. It is mutually exclusive with `--project` and `--run`.                                                                                                                                                                                              |
+| `--coordinator ID`   | Explicitly associate a known Codex coordinator and its native descendant tree, including cross-directory work. Use only a thread that belongs to this project. Without `--run`, environment thread IDs are also discovered, but clearly foreign project children are excluded unless a CAO run records the association. |
+| `--codex-home PATH`  | Codex configuration/data root to inspect. Defaults to `CODEX_HOME` or `~/.codex`.                                                                                                                                                                                                                                       |
+| `--claude-home PATH` | Claude configuration/data root to inspect. Defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`.                                                                                                                                                                                                                              |
+| `--id NAME`          | Monitor server name. Defaults to `default`; use another id for another scope.                                                                                                                                                                                                                                           |
+| `--port N`           | Local port. `0` asks the OS for a free port.                                                                                                                                                                                                                                                                            |
 
 Use the same `--state-dir` for monitor commands and CAO runs you want to observe. A run created in one state directory is invisible to a monitor started with another state directory.
 
@@ -133,16 +133,16 @@ These numbers are local usage metadata. They are not subscription balance, provi
 
 CAO delivery and native runtime state are different signals.
 
-| Signal | Meaning |
-| --- | --- |
-| `accepted` / `integrated` delivery | CAO independent verification accepted the attempt, or integration completed. |
+| Signal                                    | Meaning                                                                                               |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `accepted` / `integrated` delivery        | CAO independent verification accepted the attempt, or integration completed.                          |
 | native `finished`, `completed`, or `idle` | The native runtime or subagent appears to have ended a turn or gone idle. This is not CAO acceptance. |
-| `submitted` delivery | CAO collected a result JSON and the attempt is waiting for verification. |
-| `rework` delivery | CAO verification rejected the candidate and the task is waiting for retry/rework. |
-| `running` | CAO or native metadata indicates active work. |
-| `waiting` | The agent likely needs input or a rework/retry action. |
-| `unknown` | CAO cannot safely determine the live status. |
-| `stale` | The observation is old or came from a fallback source rather than a live source. |
+| `submitted` delivery                      | CAO collected a result JSON and the attempt is waiting for verification.                              |
+| `rework` delivery                         | CAO verification rejected the candidate and the task is waiting for retry/rework.                     |
+| `running`                                 | CAO or native metadata indicates active work.                                                         |
+| `waiting`                                 | The agent likely needs input or a rework/retry action.                                                |
+| `unknown`                                 | CAO cannot safely determine the live status.                                                          |
+| `stale`                                   | The observation is old or came from a fallback source rather than a live source.                      |
 
 Each node includes a source and confidence. `live` means CAO could observe the current runtime or hook stream. `observed` means local metadata or CAO records indicate a state, but it may not be live. `unknown` means the source could not prove the current state. A stale flag can appear with any source when the data is no longer fresh.
 

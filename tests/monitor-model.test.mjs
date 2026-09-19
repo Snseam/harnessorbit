@@ -43,6 +43,17 @@ test('monitor timings expose bounded counters without forwarding task evidence',
   assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE/);
 });
 
+test('monitor timings copy bounded lastErrorCode from evidence and drop private details', () => {
+  const snapshot = publicSnapshot({ scope: {}, projects: [], sources: [], nodes: [{ id: 'n', performance: {
+    phase: 'finished',
+    evidence: { lastErrorCode: 'unsupported_submodule', message: 'PRIVATE', details: { token: 'PRIVATE' } },
+    lastError: { code: 'unsupported_submodule', message: 'PRIVATE' },
+  } }] }, now);
+  assert.equal(snapshot.nodes[0].performance.lastErrorCode, 'unsupported_submodule');
+  assert.equal(Object.hasOwn(snapshot.nodes[0].performance, 'evidence'), false);
+  assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE/);
+});
+
 test('publicSnapshot falls back invalid enum and scalar values to safe public values', () => {
   const snapshot = publicSnapshot({
     scope: { all: true, project: null, runId: null }, projects: [], sources: [{ id: 'weird', status: 'bogus', label: null, detail: null }],

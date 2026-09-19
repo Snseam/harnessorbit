@@ -4,6 +4,8 @@
 
 Use the [copyable installation request](../README.md#start-in-codex) to let Codex install CAO. Then activate **CAO** in each new or existing local conversation where you want this development workflow.
 
+The paste stats four exact paths (handoff wrapper, `$CODEX_HOME/skills/cao` when set, `~/.codex/skills/cao`, `~/.agents/skills/cao`) and does not list parent directories or walk `~/.codex/sessions`. After activation, locate CAO from the loaded skill directory plus `--paths`; do not treat those install paths as SKILL locate targets.
+
 ## Install once
 
 ```bash

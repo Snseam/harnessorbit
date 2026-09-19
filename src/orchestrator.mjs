@@ -4,7 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { OrchestratorError, invariant } from './errors.mjs';
 import * as state from './state.mjs';
-import { validateTask, taskDigest, outsideScope } from './task.mjs';
+import { validateTask, taskDigest, outsideScope, assessScope, retryAdvice } from './task.mjs';
 import * as git from './git.mjs';
 import { Herdr } from './runtime/herdr.mjs';
 import { runCommand } from './process.mjs';
@@ -21,6 +21,8 @@ import { startHostTask, reportHostTask, releaseHostTask, assertHostOwner } from 
 import { ResourceService } from './resources/index.mjs';
 import { checkNativeChildren } from './native-children.mjs';
 import { recordTaskEvidence } from './resources/task-evidence.mjs';
+import { blockedWaitLastError, shouldClearBlockedWait } from './blocked-output.mjs';
+import { providerObservationFromText } from './provider-observation.mjs';
 
 const time = () => new Date().toISOString();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -30,6 +32,11 @@ const checkoutHold = t => t.definition.isolation === 'checkout' && !['accepted',
 const stopped = a => a.executorKind === 'host' ? Boolean(a.hostStoppedEvidence) : a.workerClosed;
 const missing = error => ['agent_not_found', 'agent_not_running', 'pane_not_found'].includes(error.code);
 const serializeError = e => ({ code: e.code || 'error', message: e.message, details: e.details || {} });
+const boundedEventErrorCode = (code) => {
+  if (typeof code !== 'string' || !code) return null;
+  const bounded = code.replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 80);
+  return bounded || null;
+};
 const current = record => record.attempts.find(a => a.id === record.currentAttempt);
 const inside = (parent, child) => child === parent || child.startsWith(parent + path.sep);
 const hashFile = async file => crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex');
@@ -154,9 +161,13 @@ export class Orchestrator {
       const attempt = current(task);
       const before = attempt.status;
       await change(attempt, task, run);
-      if (before !== attempt.status) await state.appendEvent(this.root, runId, {
-        type: 'attempt.state', taskId, attemptId, from: before, to: attempt.status,
-      });
+      if (before !== attempt.status) {
+        const errorCode = boundedEventErrorCode(attempt.lastError?.code);
+        await state.appendEvent(this.root, runId, {
+          type: 'attempt.state', taskId, attemptId, from: before, to: attempt.status,
+          ...(errorCode ? { errorCode } : {}),
+        });
+      }
       return structuredClone(attempt);
     });
   }
@@ -182,6 +193,7 @@ export class Orchestrator {
         invariant((current(record).executorKind || 'external') === executorKind, 'executor_conflict', 'Retry must use the original execution path.');
         invariant(executorKind === 'host' ? stopped(current(record)) : (current(record).workerClosed || !current(record).paneId), 'worker_not_stopped', 'The previous worker must be confirmed stopped before retrying.');
         if (executorKind === 'host') invariant(current(record).ownerThreadId === ownerThreadId, 'host_owner_mismatch', 'Host task belongs to another conversation.');
+        invariant(!(definition.isolation === 'worktree' && current(record).outsideScope?.length), 'scope_retry_forbidden', 'A worktree attempt changed files outside allowedPaths. Cancel it and dispatch a new task id; retry would reuse leftover files.');
       }
       for (const dependency of definition.dependsOn) {
         const predecessor = Object.hasOwn(run.tasks, dependency) ? run.tasks[dependency] : null;
@@ -239,6 +251,7 @@ export class Orchestrator {
 
   async dispatch(runId, input, { routeDecision = null } = {}) {
     const task = validateTask(input);
+    await this._assertDirectoryScope((await this._loadRun(runId)).project, task);
     const reserved = await this._reserve(runId, task, '', false, { routeDecision });
     if (reserved.duplicate) return { duplicate: true, ...(await this.inspect(runId, task.id)) };
     await this._launch(reserved);
@@ -578,11 +591,19 @@ export class Orchestrator {
   async inspect(runId, taskId, { output = false } = {}) {
     const { run, task, attempt } = await this._attempt(runId, taskId);
     const result = { runId, task: task.definition, attempt, stateDirectory: state.runPath(this.root, runId) };
+    const advice = retryAdvice(task.definition, attempt);
+    if (advice) result.retryAdvice = advice;
     if (output && attempt.paneId && !attempt.workerClosed) {
       try { result.output = await this.herdr.readAgent(run.herdrSession, attempt.workerName); }
       catch (error) { result.outputError = serializeError(error); }
     }
     return result;
+  }
+
+  async _assertDirectoryScope(project, task) {
+    const scope = assessScope(task.allowedPaths, (await git.snapshot(project)).files);
+    invariant(!scope.ambiguousDirectories.length, 'directory_scope_missing_slash', 'Directory scopes must end with a trailing slash so files under them stay in scope. Use `dir/` or list exact files.', { scope: { root: scope.root, ambiguousDirectories: scope.ambiguousDirectories, sample: scope.sample } });
+    return scope;
   }
 
   async status(runId) {
@@ -682,10 +703,20 @@ export class Orchestrator {
       }
       await this._update(runId, taskId, attempt.id, a => { a.observedAt = time(); a.lastObservedState = live.agent_status || 'unknown'; });
       if (live.agent_status === 'blocked') {
-        await this._update(runId, taskId, attempt.id, a => { if (!a.cancelRequested) a.status = 'needs_input'; a.lastObservedState = 'blocked'; });
+        let output = '';
+        try { output = await this.herdr.readAgent(run.herdrSession, attempt.workerName); }
+        catch { output = ''; }
+        const lastError = blockedWaitLastError(output);
+        const observation = providerObservationFromText(output);
+        await this._update(runId, taskId, attempt.id, a => {
+          if (!a.cancelRequested) a.status = 'needs_input';
+          a.lastObservedState = 'blocked';
+          a.lastError = lastError;
+          if (observation) a.providerObservation = observation;
+        });
         return this.inspect(runId, taskId, { output: true });
       }
-      if (!live.interactive_ready && attempt.status === 'needs_input') {
+      if (shouldClearBlockedWait(attempt, live)) {
         await this._update(runId, taskId, attempt.id, a => { if (!a.cancelRequested) { a.status = 'running'; delete a.lastError; } });
       }
       if (live.interactive_ready && ['idle', 'done'].includes(live.agent_status)) {
@@ -718,9 +749,14 @@ export class Orchestrator {
             return this.inspect(runId, taskId);
           }
           if (Date.now() >= deadline && Date.now() - Date.parse(attempt.submissionStartedAt) >= 5000) {
+            let output = '';
+            try { output = await this.herdr.readAgent(run.herdrSession, attempt.workerName); }
+            catch { output = ''; }
+            const observation = providerObservationFromText(output);
             await this._update(runId, taskId, attempt.id, a => {
               if (!a.cancelRequested) a.status = 'needs_input';
               a.lastError = { code: 'missing_result', message: 'Worker is idle without this attempt’s result file. Inspect output and request a valid report.' };
+              if (observation) a.providerObservation = observation;
             });
             return this.inspect(runId, taskId, { output: true });
           }

@@ -31,6 +31,8 @@ export async function startHostTask(orchestrator, runId, input, { thread, retry 
   const definition = validateTask({ ...input, agent: 'codex', isolation: 'checkout' });
   invariant(!definition.agentArgs.length, 'invalid_host_task', 'Host work cannot launch CLI arguments.');
   invariant(!definition.deadlineAt || Date.parse(definition.deadlineAt) > Date.now(), 'deadline_exceeded', 'Host task deadline has passed.');
+  const run = await orchestrator._loadRun(runId);
+  await orchestrator._assertDirectoryScope(run.project, definition);
   const reserved = await orchestrator._reserve(runId, definition, '', retry, { executorKind: 'host', ownerThreadId, routeDecision });
   if (reserved.duplicate) return { ...(await orchestrator.inspect(runId, definition.id)), duplicate: true };
   const { attempt } = reserved;

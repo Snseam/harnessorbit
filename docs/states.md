@@ -32,25 +32,25 @@ accepted -> integrating -> integration_failed
 integration_failed/integration_cancelled -> recover -> integrating -> integrated|integration_failed
 ```
 
-| Status | Meaning |
-| --- | --- |
-| `preparing` | Attempt is reserved; CAO is preparing its directory and isolation. |
-| `launching` | Herdr workspace/pane exists; CAO is starting the agent. |
-| `ready` | Agent is ready; assignment has not yet been sent. |
-| `sending` | CAO has claimed the right to send. If sending fails, the attempt becomes `uncertain`; do not blindly resend. |
-| `running` | Assignment was acknowledged and the worker is expected to write `result.json`. |
-| `uncertain` | Delivery or observation failed; use `resume` / `collect` to reconcile. |
-| `needs_input` | Worker is blocked, result requested input, native children are unresolved, `unresolved` is nonempty, paths are out of scope, or the result is invalid. |
-| `submitted` | CAO collected a valid candidate and it can be verified. |
-| `verifying` | Worker is closed and checks are running. |
-| `accepted` | Checks passed; a worktree task has a verified patch. |
-| `rework` | Verification failed; `retry` can continue in the same candidate cwd. |
-| `integrating` | CAO is applying or rechecking retained checkout state in the target project. |
-| `integrated` | Target checkout contains the change and target checks passed. |
-| `integration_failed` | Patch apply failed, or target recheck failed after apply/recover. Applied changes are retained for inspection or repair, and the project is held. |
-| `cancelled` | Attempt was cancelled. |
-| `interrupted` | Worker or controller disappeared and CAO cannot safely continue automatically. |
-| `failed` | Startup or flow failed without a usable worker. |
+| Status               | Meaning                                                                                                                                                                        |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `preparing`          | Attempt is reserved; CAO is preparing its directory and isolation.                                                                                                             |
+| `launching`          | Herdr workspace/pane exists; CAO is starting the agent.                                                                                                                        |
+| `ready`              | Agent is ready; assignment has not yet been sent.                                                                                                                              |
+| `sending`            | CAO has claimed the right to send. If sending fails, the attempt becomes `uncertain`; do not blindly resend.                                                                   |
+| `running`            | Assignment was acknowledged and the worker is expected to write `result.json`.                                                                                                 |
+| `uncertain`          | Delivery or observation failed; use `resume` / `collect` to reconcile.                                                                                                         |
+| `needs_input`        | Worker is blocked, result requested input, native children are unresolved, `unresolved` is nonempty, paths are out of scope, or the result is invalid.                         |
+| `submitted`          | CAO collected a valid candidate and it can be verified.                                                                                                                        |
+| `verifying`          | Worker is closed and checks are running.                                                                                                                                       |
+| `accepted`           | Checks passed; a worktree task has a verified patch.                                                                                                                           |
+| `rework`             | Verification failed; `retry` can continue in the same candidate cwd.                                                                                                           |
+| `integrating`        | CAO is applying or rechecking retained checkout state in the target project.                                                                                                   |
+| `integrated`         | Target checkout contains the change and target checks passed.                                                                                                                  |
+| `integration_failed` | Patch apply failed, or target recheck failed after apply/recover. Applied changes are retained for inspection or repair, and the project is held.                              |
+| `cancelled`          | Attempt was cancelled.                                                                                                                                                         |
+| `interrupted`        | Worker or controller disappeared and CAO cannot safely continue automatically.                                                                                                 |
+| `failed`             | Startup or flow failed without a usable worker. The reason code is on `inspect` `lastError` and `attempt.state.errorCode`; `herdr-server.log` is Herdr stdio, not that reason. |
 
 ## Isolation modes
 
@@ -77,9 +77,13 @@ This coordination only applies to callers using the same state root. A different
 CAO enforces scope after collection:
 
 - Task paths must be relative paths or directory prefixes; globs, absolute paths, backslashes, traversal, and `.git` are rejected.
+- Directory prefixes must end with `/`. A path without a trailing slash is an exact file. Preflight, dispatch, and host start fail with `directory_scope_missing_slash` when snapshot files exist under a missing-slash directory. `src/` and `.` remain legal; there is no file-count cap.
 - `collect` compares the candidate snapshot with the attempt baseline and puts out-of-scope tracked or untracked/non-ignored changes into `needs_input`.
 - `verify` refuses candidates with scope violations.
 - Untracked ignored files are not in snapshots, `changedPaths`, or patches, so `integrate` will not overwrite them. Tracked files are still tracked by Git and remain part of snapshots even if they match ignore patterns.
+- `inspect.retryAdvice` is a sibling of `attempt`, not stored on it. Worktree `scope_violation` is `dispatch_new_task`; checkout/host `scope_violation` is `retry_with_feedback`; `rework` is `retry_with_feedback`; later rework (`number >= 2`) is `revise_or_split`.
+- Worktree retry after `outsideScope` throws `scope_retry_forbidden`. Checkout and host retry after cancel remain legal so a checkout hold can be cleared. `recover` stays fail-closed for leftover edits.
+- Provider saturation is `attempt.providerObservation.code`, not `lastError`. It does not authorize `retry`. `retry` remains legal only on `rework`, `failed`, `interrupted`, or `cancelled`.
 
 ## Result contract
 
@@ -94,7 +98,11 @@ The worker must write the attempt's `result.json` last. It must match the task i
   "summary": "Fixed add implementation.",
   "changedFiles": ["src/math.mjs"],
   "checks": [
-    { "name": "node tests", "status": "passed", "command": "node --test tests/math.test.mjs" }
+    {
+      "name": "node tests",
+      "status": "passed",
+      "command": "node --test tests/math.test.mjs"
+    }
   ],
   "children": [],
   "unresolved": []

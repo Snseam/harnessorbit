@@ -277,6 +277,39 @@ export function outsideScope(paths, allowedPaths) {
   return normalizeUniqueSorted(paths.filter((relativePath) => !pathAllowed(relativePath, allowedPaths)));
 }
 
+export function assessScope(allowedPaths, snapshotFiles) {
+  const scopes = asScopes(allowedPaths);
+  const keys = Object.keys(snapshotFiles || {});
+  const root = scopes.includes('.');
+  const ambiguousDirectories = normalizeUniqueSorted(
+    scopes.filter((scope) => scope !== '.' && !scope.endsWith('/') && keys.some((key) => key.startsWith(`${scope}/`))),
+  );
+  const matched = keys.filter((key) => pathAllowed(key, scopes)).sort((a, b) => a.localeCompare(b));
+  return {
+    root,
+    ambiguousDirectories,
+    matchedFiles: matched.length,
+    sample: matched.slice(0, 10),
+  };
+}
+
+export function retryAdvice(task, attempt) {
+  if (!attempt) return null;
+  const isolation = task?.isolation ?? task?.definition?.isolation;
+  const scopeViolation = attempt.lastError?.code === 'scope_violation' || Boolean(attempt.outsideScope?.length);
+  if (scopeViolation) {
+    return isolation === 'worktree' && attempt.executorKind !== 'host'
+      ? { action: 'dispatch_new_task', reason: 'scope_violation' }
+      : { action: 'retry_with_feedback', reason: 'scope_violation' };
+  }
+  if (attempt.status === 'rework') {
+    return (attempt.number || 1) >= 2
+      ? { action: 'revise_or_split', reason: 'rework' }
+      : { action: 'retry_with_feedback', reason: 'rework' };
+  }
+  return null;
+}
+
 function stableStringify(value) {
   if (Array.isArray(value)) {
     return `[${value.map(stableStringify).join(',')}]`;
