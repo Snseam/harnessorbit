@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
+  createCommandRunner,
   createRealBenchmarkPlan,
   runRealBenchmark,
 } from '../src/real-benchmark.mjs';
@@ -106,6 +107,17 @@ test('real runner records accepted, failed and timeout rows with raw evidence re
   assert.equal(arms['codex-baseline'].denominator, 1);
   assert.equal(arms['codex-baseline'].byClassification.failed, 1);
   assert.equal(arms['codex-harnessorbit'].byClassification.timeout, 1);
+});
+
+test('command runner applies the per-trial deadline to the child process', async () => {
+  const runner = createCommandRunner({
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 1000)'],
+    appendPrompt: false,
+  });
+  const result = await runner({ task: { prompt: 'ignored' }, cwd: process.cwd(), deadlineMs: 20 });
+  assert.equal(result.outcome, 'timeout');
+  assert.equal(result.timedOut, true);
 });
 
 test('one missing arm remains in the denominator when the other arm records a result', async () => {
