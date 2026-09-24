@@ -47,9 +47,11 @@ function assertPreparationFeasible(run, task) {
 // This controller binds a choice to one attempt. It never reapplies a saved
 // recommendation blindly, and a repeated request never creates another worker.
 export class AdaptiveDispatcher {
-  constructor({ orchestrator, resources, calibrationRunner, calibrationRunnerFactory } = {}) {
+  constructor({ orchestrator, resources, calibrationRunner, calibrationRunnerFactory, decisionProvider = null, decisionMode = 'shadow' } = {}) {
     invariant(orchestrator?.root, 'invalid_adaptive_controller', 'An orchestrator is required.');
     this.orchestrator = orchestrator;
+    this.decisionProvider = decisionProvider;
+    this.decisionMode = decisionMode;
     this.resources = resources || new ResourceService({ root: orchestrator.root });
     this.calibrationRunnerFactory = calibrationRunnerFactory || (() => calibrationRunner || new CalibrationRunner({
       root: this.orchestrator.root,
@@ -62,13 +64,13 @@ export class AdaptiveDispatcher {
 
   async dispatch(runId, input, options = {}) {
     const task = validateTask(input);
-    await this.orchestrator._loadRun(runId);
+    await this.orchestrator.loadRun(runId);
     const thread = options.thread || this.orchestrator.coordinatorId;
     const preparation = normalizePreparationOptions(options);
     const selection = { ...options, ...preparation, thread };
     const requestDigest = requestContract(input, selection);
     return withLock(path.join(runPath(this.orchestrator.root, runId), `adaptive-${task.id}.lock`), async () => {
-      const run = await this.orchestrator._loadRun(runId);
+      const run = await this.orchestrator.loadRun(runId);
       const existing = run.tasks[task.id];
       if (existing) {
         const attempt = existing.attempts.find(a => a.id === existing.currentAttempt);
@@ -77,7 +79,15 @@ export class AdaptiveDispatcher {
       }
       let inventory = await this.resources.discover();
       const history = runHistory(run);
-      let plan = await planAdaptive({ input, inventory, ...selection, hostAvailable: Boolean(thread), history });
+      let plan = await planAdaptive({
+        input,
+        inventory,
+        ...selection,
+        hostAvailable: Boolean(thread),
+        history,
+        decisionProvider: options.decisionProvider || this.decisionProvider,
+        decisionMode: options.decisionMode || this.decisionMode,
+      });
       let preparationEvidence = null;
       if (!plan.decision.selected && preparation.calibrationPolicy === 'on-demand') {
         const prepared = await prepareAdaptiveResources({

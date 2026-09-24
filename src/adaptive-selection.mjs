@@ -1,6 +1,7 @@
 import { OrchestratorError } from './errors.mjs';
 import { explainShadowRoute } from './shadow-routing.mjs';
 import { taskDigest, validateTask } from './task.mjs';
+import { createDecisionRequest, decideWithFallback } from './decision-provider.mjs';
 
 const SCHEMA_VERSION = 1;
 const PREFERENCES = new Set(['balanced', 'fastest', 'subscription-first', 'quality-first']);
@@ -334,6 +335,8 @@ export async function planAdaptive({
   hostAvailable = true,
   history = [],
   now = Date.now(),
+  decisionProvider = null,
+  decisionMode = 'shadow',
 } = {}) {
   if (!PREFERENCES.has(preference)) throw adaptiveError('invalid_adaptive_preference', 'Adaptive selection preference is invalid.', { preference });
   if (fixedExecutorKind !== undefined && !['host', 'external'].includes(fixedExecutorKind)) throw adaptiveError('invalid_adaptive_executor', 'Executor must be host or external.');
@@ -370,6 +373,31 @@ export async function planAdaptive({
   const selectedResource = selectedResourceFromDecision(decision, inventory, hostAvailable);
   const rawResource = findResource(inventory, decision.selected?.resourceId);
   const effectiveTask = effectiveTaskForSelection({ selected: decision.selected, task, input, resource: rawResource, fixedExecutorKind, hostAvailable: hostAvailable === true || typeof hostAvailable === 'string' });
+  let decisionReceipt = null;
+  if (decisionProvider) {
+    const providerRequest = createDecisionRequest({
+      kind: 'adaptive.route',
+      state: {
+        phase: 'selection',
+        risk: task.brief?.risk || 'unknown',
+        taskKind: task.brief?.taskKind || 'unknown',
+        selectedExecutor: decision.selected?.executorKind || null,
+        candidateCount: decision.candidates?.length || 0,
+      },
+      candidates: (decision.candidates || []).map(candidate => ({
+        id: candidate.resourceId || `${candidate.executorKind || 'candidate'}:none`,
+        eligible: candidate.eligible === true,
+        score: candidate.score,
+        kind: candidate.executorKind,
+      })),
+      runId: input.runId,
+      taskId: task.id,
+      mode: decisionMode,
+      lowRisk: task.brief?.risk === 'low',
+      eligibility: { approved: task.brief?.risk === 'low' && decision.applied !== true, reason: 'deterministic-selection-complete' },
+    });
+    decisionReceipt = await decideWithFallback(providerRequest, { provider: decisionProvider, mode: decisionMode });
+  }
 
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -384,6 +412,7 @@ export async function planAdaptive({
       ...clone(decision.evidence),
       activeSelection: true,
       proof: historyAdjusted.proof,
+      decisionProvider: decisionReceipt,
     },
   };
 }

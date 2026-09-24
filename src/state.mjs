@@ -1,8 +1,10 @@
 import { constants as fsConstants } from 'node:fs';
 import { appendFile, mkdir, open, readFile, readdir, rename, rm, unlink } from 'node:fs/promises';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { OrchestratorError } from './errors.mjs';
+import { normalizeRuntimeEvent } from './runtime-contract.mjs';
 
 const ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 
@@ -291,7 +293,13 @@ export async function appendEvent(root, runId, event) {
 
   const directory = runPath(root, runId);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const record = { ...event, timestamp: new Date().toISOString() };
+  let normalized;
+  try {
+    normalized = normalizeRuntimeEvent(event, { runId, eventId: event.eventId || `${runId}:${crypto.randomUUID()}` });
+  } catch (error) {
+    throw stateError('invalid_event', 'Event does not satisfy the runtime contract.', { runId, cause: error.code || 'invalid_event' });
+  }
+  const record = { ...normalized, timestamp: new Date().toISOString() };
   await appendFile(path.join(directory, 'events.jsonl'), `${JSON.stringify(record)}\n`, { mode: 0o600 });
   return record;
 }

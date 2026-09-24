@@ -23,6 +23,9 @@ import { checkNativeChildren } from './native-children.mjs';
 import { recordTaskEvidence } from './resources/task-evidence.mjs';
 import { blockedWaitLastError, shouldClearBlockedWait } from './blocked-output.mjs';
 import { providerObservationFromText } from './provider-observation.mjs';
+import { createAttemptEvent } from './runtime-contract.mjs';
+import { ProjectLedger } from './project-ledger.mjs';
+import { RunApi } from './run-api.mjs';
 
 const time = () => new Date().toISOString();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -65,6 +68,7 @@ export function defaultStateRoot() {
 export class Orchestrator {
   constructor({ stateRoot = defaultStateRoot(), herdr = new Herdr(), command = runCommand, profiles, gateways, materialize = prepareExecution, telemetry = prepareClaudeTelemetry, resourceResolver, coordinatorId = process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID || null } = {}) {
     this.root = path.resolve(stateRoot);
+    this.runApi = new RunApi({ root: this.root });
     this.herdr = herdr;
     this.command = command;
     this.profiles = profiles || new ProfileStore({ root: this.root });
@@ -81,10 +85,58 @@ export class Orchestrator {
     // Use that same identity for telemetry validation and runtime cleanup.
     try { this.root = await fs.realpath(this.root); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    const run = await state.loadRun(this.root, id);
+    this.runApi.root = this.root;
+    const run = await this.runApi.get(id);
     invariant(run, 'run_not_found', `Run ${id} does not exist.`);
     invariant(run.schemaVersion === 1 && run.id === id && run.tasks && typeof run.project === 'string', 'invalid_run', 'Run record is invalid or uses an unsupported schema.');
     return run;
+  }
+
+  async loadRun(id) { return this._loadRun(id); }
+  async reserveTask(...args) { return this._reserve(...args); }
+  async currentAttempt(...args) { return this._attempt(...args); }
+  async updateAttempt(...args) { return this._update(...args); }
+
+  async _recordLedgerEvidence(run, evidence) {
+    if (!run?.project) return;
+    try {
+      const ledger = new ProjectLedger({ root: this.root, project: run.project });
+      await ledger.recordEvidence(evidence);
+    } catch (error) {
+      await this._markLedgerEvidenceIncomplete(run, error);
+    }
+  }
+
+  async _recordLedgerDecision(run, result, references = []) {
+    if (!run?.project || !result) return;
+    try {
+      const ledger = new ProjectLedger({ root: this.root, project: run.project });
+      await ledger.recordDecision(result, references);
+    } catch (error) {
+      await this._markLedgerEvidenceIncomplete(run, error);
+    }
+  }
+
+  async _markLedgerEvidenceIncomplete(run, error) {
+    const code = typeof error?.code === 'string' && /^[a-z][a-z0-9_.-]{0,95}$/.test(error.code)
+      ? error.code
+      : 'ledger_write_failed';
+    run.ledgerEvidenceIncomplete = true;
+    run.ledgerEvidenceIncompleteReason = code;
+    // Hooks can run after an independent _update() has already persisted the
+    // authoritative attempt. Re-read before marking the current run so the
+    // observability flag is not lost with a stale in-memory snapshot.
+    if (!run.id) return;
+    try {
+      const latest = await this.runApi.get(run.id);
+      latest.ledgerEvidenceIncomplete = true;
+      latest.ledgerEvidenceIncompleteReason = code;
+      latest.updatedAt = time();
+      await state.saveRun(this.root, latest);
+    } catch {
+      // The authoritative run result remains intact; the missing ledger flag
+      // is itself bounded by the next successful state write.
+    }
   }
 
   async init({ project, id, maxParallel = 4 }) {
@@ -163,9 +215,20 @@ export class Orchestrator {
       await change(attempt, task, run);
       if (before !== attempt.status) {
         const errorCode = boundedEventErrorCode(attempt.lastError?.code);
-        await state.appendEvent(this.root, runId, {
-          type: 'attempt.state', taskId, attemptId, from: before, to: attempt.status,
-          ...(errorCode ? { errorCode } : {}),
+        const event = createAttemptEvent({
+          runId, taskId, attemptId, from: before, to: attempt.status, errorCode,
+          phase: attempt.performance?.phase || null,
+        });
+        const recorded = await state.appendEvent(this.root, runId, event);
+        const eventDigest = crypto.createHash('sha256').update(JSON.stringify(recorded)).digest('hex');
+        await this._recordLedgerEvidence(run, {
+          type: 'attempt.state',
+          status: attempt.status,
+          digest: eventDigest,
+          runId,
+          taskId,
+          attemptId,
+          references: [{ kind: 'runtime-event', id: recorded.eventId || null, digest: eventDigest }],
         });
       }
       return structuredClone(attempt);
@@ -244,7 +307,22 @@ export class Orchestrator {
       record.attempts.push(attempt);
       record.currentAttempt = id;
       run.tasks[definition.id] = record;
-      await state.appendEvent(this.root, run.id, { type: 'attempt.reserved', taskId: definition.id, attemptId: id });
+      const reservedEvent = await state.appendEvent(this.root, run.id, { type: 'attempt.reserved', taskId: definition.id, attemptId: id });
+      const reservedDigest = crypto.createHash('sha256').update(JSON.stringify(reservedEvent)).digest('hex');
+      await this._recordLedgerEvidence(run, {
+        type: 'attempt.reserved',
+        status: attempt.status,
+        digest: reservedDigest,
+        runId: run.id,
+        taskId: definition.id,
+        attemptId: id,
+        references: [{ kind: 'runtime-event', id: reservedEvent.eventId || null, digest: reservedDigest }],
+      });
+      if (binding?.evidence?.decisionProvider) {
+        await this._recordLedgerDecision(run, binding.evidence.decisionProvider, [
+          { kind: 'attempt', id, digest: reservedDigest },
+        ]);
+      }
       return { duplicate: false, task: structuredClone(record), run: structuredClone(run), attempt: structuredClone(attempt) };
     }));
   }
@@ -840,6 +918,16 @@ export class Orchestrator {
         a.operation.finishedAt = time();
         if (passed && task.definition.isolation === 'worktree') a.patchFile = path.join(attempt.directory, 'candidate.patch');
       });
+      const verificationDigest = crypto.createHash('sha256').update(JSON.stringify(verification)).digest('hex');
+      await this._recordLedgerEvidence(run, {
+        type: 'verification',
+        status: passed ? 'passed' : 'failed',
+        digest: verificationDigest,
+        runId: run.id,
+        taskId: task.definition.id,
+        attemptId: attempt.id,
+        references: [{ kind: 'verification', id: attempt.id, digest: verificationDigest }],
+      });
       if (passed) await this._recordTaskReadiness(runId, taskId);
       return this.inspect(runId, taskId);
     });
@@ -960,6 +1048,17 @@ export class Orchestrator {
       a.integration = { passed, stable, snapshotHash: before.hash, evidence };
       a.status = a.cancelRequested ? 'integration_cancelled' : (passed ? 'integrated' : 'integration_failed');
       a.operation.finishedAt = time();
+    });
+    const integrationEvidence = { passed, stable, snapshotHash: before.hash, evidence };
+    const integrationDigest = crypto.createHash('sha256').update(JSON.stringify(integrationEvidence)).digest('hex');
+    await this._recordLedgerEvidence(run, {
+      type: 'integration',
+      status: passed ? 'passed' : 'failed',
+      digest: integrationDigest,
+      runId: run.id,
+      taskId: task.definition.id,
+      attemptId: attempt.id,
+      references: [{ kind: 'integration', id: attempt.id, digest: integrationDigest }],
     });
     return this.inspect(run.id, task.definition.id);
   }

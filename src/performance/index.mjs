@@ -433,8 +433,9 @@ function summarizeTask(task, nowIso) {
     nowIso,
     nextAttemptCreatedAt: safeIso(attempts[index + 1]?.createdAt),
   }));
-  const currentAttemptId = task?.currentAttempt ?? sanitizedAttempts.at(-1)?.id ?? null;
-  const currentAttempt = sanitizedAttempts.find(attempt => attempt.id === currentAttemptId) ?? sanitizedAttempts.at(-1) ?? null;
+  const currentAttemptId = typeof task?.currentAttempt === 'string' ? task.currentAttempt : null;
+  const currentAttempt = currentAttemptId ? sanitizedAttempts.find(attempt => attempt.id === currentAttemptId) ?? null : null;
+  const invalidCurrentAttempt = sanitizedAttempts.length > 0 && !currentAttempt;
   const statuses = new Set(sanitizedAttempts.map(attempt => attempt.status).filter(Boolean));
   return {
     id: task?.definition?.id ?? null,
@@ -453,6 +454,7 @@ function summarizeTask(task, nowIso) {
       unjudged: sanitizedAttempts.some(attempt => attempt.outcome.unjudged),
       statuses: [...statuses],
       currentStatus: currentAttempt?.status ?? null,
+      invalidCurrentAttempt,
     },
   };
 }

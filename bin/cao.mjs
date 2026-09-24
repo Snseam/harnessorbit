@@ -27,12 +27,24 @@ import { submitResult, MAX_RESULT_BYTES } from '../src/results.mjs';
 import { ResourceService } from '../src/resources/index.mjs';
 import { CalibrationStore } from '../src/calibration/store.mjs';
 import { CalibrationRunner, releaseCalibrationReservation } from '../src/calibration/runner.mjs';
+import { createContextPacket } from '../src/context-packet.mjs';
+import { ProjectLedger, initProjectLedger } from '../src/project-ledger.mjs';
+import { WorkflowRegistry } from '../src/workflows.mjs';
+import { runInternalBenchmark, createInternalBenchmarkPlan } from '../src/internal-benchmark.mjs';
+import { replayShadowTraces } from '../src/shadow-replay.mjs';
+import { DeterministicDecisionProvider, JevDecisionProvider } from '../src/decision-provider.mjs';
 
 export const help = `Codex Agent Orchestrator (CAO) 0.1.0
 
 Usage: node bin/cao.mjs <command> [options]
 
   init       --project PATH [--id ID] [--max-parallel 4]
+  harness init --project PATH [--include-paths src/,docs/]
+  harness context --project PATH [--include-paths src/,docs/]
+  harness ledger --project PATH
+  harness workflow --run ID [--id release-readiness]
+  harness benchmark [--output PATH]
+  harness replay --file TRACES.json
   validate   --file TASK.json
   dispatch   --run ID --file TASK.json [--adaptive] [--thread ID] [--resources ID,ID]
              [--executor host|external] [--preference balanced|fastest|subscription-first|quality-first]
@@ -120,8 +132,16 @@ Only --integrate applies patches; --repair-reports permits one report-only reque
 Task deadlineAt is an optional ISO UTC deadline, enforced while a controller/check is active.
 `;
 
+function configuredDecisionProvider() {
+  const endpoint = process.env.JEV_ENDPOINT;
+  const apiKey = process.env.JEV_JBSD_API_KEY || process.env.JEV_JBSD_APIKEY;
+  return endpoint && apiKey ? new JevDecisionProvider({ endpoint, apiKey }) : null;
+}
+
 const optionsByCommand = {
   init: ['project', 'id', 'max-parallel'], validate: ['file'], dispatch: ['run', 'file', 'adaptive', 'thread', 'resources', 'executor', 'preference', 'calibration-policy', 'probe-budget-ms'],
+  'harness init': ['project', 'include-paths', 'run'], 'harness context': ['project', 'include-paths', 'run'], 'harness ledger': ['project'],
+  'harness workflow': ['run', 'id'], 'harness benchmark': ['output'], 'harness replay': ['file'],
   preflight: ['run', 'file'], supervise: ['run', 'wait-ms', 'poll-ms', 'integrate', 'repair-reports'],
   step: ['run', 'integrate', 'repair-reports'], 'performance report': ['run'],
   'result submit': ['attempt-dir', 'file', 'stdin'],
@@ -151,7 +171,7 @@ const optionsByCommand = {
   'monitor status': ['id'], 'monitor stop': ['id'],
   'monitor snapshot': ['project', 'run', 'all', 'coordinator', 'codex-home', 'claude-home'],
 };
-const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host']);
+const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness']);
 
 export function parseArgs(argv) {
   const values = {};
@@ -165,7 +185,9 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    if (['help', 'json', 'output', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive'].includes(name)) {
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive'].includes(name)
+      || (name === 'output' && command !== 'harness benchmark');
+    if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
       values[name] = true;
     } else {
@@ -371,7 +393,11 @@ export async function main(argv = process.argv.slice(2)) {
         return orchestrator.dispatch(required('run'), input);
       }
       const fixedAgent = mode.enabled && o.executor !== 'host' && mode.agent !== 'auto' ? mode.agent : null;
-      return new AdaptiveDispatcher({ orchestrator }).dispatch(required('run'), input, {
+      return new AdaptiveDispatcher({
+        orchestrator,
+        decisionProvider: configuredDecisionProvider(),
+        decisionMode: process.env.CAO_DECISION_MODE === 'online' ? 'online' : 'shadow',
+      }).dispatch(required('run'), input, {
         thread, preference: o.preference || mode.preference, fixedExecutorKind: o.executor,
         calibrationPolicy: o['calibration-policy'] || (mode.enabled ? mode.calibrationPolicy : 'off'),
         probeBudgetMs: o['probe-budget-ms'] === undefined ? (mode.enabled ? mode.probeBudgetMs : 30000) : Number(o['probe-budget-ms']),
@@ -390,6 +416,53 @@ export async function main(argv = process.argv.slice(2)) {
     case 'recover': return orchestrator.recover(...taskArgs());
     case 'cancel': return orchestrator.cancel(...taskArgs());
     case 'cleanup': return orchestrator.cleanup(required('run'));
+    case 'harness init': {
+      const project = path.resolve(required('project'));
+      const includePaths = o['include-paths'] ? o['include-paths'].split(',').map(value => value.trim()).filter(Boolean) : [];
+      return initProjectLedger({ root: profiles.root, project, includePaths, runId: o.run || null });
+    }
+    case 'harness context': {
+      const project = path.resolve(required('project'));
+      const includePaths = o['include-paths'] ? o['include-paths'].split(',').map(value => value.trim()).filter(Boolean) : [];
+      return createContextPacket({ project, includePaths, runId: o.run || null });
+    }
+    case 'harness ledger': {
+      const project = path.resolve(required('project'));
+      return new ProjectLedger({ root: profiles.root, project }).load();
+    }
+    case 'harness workflow': {
+      const run = await loadRun(profiles.root, required('run'));
+      if (!run) throw new OrchestratorError('run_not_found', 'Harness workflow run does not exist.');
+      const contextPacket = createContextPacket({ project: run.project, runId: run.id });
+      const report = new WorkflowRegistry().evaluate(o.id || 'release-readiness', { run, contextPacket });
+      const ledger = new ProjectLedger({ root: profiles.root, project: run.project });
+      try {
+        await ledger.recordEvidence({
+          type: 'workflow.outcome',
+          status: report.projectAcceptance,
+          digest: report.reportDigest,
+          runId: run.id,
+          references: report.evidence.references,
+        });
+        return { ...report, ledgerEvidenceIncomplete: false };
+      } catch (error) {
+        if (error?.code !== 'ledger_full') throw error;
+        return { ...report, ledgerEvidenceIncomplete: true, ledgerEvidenceStatus: 'ledger_full' };
+      }
+    }
+    case 'harness benchmark': {
+      const report = runInternalBenchmark({ plan: createInternalBenchmarkPlan() });
+      if (o.output) {
+        const file = path.resolve(o.output);
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+      }
+      return report;
+    }
+    case 'harness replay': {
+      const traces = JSON.parse(await read(required('file')));
+      return replayShadowTraces({ traces: Array.isArray(traces) ? traces : traces.traces, provider: new DeterministicDecisionProvider() });
+    }
     case 'usage': {
       if (o.table && o.json) throw new OrchestratorError('invalid_arguments', '--table and --json are mutually exclusive.');
       if (o['tokscale-bin'] !== undefined && !o['tokscale-bin']) throw new OrchestratorError('invalid_arguments', '--tokscale-bin must identify an executable.');
