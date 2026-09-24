@@ -32,6 +32,9 @@ Run the real paired pilot preflight with:
 npm run benchmark:real -- --version-only --output /tmp/cao-real-pilot.json
 ```
 
+For a paired task set, pass a JSON array with `--tasks-file`; each item must
+contain `id`, optional `cohort`, and a concrete `prompt`.
+
 The branch now includes a first-party runtime entrypoint for the second arm:
 
 ```sh
@@ -77,6 +80,6 @@ fallback or shadow operation.
    synthetic fixtures never satisfy that gate.
 5. Final review must be clear, then post-cleaner verification is rerun.
 
-The current verification snapshot is 517/517 full tests and a passing syntax
+The current verification snapshot is 520/520 full tests and a passing syntax
 check. The acceptance report records the earlier restricted-sandbox failures
 separately and keeps the real product-benefit gate open.

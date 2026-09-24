@@ -32,7 +32,7 @@ separate.
 | Check | Result | Boundary |
 | --- | --- | --- |
 | Initial restricted sandbox `npm test` | 465/492 passed, 27 failed | Existing loopback `listen EPERM` gateway/monitor tests and two process-tree timeout tests; no new HarnessOrbit test failed |
-| Latest full `npm test` | **517/517 passed** | Full suite after boundary hardening, ledger hooks, real-pilot harness additions and direct TypeSafe Jev adapter coverage, zero failures/cancellations |
+| Latest full `npm test` | **520/520 passed** | Full suite after the first-party HarnessOrbit runner, task-file pilot support and direct TypeSafe Jev adapter coverage, zero failures/cancellations |
 | `npm run check` | **passed** | Syntax checks for 134 modules |
 | New/changed targeted tests | **passed** | Focused decision, adaptive, context/ledger, benchmark, runtime, replay, workflow, performance and real-pilot tests |
 | CLI smoke | **passed** | `harness init`, `harness replay`, `harness benchmark` |

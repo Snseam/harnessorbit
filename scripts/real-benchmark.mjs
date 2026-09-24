@@ -19,7 +19,17 @@ function has(argv, name) {
   return argv.includes(name);
 }
 
-function parseTasks(argv) {
+async function parseTasks(argv) {
+  const tasksFile = value(argv, '--tasks-file');
+  if (tasksFile) {
+    const parsed = JSON.parse(await fs.readFile(path.resolve(tasksFile), 'utf8'));
+    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('--tasks-file must contain a non-empty JSON array');
+    return parsed.map((task, index) => ({
+      id: task?.id || `pilot-task-${index + 1}`,
+      cohort: task?.cohort || 'pilot',
+      prompt: task?.prompt,
+    }));
+  }
   const prompt = value(argv, '--task');
   return [{ id: value(argv, '--task-id', 'pilot-task'), cohort: value(argv, '--cohort', 'pilot'), prompt }];
 }
@@ -28,7 +38,7 @@ export async function main(argv = process.argv.slice(2)) {
   const evidenceRoot = path.resolve(value(argv, '--evidence-dir', 'work/real-benchmark'));
   const deadlineMs = Number(value(argv, '--deadline-ms', 15 * 60 * 1000));
   const repetitions = String(value(argv, '--repetitions', '1')).split(',').map(Number);
-  const tasks = parseTasks(argv);
+  const tasks = await parseTasks(argv);
   const plan = createRealBenchmarkPlan({
     experimentId: value(argv, '--experiment-id', undefined) || undefined,
     deadlineMs,
