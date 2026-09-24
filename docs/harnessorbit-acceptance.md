@@ -38,6 +38,7 @@ separate.
 | CLI smoke | **passed** | `harness init`, `harness replay`, `harness benchmark` |
 | Exact configured Jev secret scan | **clean** | `.env.local` ignored, mode `0600`, not tracked; the value is never printed or committed |
 | Official Jev gateway probe | **TypeSafe direct passed; Vercel gateway rejected** | `api.typesafe.ai/v1/models` and `/v1/systemone` returned 200 with pinned `jev-1.13.0`; Vercel `/v1/evaluate` and `/typesafe/v1/systemone` returned 401. Sanitized evidence is in `work/real-benchmark/jev-probe-2026-09-24.json` |
+| First-party HarnessOrbit runner | **version probe passed** | `node scripts/harnessorbit-runner.mjs --version` returned `0.1.0`; it records bounded context/decision receipts and delegates to Codex with credentials removed |
 
 ## Internal comparison
 
@@ -70,11 +71,10 @@ required before changing the default strategy.
 
 The latest real-pilot preflight is archived at
 `work/real-benchmark/preflight-2026-09-24.json`. It is `status=blocked` with Codex CLI
-`0.156.1` available and a clean base commit, while the HarnessOrbit command is
-not configured. The task prompt and `npm run check` control are present, but
-execution was not requested, so the report retains both arms in the denominator
-and does not execute a product comparison. No real HarnessOrbit benefit claim
-is made.
+`0.156.1` available and a clean base commit. The first-party HarnessOrbit
+runner is now available; the prior preflight remains an archived blocked
+snapshot because execution was not requested. A new executed pilot is still
+required before making a product-benefit claim.
 
 The Jev credential probe is a separate external boundary. The supplied
 credential is accepted by TypeSafe's direct API and the adapter completed a

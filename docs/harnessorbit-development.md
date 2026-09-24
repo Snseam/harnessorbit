@@ -32,7 +32,19 @@ Run the real paired pilot preflight with:
 npm run benchmark:real -- --version-only --output /tmp/cao-real-pilot.json
 ```
 
-Execution requires an explicitly configured HarnessOrbit command, a clean
+The branch now includes a first-party runtime entrypoint for the second arm:
+
+```sh
+node scripts/harnessorbit-runner.mjs --version
+```
+
+It builds a bounded ContextPacket, records context and shadow decision receipts
+in the external Project Ledger, strips Jev credentials from the Codex child
+environment, and delegates execution to Codex. Acceptance and integration still
+come from the benchmark's independent checks and evidence writer.
+
+Execution uses `node scripts/harnessorbit-runner.mjs` as the first-party
+HarnessOrbit command, a clean
 isolated base checkout, a declared task prompt and the same checks/deadline on
 both arms. Without those controls the command returns `status=blocked`, keeps
 missing arms in the evaluator denominator, and writes no claim-eligible result.
