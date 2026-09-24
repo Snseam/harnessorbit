@@ -19,6 +19,12 @@ function has(argv, name) {
   return argv.includes(name);
 }
 
+function withoutProviderCredentials(env = process.env) {
+  const result = { ...env };
+  for (const key of ['JEV_JBSD_API_KEY', 'JEV_JBSD_APIKEY', 'JEV_API_KEY', 'JEV_ENDPOINT', 'JEV_MODEL']) delete result[key];
+  return result;
+}
+
 async function parseTasks(argv) {
   const tasksFile = value(argv, '--tasks-file');
   if (tasksFile) {
@@ -58,9 +64,10 @@ export async function main(argv = process.argv.slice(2)) {
     runners['codex-baseline'] = createCommandRunner({
       command: value(argv, '--codex-command', 'codex'),
       args: ({ cwd }) => ['exec', '--ephemeral', '--json', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-C', cwd],
+      env: withoutProviderCredentials(),
     });
     const orbitCommand = value(argv, '--harnessorbit-command', process.env.HARNESSORBIT_COMMAND);
-    if (orbitCommand) runners['codex-harnessorbit'] = createCommandRunner({ command: orbitCommand });
+    if (orbitCommand) runners['codex-harnessorbit'] = createCommandRunner({ command: orbitCommand, env: process.env });
   }
   const declaredChecks = plan.controls.sameChecks.filter(check => check !== 'declared-checks-unavailable');
   const checkRunner = declaredChecks.length > 0 ? createCheckRunner({ checks: declaredChecks }) : null;
