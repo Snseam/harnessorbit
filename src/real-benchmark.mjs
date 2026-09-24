@@ -257,7 +257,7 @@ export function createCommandRunner({ command, args = [], appendPrompt = true, s
     const parsed = parseCommand(command);
     if (!parsed || !task.prompt) return { outcome: 'unjudged', reason: 'task_or_command_missing' };
     const resolvedArgs = typeof args === 'function' ? args({ task, cwd, deadlineMs, sandbox }) : [...args];
-    const result = await runProcess(parsed.command, [...parsed.args, ...resolvedArgs, ...(appendPrompt ? [task.prompt] : [])], { cwd, timeoutMs, env });
+    const result = await runProcess(parsed.command, [...parsed.args, ...resolvedArgs, ...(appendPrompt ? [task.prompt] : [])], { cwd, timeoutMs: deadlineMs, env });
     return {
       outcome: result.timedOut ? 'timeout' : result.exitCode === 0 ? 'accepted' : 'failed',
       projectAcceptance: result.exitCode === 0 && !result.timedOut,
