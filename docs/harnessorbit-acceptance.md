@@ -32,9 +32,9 @@ separate.
 | Check | Result | Boundary |
 | --- | --- | --- |
 | Initial restricted sandbox `npm test` | 465/492 passed, 27 failed | Existing loopback `listen EPERM` gateway/monitor tests and two process-tree timeout tests; no new HarnessOrbit test failed |
-| Latest full `npm test` | **520/520 passed** | Full suite after the first-party HarnessOrbit runner, task-file pilot support and direct TypeSafe Jev adapter coverage, zero failures/cancellations |
-| `npm run check` | **passed** | Syntax checks for 134 modules |
-| New/changed targeted tests | **passed** | Focused decision, adaptive, context/ledger, benchmark, runtime, replay, workflow, performance and real-pilot tests |
+| Latest full `npm test` | **521/521 passed** | Full suite after the first-party HarnessOrbit runner, task-file pilot support, direct TypeSafe Jev adapter coverage and deadline regression guard; zero failures/cancellations |
+| `npm run check` | **passed** | Syntax checks for 137 modules |
+| New/changed targeted tests | **passed** | `tests/real-benchmark.test.mjs` 9/9 plus focused decision, adaptive, context/ledger, benchmark, runtime, replay, workflow and performance tests |
 | CLI smoke | **passed** | `harness init`, `harness replay`, `harness benchmark` |
 | Exact configured Jev secret scan | **clean** | `.env.local` ignored, mode `0600`, not tracked; the value is never printed or committed |
 | Official Jev gateway probe | **TypeSafe direct passed; Vercel gateway rejected** | `api.typesafe.ai/v1/models` and `/v1/systemone` returned 200 with pinned `jev-1.13.0`; Vercel `/v1/evaluate` and `/typesafe/v1/systemone` returned 401. Sanitized evidence is in `work/real-benchmark/jev-probe-2026-09-24.json` |
@@ -69,12 +69,40 @@ The fixture is marked `deterministic-contract-simulation` and
 they do not establish a product benefit. A real paired Codex experiment is
 required before changing the default strategy.
 
-The latest real-pilot preflight is archived at
-`work/real-benchmark/preflight-2026-09-24.json`. It is `status=blocked` with Codex CLI
-`0.156.1` available and a clean base commit. The first-party HarnessOrbit
-runner is now available; the prior preflight remains an archived blocked
-snapshot because execution was not requested. A new executed pilot is still
-required before making a product-benefit claim.
+The executed real pilot is archived under
+`work/real-benchmark/jev-pilot-20260924-r5/`. Its controls fixed one task
+definition digest, base commit `bca0a1900f69e8a97983e1e19302d4354b40a09d`,
+the two independent checks, a 180000 ms deadline and
+`cohort/task/repetition` pairing. All 42 planned trials completed and all 21
+pairs have both arm rows; each row retains receipt, commit, checks, snapshot
+and stdout/stderr references. The sanitized report is `report.json` and the
+review summary is `pilot-summary.json` in that directory.
+
+The exploratory result is:
+
+| Metric | Pure Codex | Codex + HarnessOrbit |
+| --- | ---: | ---: |
+| Denominator | 21 | 21 |
+| Accepted/project acceptance | 19 (90.5%) | 20 (95.2%) |
+| Failed | 2 | 1 |
+| Median duration, all rows | 38,751 ms | 66,465 ms |
+| Mean duration, all rows | 46,850 ms | 77,699 ms |
+
+Among the 19 pairs where both arms were accepted, HarnessOrbit was faster in
+2 pairs and slower in 17. The median paired delta was **+28,053 ms**
+(HarnessOrbit minus Pure Codex); the exact two-sided sign test for this
+direction was 0.00073, and the exploratory paired randomization probability
+for a delta at least this harmful was 0.00021. Acceptance discordance was one
+HarnessOrbit-only success and zero Pure-Codex-only successes. These are
+descriptive results from a normal marker-task set, not a pre-registered product
+claim; the task set contains no high-risk cases, so the high-risk safety gate
+was not exercised by this pilot.
+
+The real pilot therefore **does not satisfy G026**. It shows a small raw
+acceptance difference but a clear runtime overhead signal, with no independent
+statistical review or high-risk cohort evidence. The default strategy remains
+Pure Codex plus optional shadow/advisory HarnessOrbit; no rollout or product
+direction change is authorized by this run.
 
 The Jev credential probe is a separate external boundary. The supplied
 credential is accepted by TypeSafe's direct API and the adapter completed a
@@ -91,7 +119,9 @@ failing the evaluation.
 
 ## Acceptance boundary
 
-The branch is implementation-ready and full-suite verified. Product-benefit
-acceptance remains intentionally open until real controlled paired runs are
-executed with the declared controls and their raw receipts, timing, token,
-cost, acceptance and safety denominators are archived.
+The branch is implementation-ready and full-suite verified. The real paired
+pilot is complete and archived, but product-benefit acceptance remains open:
+the observed acceptance uplift is not claim-eligible and the measured runtime
+direction is worse for HarnessOrbit. A future claim would require a
+pre-registered task mix including high-risk cases, an independent review and a
+replication that does not reproduce the current overhead.

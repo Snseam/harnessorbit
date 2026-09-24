@@ -80,6 +80,9 @@ fallback or shadow operation.
    synthetic fixtures never satisfy that gate.
 5. Final review must be clear, then post-cleaner verification is rerun.
 
-The current verification snapshot is 520/520 full tests and a passing syntax
-check. The acceptance report records the earlier restricted-sandbox failures
-separately and keeps the real product-benefit gate open.
+The current verification snapshot is 521/521 full tests and a passing syntax
+check for 137 modules. The acceptance report records the earlier
+restricted-sandbox failures separately, archives the completed 42-trial real
+pilot, and keeps the product-benefit gate open because the measured
+HarnessOrbit arm was slower and the acceptance difference was not
+claim-eligible.
