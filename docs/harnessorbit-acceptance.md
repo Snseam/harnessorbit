@@ -159,6 +159,34 @@ The sanitized evidence is in
 calibration results. Any model change requires a fresh paired run with the new
 model recorded as part of the controls.
 
+## Full Aider Polyglot Python run with the current model
+
+The requested model-switch replication completed all 20 planned rows: 10 tasks
+for each arm, with `gpt-6-astra` pinned through the same wrapper, base commit
+`aa08d0a660727a62685c3e48bea5fca5efa2150f`, the same independent check and a
+420000 ms deadline. The raw report and sanitized summary are in
+`work/real-benchmark/aider-py-full-astra-20250925-r1/`; all previous model
+reports remain in their original directories.
+
+| Metric | Pure Codex | Codex + HarnessOrbit |
+| --- | ---: | ---: |
+| Denominator | 10 | 10 |
+| Accepted | 5 (50%) | 7 (70%) |
+| Failed | 3 | 1 |
+| Timeout | 2 | 2 |
+| Independent check passed | 9 | 8 |
+
+All 10 task pairs have both arm rows. Five pairs completed in both arms; the
+median paired duration delta was **+64,946 ms** (HarnessOrbit minus Pure Codex).
+There were two HarnessOrbit-only completions, no Pure-Codex-only completions and
+three pairs where neither arm completed. Four traces contained the known model
+capacity message, and the task set contains no high-risk cohort.
+
+This is a model-pinned exploratory observation with `claimEligible=false`. The
+raw acceptance difference does not authorize rollout or a product-direction
+change; the measured paired runtime remains slower for HarnessOrbit in the
+completed pairs.
+
 ## Acceptance boundary
 
 The branch is implementation-ready and full-suite verified. The real paired
