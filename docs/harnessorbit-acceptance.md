@@ -117,6 +117,32 @@ cover all material receipt fields, and a full append-only ledger returns the
 authoritative workflow report with `ledgerEvidenceIncomplete=true` instead of
 failing the evaluation.
 
+## Aider Polyglot Python calibration
+
+After the 180-second smoke round, a bounded calibration used three fixed
+Aider Polyglot Python tasks (`beer-song`, `bottle-song` and `dot-dsl`) with the
+same base commit `213cdaf8cd68cfe0153e520e57525f69aacdff64`, one independent
+`unittest` check and a 360000 ms deadline. It completed all 6 planned rows and
+retained all rows in the denominator. The raw report and sanitized summary are
+in `work/real-benchmark/aider-py-calibration-20260924-r1/`.
+
+| Metric | Pure Codex | Codex + HarnessOrbit |
+| --- | ---: | ---: |
+| Denominator | 3 | 3 |
+| Accepted | 2 | 1 |
+| Failed | 1 | 2 |
+| Independent check passed | 3 | 3 |
+| Known model-capacity error | 1 | 2 |
+
+The three failed rows all reached the independent check successfully, then
+ended with the known `Selected model is at capacity` error. This removes the
+180-second timeout as the dominant confound for the selected tasks, but adds an
+infrastructure confound and is still only a six-row exploratory sample.
+The result is `claimEligible=false`; it does not support a benefit claim,
+rollout, or product-direction change. A next replication must use a stable
+model-capacity window and a pre-registered task mix before statistical
+comparison.
+
 ## Acceptance boundary
 
 The branch is implementation-ready and full-suite verified. The real paired
