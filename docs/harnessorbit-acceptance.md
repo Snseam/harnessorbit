@@ -143,6 +143,22 @@ rollout, or product-direction change. A next replication must use a stable
 model-capacity window and a pre-registered task mix before statistical
 comparison.
 
+## Model-pinned replication boundary
+
+A model switch creates a new experimental condition. A capacity probe therefore
+pinned both arms to `gpt-6-astra` through the same local wrapper, while keeping
+the task definitions, base commit, check and 420000 ms deadline fixed. The probe
+ran 4/4 rows on two tasks: Pure Codex accepted one row and HarnessOrbit accepted
+one row. A capacity message appeared in 3/4 traces and two rows ended failed;
+all three rows that completed their independent checks retained those check
+records.
+
+The sanitized evidence is in
+`work/real-benchmark/aider-py-capacity-probe-20260925-r3-astra/`. This probe is
+`claimEligible=false` and must not be merged with the default-model smoke or
+calibration results. Any model change requires a fresh paired run with the new
+model recorded as part of the controls.
+
 ## Acceptance boundary
 
 The branch is implementation-ready and full-suite verified. The real paired
