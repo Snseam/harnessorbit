@@ -4,6 +4,8 @@
 
 把 [README 的安装指令](../../README.zh-CN.md#在-codex-对话中直接开始)复制给 Codex，即可安装。随后在需要的任意新的或已有的本地对话中启用 **CAO**。
 
+安装粘贴按顺序 stat 四条精确路径（handoff wrapper、已设置时的 `$CODEX_HOME/skills/cao`、`~/.codex/skills/cao`、`~/.agents/skills/cao`），不列出父目录，也不遍历 `~/.codex/sessions`。启用后从已加载的技能目录加 `--paths` 定位 CAO；不要把这些安装路径当作 SKILL 的 locate 目标。
+
 ## 安装一次
 
 ```bash

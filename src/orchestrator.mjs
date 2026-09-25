@@ -4,7 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { OrchestratorError, invariant } from './errors.mjs';
 import * as state from './state.mjs';
-import { validateTask, taskDigest, outsideScope } from './task.mjs';
+import { validateTask, taskDigest, outsideScope, assessScope, retryAdvice } from './task.mjs';
 import * as git from './git.mjs';
 import { Herdr } from './runtime/herdr.mjs';
 import { runCommand } from './process.mjs';
@@ -21,6 +21,11 @@ import { startHostTask, reportHostTask, releaseHostTask, assertHostOwner } from 
 import { ResourceService } from './resources/index.mjs';
 import { checkNativeChildren } from './native-children.mjs';
 import { recordTaskEvidence } from './resources/task-evidence.mjs';
+import { blockedWaitLastError, shouldClearBlockedWait } from './blocked-output.mjs';
+import { providerObservationFromText } from './provider-observation.mjs';
+import { createAttemptEvent } from './runtime-contract.mjs';
+import { ProjectLedger } from './project-ledger.mjs';
+import { RunApi } from './run-api.mjs';
 
 const time = () => new Date().toISOString();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -30,6 +35,11 @@ const checkoutHold = t => t.definition.isolation === 'checkout' && !['accepted',
 const stopped = a => a.executorKind === 'host' ? Boolean(a.hostStoppedEvidence) : a.workerClosed;
 const missing = error => ['agent_not_found', 'agent_not_running', 'pane_not_found'].includes(error.code);
 const serializeError = e => ({ code: e.code || 'error', message: e.message, details: e.details || {} });
+const boundedEventErrorCode = (code) => {
+  if (typeof code !== 'string' || !code) return null;
+  const bounded = code.replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 80);
+  return bounded || null;
+};
 const current = record => record.attempts.find(a => a.id === record.currentAttempt);
 const inside = (parent, child) => child === parent || child.startsWith(parent + path.sep);
 const hashFile = async file => crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex');
@@ -58,6 +68,7 @@ export function defaultStateRoot() {
 export class Orchestrator {
   constructor({ stateRoot = defaultStateRoot(), herdr = new Herdr(), command = runCommand, profiles, gateways, materialize = prepareExecution, telemetry = prepareClaudeTelemetry, resourceResolver, coordinatorId = process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID || null } = {}) {
     this.root = path.resolve(stateRoot);
+    this.runApi = new RunApi({ root: this.root });
     this.herdr = herdr;
     this.command = command;
     this.profiles = profiles || new ProfileStore({ root: this.root });
@@ -74,10 +85,58 @@ export class Orchestrator {
     // Use that same identity for telemetry validation and runtime cleanup.
     try { this.root = await fs.realpath(this.root); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    const run = await state.loadRun(this.root, id);
+    this.runApi.root = this.root;
+    const run = await this.runApi.get(id);
     invariant(run, 'run_not_found', `Run ${id} does not exist.`);
     invariant(run.schemaVersion === 1 && run.id === id && run.tasks && typeof run.project === 'string', 'invalid_run', 'Run record is invalid or uses an unsupported schema.');
     return run;
+  }
+
+  async loadRun(id) { return this._loadRun(id); }
+  async reserveTask(...args) { return this._reserve(...args); }
+  async currentAttempt(...args) { return this._attempt(...args); }
+  async updateAttempt(...args) { return this._update(...args); }
+
+  async _recordLedgerEvidence(run, evidence) {
+    if (!run?.project) return;
+    try {
+      const ledger = new ProjectLedger({ root: this.root, project: run.project });
+      await ledger.recordEvidence(evidence);
+    } catch (error) {
+      await this._markLedgerEvidenceIncomplete(run, error);
+    }
+  }
+
+  async _recordLedgerDecision(run, result, references = []) {
+    if (!run?.project || !result) return;
+    try {
+      const ledger = new ProjectLedger({ root: this.root, project: run.project });
+      await ledger.recordDecision(result, references);
+    } catch (error) {
+      await this._markLedgerEvidenceIncomplete(run, error);
+    }
+  }
+
+  async _markLedgerEvidenceIncomplete(run, error) {
+    const code = typeof error?.code === 'string' && /^[a-z][a-z0-9_.-]{0,95}$/.test(error.code)
+      ? error.code
+      : 'ledger_write_failed';
+    run.ledgerEvidenceIncomplete = true;
+    run.ledgerEvidenceIncompleteReason = code;
+    // Hooks can run after an independent _update() has already persisted the
+    // authoritative attempt. Re-read before marking the current run so the
+    // observability flag is not lost with a stale in-memory snapshot.
+    if (!run.id) return;
+    try {
+      const latest = await this.runApi.get(run.id);
+      latest.ledgerEvidenceIncomplete = true;
+      latest.ledgerEvidenceIncompleteReason = code;
+      latest.updatedAt = time();
+      await state.saveRun(this.root, latest);
+    } catch {
+      // The authoritative run result remains intact; the missing ledger flag
+      // is itself bounded by the next successful state write.
+    }
   }
 
   async init({ project, id, maxParallel = 4 }) {
@@ -154,9 +213,24 @@ export class Orchestrator {
       const attempt = current(task);
       const before = attempt.status;
       await change(attempt, task, run);
-      if (before !== attempt.status) await state.appendEvent(this.root, runId, {
-        type: 'attempt.state', taskId, attemptId, from: before, to: attempt.status,
-      });
+      if (before !== attempt.status) {
+        const errorCode = boundedEventErrorCode(attempt.lastError?.code);
+        const event = createAttemptEvent({
+          runId, taskId, attemptId, from: before, to: attempt.status, errorCode,
+          phase: attempt.performance?.phase || null,
+        });
+        const recorded = await state.appendEvent(this.root, runId, event);
+        const eventDigest = crypto.createHash('sha256').update(JSON.stringify(recorded)).digest('hex');
+        await this._recordLedgerEvidence(run, {
+          type: 'attempt.state',
+          status: attempt.status,
+          digest: eventDigest,
+          runId,
+          taskId,
+          attemptId,
+          references: [{ kind: 'runtime-event', id: recorded.eventId || null, digest: eventDigest }],
+        });
+      }
       return structuredClone(attempt);
     });
   }
@@ -182,6 +256,7 @@ export class Orchestrator {
         invariant((current(record).executorKind || 'external') === executorKind, 'executor_conflict', 'Retry must use the original execution path.');
         invariant(executorKind === 'host' ? stopped(current(record)) : (current(record).workerClosed || !current(record).paneId), 'worker_not_stopped', 'The previous worker must be confirmed stopped before retrying.');
         if (executorKind === 'host') invariant(current(record).ownerThreadId === ownerThreadId, 'host_owner_mismatch', 'Host task belongs to another conversation.');
+        invariant(!(definition.isolation === 'worktree' && current(record).outsideScope?.length), 'scope_retry_forbidden', 'A worktree attempt changed files outside allowedPaths. Cancel it and dispatch a new task id; retry would reuse leftover files.');
       }
       for (const dependency of definition.dependsOn) {
         const predecessor = Object.hasOwn(run.tasks, dependency) ? run.tasks[dependency] : null;
@@ -232,13 +307,29 @@ export class Orchestrator {
       record.attempts.push(attempt);
       record.currentAttempt = id;
       run.tasks[definition.id] = record;
-      await state.appendEvent(this.root, run.id, { type: 'attempt.reserved', taskId: definition.id, attemptId: id });
+      const reservedEvent = await state.appendEvent(this.root, run.id, { type: 'attempt.reserved', taskId: definition.id, attemptId: id });
+      const reservedDigest = crypto.createHash('sha256').update(JSON.stringify(reservedEvent)).digest('hex');
+      await this._recordLedgerEvidence(run, {
+        type: 'attempt.reserved',
+        status: attempt.status,
+        digest: reservedDigest,
+        runId: run.id,
+        taskId: definition.id,
+        attemptId: id,
+        references: [{ kind: 'runtime-event', id: reservedEvent.eventId || null, digest: reservedDigest }],
+      });
+      if (binding?.evidence?.decisionProvider) {
+        await this._recordLedgerDecision(run, binding.evidence.decisionProvider, [
+          { kind: 'attempt', id, digest: reservedDigest },
+        ]);
+      }
       return { duplicate: false, task: structuredClone(record), run: structuredClone(run), attempt: structuredClone(attempt) };
     }));
   }
 
   async dispatch(runId, input, { routeDecision = null } = {}) {
     const task = validateTask(input);
+    await this._assertDirectoryScope((await this._loadRun(runId)).project, task);
     const reserved = await this._reserve(runId, task, '', false, { routeDecision });
     if (reserved.duplicate) return { duplicate: true, ...(await this.inspect(runId, task.id)) };
     await this._launch(reserved);
@@ -578,11 +669,19 @@ export class Orchestrator {
   async inspect(runId, taskId, { output = false } = {}) {
     const { run, task, attempt } = await this._attempt(runId, taskId);
     const result = { runId, task: task.definition, attempt, stateDirectory: state.runPath(this.root, runId) };
+    const advice = retryAdvice(task.definition, attempt);
+    if (advice) result.retryAdvice = advice;
     if (output && attempt.paneId && !attempt.workerClosed) {
       try { result.output = await this.herdr.readAgent(run.herdrSession, attempt.workerName); }
       catch (error) { result.outputError = serializeError(error); }
     }
     return result;
+  }
+
+  async _assertDirectoryScope(project, task) {
+    const scope = assessScope(task.allowedPaths, (await git.snapshot(project)).files);
+    invariant(!scope.ambiguousDirectories.length, 'directory_scope_missing_slash', 'Directory scopes must end with a trailing slash so files under them stay in scope. Use `dir/` or list exact files.', { scope: { root: scope.root, ambiguousDirectories: scope.ambiguousDirectories, sample: scope.sample } });
+    return scope;
   }
 
   async status(runId) {
@@ -682,10 +781,20 @@ export class Orchestrator {
       }
       await this._update(runId, taskId, attempt.id, a => { a.observedAt = time(); a.lastObservedState = live.agent_status || 'unknown'; });
       if (live.agent_status === 'blocked') {
-        await this._update(runId, taskId, attempt.id, a => { if (!a.cancelRequested) a.status = 'needs_input'; a.lastObservedState = 'blocked'; });
+        let output = '';
+        try { output = await this.herdr.readAgent(run.herdrSession, attempt.workerName); }
+        catch { output = ''; }
+        const lastError = blockedWaitLastError(output);
+        const observation = providerObservationFromText(output);
+        await this._update(runId, taskId, attempt.id, a => {
+          if (!a.cancelRequested) a.status = 'needs_input';
+          a.lastObservedState = 'blocked';
+          a.lastError = lastError;
+          if (observation) a.providerObservation = observation;
+        });
         return this.inspect(runId, taskId, { output: true });
       }
-      if (!live.interactive_ready && attempt.status === 'needs_input') {
+      if (shouldClearBlockedWait(attempt, live)) {
         await this._update(runId, taskId, attempt.id, a => { if (!a.cancelRequested) { a.status = 'running'; delete a.lastError; } });
       }
       if (live.interactive_ready && ['idle', 'done'].includes(live.agent_status)) {
@@ -718,9 +827,14 @@ export class Orchestrator {
             return this.inspect(runId, taskId);
           }
           if (Date.now() >= deadline && Date.now() - Date.parse(attempt.submissionStartedAt) >= 5000) {
+            let output = '';
+            try { output = await this.herdr.readAgent(run.herdrSession, attempt.workerName); }
+            catch { output = ''; }
+            const observation = providerObservationFromText(output);
             await this._update(runId, taskId, attempt.id, a => {
               if (!a.cancelRequested) a.status = 'needs_input';
               a.lastError = { code: 'missing_result', message: 'Worker is idle without this attempt’s result file. Inspect output and request a valid report.' };
+              if (observation) a.providerObservation = observation;
             });
             return this.inspect(runId, taskId, { output: true });
           }
@@ -803,6 +917,16 @@ export class Orchestrator {
         a.verification = verification; a.status = a.cancelRequested ? 'cancelled' : (passed ? 'accepted' : 'rework');
         a.operation.finishedAt = time();
         if (passed && task.definition.isolation === 'worktree') a.patchFile = path.join(attempt.directory, 'candidate.patch');
+      });
+      const verificationDigest = crypto.createHash('sha256').update(JSON.stringify(verification)).digest('hex');
+      await this._recordLedgerEvidence(run, {
+        type: 'verification',
+        status: passed ? 'passed' : 'failed',
+        digest: verificationDigest,
+        runId: run.id,
+        taskId: task.definition.id,
+        attemptId: attempt.id,
+        references: [{ kind: 'verification', id: attempt.id, digest: verificationDigest }],
       });
       if (passed) await this._recordTaskReadiness(runId, taskId);
       return this.inspect(runId, taskId);
@@ -924,6 +1048,17 @@ export class Orchestrator {
       a.integration = { passed, stable, snapshotHash: before.hash, evidence };
       a.status = a.cancelRequested ? 'integration_cancelled' : (passed ? 'integrated' : 'integration_failed');
       a.operation.finishedAt = time();
+    });
+    const integrationEvidence = { passed, stable, snapshotHash: before.hash, evidence };
+    const integrationDigest = crypto.createHash('sha256').update(JSON.stringify(integrationEvidence)).digest('hex');
+    await this._recordLedgerEvidence(run, {
+      type: 'integration',
+      status: passed ? 'passed' : 'failed',
+      digest: integrationDigest,
+      runId: run.id,
+      taskId: task.definition.id,
+      attemptId: attempt.id,
+      references: [{ kind: 'integration', id: attempt.id, digest: integrationDigest }],
     });
     return this.inspect(run.id, task.definition.id);
   }

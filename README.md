@@ -24,8 +24,14 @@ Codex Agent Orchestrator (**CAO**) is a local, zero-dependency Node.js CLI for c
 Install the official Codex Agent Orchestrator (CAO) skill for my Codex:
 https://github.com/Snseam/codex-agent-orchestrator
 
-Find and reuse my local CAO checkout. If none exists, clone the repository into an unused, durable directory outside the target project. Preserve existing files and uncommitted changes.
-Read its README.md and skills/cao/SKILL.md. Check Node.js 22.13+ and the CLI help, then run:
+Locate an existing CAO checkout by statting exactly these paths, in order. Do not list parent directories. Do not walk ~/.codex/sessions. Do not open jsonl or sqlite files. If a path is missing, try the next. If none exist, clone the repository into an unused, durable directory outside the target project. Preserve existing files and uncommitted changes.
+
+1. The CAO wrapper or checkout absolute path already recorded in this conversation's handoff notes, if any
+2. $CODEX_HOME/skills/cao (only when CODEX_HOME is already set)
+3. ~/.codex/skills/cao
+4. ~/.agents/skills/cao
+
+When a path exists, realpath the symlink to the checkout. Then run only:
 node <absolute-checkout-path>/bin/cao.mjs skill install
 node <absolute-checkout-path>/bin/cao.mjs skill status
 node <absolute-checkout-path>/bin/cao.mjs doctor
@@ -56,13 +62,13 @@ Add CSV import to this project. Handle duplicate rows and malformed files, add r
 
 You do not need to invoke CAO again before each development request. Codex reads the conversation's saved preference and drives the CAO workflow. Plain questions and planning requests are answered without starting workers. With no development task supplied, activation only checks readiness.
 
-| What you want | What to send in the same conversation |
-| --- | --- |
-| See progress | “Show the current CAO mode, run, task states, and blockers.” |
-| Change the agent | “Use my configured Pi for subsequent CAO tasks; check compatibility first.” |
-| Handle one task directly | “For this task only, work directly without CAO.” |
-| Turn off the default | “Stop using CAO by default in this conversation.” |
-| Restore the default | Invoke CAO again. |
+| What you want            | What to send in the same conversation                                       |
+| ------------------------ | --------------------------------------------------------------------------- |
+| See progress             | “Show the current CAO mode, run, task states, and blockers.”                |
+| Change the agent         | “Use my configured Pi for subsequent CAO tasks; check compatibility first.” |
+| Handle one task directly | “For this task only, work directly without CAO.”                            |
+| Turn off the default     | “Stop using CAO by default in this conversation.”                           |
+| Restore the default      | Invoke CAO again.                                                           |
 
 Each conversation has its own activation record. Installing the skill does not enable every conversation or create a background scheduler. To resume active work elsewhere, provide the original project, state directory, and run ID so Codex can inspect the existing run.
 
@@ -244,12 +250,12 @@ To inspect the current conversation view with token columns, you can ask Codex:
 
 ## Agent support
 
-| Agent | Task value | Current validation |
-| --- | --- | --- |
-| Claude Code | `claude` | Local live workflow and controlled repair verified; profiled local relay verified with a simulated Anthropic API |
-| Pi | `pi` | Isolated Kimi `k3` adaptive Herdr workflow verified through independent acceptance, integration and cleanup; other configurations remain unverified |
-| OpenCode | `opencode` | Launch and profiled runtime adapter implemented; live workflow not yet verified |
-| Codex CLI | `codex` | Native CLI profile request verified against a mock API; complete Herdr workflow not yet verified |
+| Agent       | Task value | Current validation                                                                                                                                  |
+| ----------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `claude`   | Local live workflow and controlled repair verified; profiled local relay verified with a simulated Anthropic API                                    |
+| Pi          | `pi`       | Isolated Kimi `k3` adaptive Herdr workflow verified through independent acceptance, integration and cleanup; other configurations remain unverified |
+| OpenCode    | `opencode` | Launch and profiled runtime adapter implemented; live workflow not yet verified                                                                     |
+| Codex CLI   | `codex`    | Native CLI profile request verified against a mock API; complete Herdr workflow not yet verified                                                    |
 
 `agentArgs` forwards CLI-specific options in inherited mode. Profiled tasks reject arguments that would conflict with profile-owned model, provider, session, config, or worktree settings; Codex allows selected reasoning and verbosity `-c` overrides. `nativeInstructions` describes how a worker should use its available native tools. `maxChildren` is a reporting budget, not a hard runtime limit; adaptive Claude also checks available hook evidence before acceptance. See the [adapter architecture](docs/architecture.md), [execution profiles](docs/execution-profiles.md) and [live validation boundaries](docs/adaptive-validation.md).
 
@@ -288,23 +294,23 @@ Plain `npm run smoke` only prints instructions. Live smoke tests use your config
 
 ## Documentation
 
-| Resource | Contents |
-| --- | --- |
-| [Architecture](docs/architecture.md) | CLI, state store, Herdr runtime, Git isolation, verification, profiled execution |
-| [Execution profiles and routing](docs/execution-profiles.md) | Profile CRUD, secrets, CC Switch import, routing, gateway lifecycle |
-| [Local Agent Monitor](docs/monitor.md) | Read-only local dashboard for CAO, Codex, and Claude metadata |
-| [Task states and recovery](docs/states.md) | Result contract, retries, interaction, checkout and integration holds |
-| [Supervision and performance](docs/supervision.md) | Foreground controller, preflight, report submission, deadlines and timing evidence |
-| [Resources and calibration](docs/resources.md) | Native/NVM discovery, CC Switch Pi profiles, isolated probes and cached evidence |
-| [Task briefs and shadow routing](docs/shadow-routing.md) | Advisory choices, conversation preferences and evidence limits |
-| [Opt-in adaptive dispatch](docs/adaptive-dispatch.md) | Actual resource selection, pinned attempts and native-child acceptance evidence |
-| [Paired benchmark evaluation](docs/benchmark-evaluation.md) | Predeclared trials, complete denominators, paired outcomes and rollout limits |
-| [Adaptive live validation](docs/adaptive-validation.md) | Tested Claude/Pi flows, isolation, observed failures and remaining coverage |
-| [Current-Codex host work](docs/host-work.md) | Register, report and independently verify in-place work without an external session |
-| [Token usage reports](docs/usage.md) | Optional Tokscale integration, JSON shape, attribution boundaries |
-| [CAO Codex skill](docs/codex-skill.md) | One-prompt installation, `/CAO` activation, conversation preferences, and updates |
-| [Changelog](CHANGELOG.md) | Release history |
-| [中文文档](README.zh-CN.md) | Chinese overview and getting started |
+| Resource                                                     | Contents                                                                            |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| [Architecture](docs/architecture.md)                         | CLI, state store, Herdr runtime, Git isolation, verification, profiled execution    |
+| [Execution profiles and routing](docs/execution-profiles.md) | Profile CRUD, secrets, CC Switch import, routing, gateway lifecycle                 |
+| [Local Agent Monitor](docs/monitor.md)                       | Read-only local dashboard for CAO, Codex, and Claude metadata                       |
+| [Task states and recovery](docs/states.md)                   | Result contract, retries, interaction, checkout and integration holds               |
+| [Supervision and performance](docs/supervision.md)           | Foreground controller, preflight, report submission, deadlines and timing evidence  |
+| [Resources and calibration](docs/resources.md)               | Native/NVM discovery, CC Switch Pi profiles, isolated probes and cached evidence    |
+| [Task briefs and shadow routing](docs/shadow-routing.md)     | Advisory choices, conversation preferences and evidence limits                      |
+| [Opt-in adaptive dispatch](docs/adaptive-dispatch.md)        | Actual resource selection, pinned attempts and native-child acceptance evidence     |
+| [Paired benchmark evaluation](docs/benchmark-evaluation.md)  | Predeclared trials, complete denominators, paired outcomes and rollout limits       |
+| [Adaptive live validation](docs/adaptive-validation.md)      | Tested Claude/Pi flows, isolation, observed failures and remaining coverage         |
+| [Current-Codex host work](docs/host-work.md)                 | Register, report and independently verify in-place work without an external session |
+| [Token usage reports](docs/usage.md)                         | Optional Tokscale integration, JSON shape, attribution boundaries                   |
+| [CAO Codex skill](docs/codex-skill.md)                       | One-prompt installation, `/CAO` activation, conversation preferences, and updates   |
+| [Changelog](CHANGELOG.md)                                    | Release history                                                                     |
+| [中文文档](README.zh-CN.md)                                  | Chinese overview and getting started                                                |
 
 ## Contributing and support
 

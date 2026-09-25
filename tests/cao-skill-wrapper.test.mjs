@@ -39,3 +39,26 @@ test('installed skill wrapper resolves its physical checkout and preserves proje
   assert.equal(JSON.parse(rejected.stderr).error.code, 'invalid_thread');
   assert.deepEqual(await fs.readdir(project), []);
 });
+
+test('README install paste uses exact-path stats and SKILL locate stays loaded-dir plus --paths', async () => {
+  const readme = await fs.readFile(path.join(repository, 'README.md'), 'utf8');
+  const readmeZh = await fs.readFile(path.join(repository, 'README.zh-CN.md'), 'utf8');
+  const skill = await fs.readFile(path.join(repository, 'skills/cao/SKILL.md'), 'utf8');
+  assert.match(readme, /\$CODEX_HOME\/skills\/cao/);
+  assert.match(readme, /~\/\.codex\/skills\/cao/);
+  assert.match(readme, /~\/\.agents\/skills\/cao/);
+  assert.match(readme, /Do not list parent directories/);
+  assert.match(readme, /Do not walk ~\/\.codex\/sessions/);
+  assert.match(readme, /Do not open jsonl or sqlite/);
+  assert.doesNotMatch(readme, /Find and reuse my local CAO checkout/);
+  assert.doesNotMatch(readme, /Read its README\.md and skills\/cao\/SKILL\.md/);
+  assert.match(readmeZh, /\$CODEX_HOME\/skills\/cao/);
+  assert.match(readmeZh, /不要列出父目录/);
+  assert.match(readmeZh, /不要遍历 ~\/\.codex\/sessions/);
+  assert.doesNotMatch(readmeZh, /先查找并复用本机已有的 CAO 仓库/);
+  assert.doesNotMatch(skill, /\$CODEX_HOME\/skills\/cao/);
+  assert.doesNotMatch(skill, /~\/\.codex\/skills\/cao/);
+  assert.doesNotMatch(skill, /~\/\.agents\/skills\/cao/);
+  assert.match(skill, /loaded `SKILL\.md`/);
+  assert.match(skill, /--paths/);
+});

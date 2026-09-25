@@ -142,6 +142,33 @@ test('collector separates native idle from CAO delivery acceptance', async t => 
   assert.equal(rework.delivery, 'rework');
 });
 
+test('collector labels provider saturation without changing waiting status', async t => {
+  const state = await root(t);
+  const project = path.join(state, 'project');
+  await saveRun(state, runRecord('run-sat', project, [
+    taskRecord('blocked-task', [attempt('blocked-a1', 'needs_input', {
+      taskId: 'blocked-task',
+      lastObservedState: 'blocked',
+      workerClosed: false,
+      providerObservation: { code: 'provider_saturated' },
+    })]),
+    taskRecord('rework-task', [attempt('rework-a1', 'rework', {
+      taskId: 'rework-task',
+      providerObservation: { code: 'provider_rate_limited' },
+    })]),
+  ]));
+  const herdr = herdrFake({
+    'session-run-sat': { result: { snapshot: { agents: [{ name: 'worker-blocked-a1', pane_id: 'pane-blocked-a1', terminal_id: 'term-blocked-a1', agent: 'claude', agent_status: 'blocked', interactive_ready: false }] } } },
+  });
+  const snapshot = await new MonitorCollector({ root: state, project, codex: codexFake(), claude: claudeFake(), herdr }).snapshot();
+  const blocked = snapshot.nodes.find(node => node.taskId === 'blocked-task');
+  assert.equal(blocked.status, 'waiting');
+  assert.equal(blocked.statusLabel, 'Provider saturated · not a CAO retry · needs_input · blocked');
+  const rework = snapshot.nodes.find(node => node.taskId === 'rework-task');
+  assert.equal(rework.status, 'waiting');
+  assert.equal(rework.statusLabel, 'Provider saturated · not a CAO retry · rework');
+});
+
 test('collector marks active CAO attempts unknown on terminal identity mismatch and never treats idle as accepted', async t => {
   const state = await root(t);
   const project = path.join(state, 'project');

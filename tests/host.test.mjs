@@ -54,6 +54,17 @@ test('host scope and user baseline are checked independently of self-reported ch
   const submitted = await f.service.hostReport(f.run.id, retry.task.id, report(retry.attempt));
   assert.equal(submitted.attempt.status, 'needs_input');
   assert.deepEqual(submitted.attempt.outsideScope, ['outside.txt']);
+  assert.deepEqual(submitted.retryAdvice, { action: 'retry_with_feedback', reason: 'scope_violation' });
+});
+
+test('host start rejects missing directory slash before reserving', async t => {
+  const f = await setup(t);
+  await assert.rejects(f.service.hostStart(f.run.id, hostTask({ allowedPaths: ['src'] })), e => {
+    assert.equal(e.code, 'directory_scope_missing_slash');
+    assert.equal(e.details.scope.root, false);
+    return true;
+  });
+  assert.equal((await f.service.status(f.run.id)).tasks.length, 0);
 });
 
 test('host ownership, nonce, stopped declaration and child completion are enforced', async t => {

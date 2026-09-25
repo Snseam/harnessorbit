@@ -72,7 +72,6 @@ Orchestrator 是状态机和流程协调层。
 - `recover`：对 integration hold 复验当前 checkout，不再次 apply patch；对已停止的 failed/rework/interrupted/cancelled checkout 任务，按当前 checkout 重新进入 verify。
 - `cancel`/`cleanup`：关闭 worker 或停止 CAO session；证据与工作树保留。checkout cancel 无改动时释放 checkout hold；cleanup 关闭 run 的新 dispatch，但不清除 hold。
 
-
 ## Agent Monitor：`src/monitor/*`
 
 Agent Monitor 是一个本地只读状态界面，用于查看 CAO 项目和相关原生 agent metadata。默认 scope 是当前 CAO 项目：`monitor start --open` 会把当前工作目录解析为 Git root，并展示匹配的 CAO run，以及可关联的 Codex/Claude children。`monitor start --run <runId>` 缩小到单个 run；`monitor start --all` 是显式的整机视图。三种 scope 互斥。`--codex-home` 和 `--claude-home` 指向对应工具的配置根，不是项目目录。旧版或跨目录 Codex coordinator thread 需要关联时，可以显式传 `--coordinator`。Monitor 使用与 run 命令相同的 CAO state directory。
@@ -108,6 +107,8 @@ Codex 观察优先使用本地 app-server proxy。当前本机 app-server 行为
       integration-<随机>.json
 ```
 
+`herdr-server.log` 是 Herdr daemon 的 stdio。preparing→failed 的原因在 `attempt.state.errorCode` 和 `inspect` 的 `lastError` 上，不在这份日志里。
+
 写 JSON 使用临时文件 + rename；锁使用目录锁，带 pid/hostname/nonce owner。只恢复同主机且进程确定死亡的锁。checkout 单写锁和项目集成锁位于 `<stateRoot>/locks/`，因此只在相同 stateRoot 下互相可见。
 
 ## 任务与 prompt：`src/task.mjs`、`src/adapters.mjs`
@@ -142,7 +143,7 @@ CAO 依赖 Herdr 的 pane/terminal/process identity。attempt 会记录 `paneId`
 Git 层负责项目快照、worktree、patch 和集成前冲突检查。
 
 - 快照包含所有 tracked 文件，以及未被 Git 忽略的 untracked 文件；tracked 文件即使匹配 ignore 规则也会进入快照。记录 hash、mode、type。
-- 快照拒绝 submodule，不读取 `.git`，也拒绝经过 symlink ancestor 的路径。
+- 快照把 gitlink 记为不透明指针（`type: gitlink`），不会把 submodule 内容检出到候选 worktree。仍不读取 `.git`，也拒绝经过 symlink ancestor 的路径。
 - worktree 任务使用 `git worktree add --detach`；源项目 dirty 时，会先把当前 tracked/untracked 状态写入 tree，再把候选 worktree reset 到该 tree，保留用户未提交基线。
 - `makePatch` 用临时 `GIT_INDEX_FILE` 生成 binary patch，不修改用户真实 index。
 - `applyPatch` 先 `git apply --check`，再 `git apply`；不 stage、不 commit。

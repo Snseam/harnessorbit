@@ -90,23 +90,41 @@ function assertSafeRelativePath(root, relativePath) {
   }
 }
 
-function rejectSubmodules(root) {
-  const entries = splitNul(gitText(['-C', root, 'ls-files', '-s', '-z']));
-  const submodules = entries.flatMap((entry) => {
-    const match = /^(160000) [0-9a-f]+ \d+\t(.+)$/.exec(entry);
-    return match ? [match[2]] : [];
+function parseGitlinks(output) {
+  return splitNul(output).flatMap((entry) => {
+    const match = /^(160000) ([0-9a-f]+) \d+\t(.+)$/.exec(entry);
+    return match ? [{ sha: match[2], path: match[3] }] : [];
   });
+}
 
-  if (submodules.length > 0) {
-    throw new OrchestratorError('unsupported_submodule', 'Submodules are not supported by this git workspace snapshot/patch implementation', {
-      root,
-      paths: submodules.sort(),
-    });
+function listGitlinks(root, env = {}) {
+  return parseGitlinks(gitText(['-C', root, 'ls-files', '-s', '-z'], { env }));
+}
+
+function uniqueGitlinkPaths(...groups) {
+  return [...new Set(groups.flat().map((entry) => entry.path))].sort();
+}
+
+function gitlinkExcludes(paths) {
+  return paths.flatMap((relativePath) => [`:(exclude)${relativePath}`, `:(exclude)${relativePath}/**`]);
+}
+
+function removeIndexPaths(root, env, paths) {
+  if (paths.length === 0) return;
+  git(['-C', root, 'update-index', '--force-remove', '--', ...paths], { env });
+}
+
+function addWorktreeExcept(root, env, excludedPaths) {
+  git(['-C', root, 'add', '-A', '--', '.', ...gitlinkExcludes(excludedPaths)], { env });
+}
+
+function pinGitlinks(root, env, gitlinks) {
+  for (const entry of gitlinks) {
+    git(['-C', root, 'update-index', '--add', '--cacheinfo', '160000', entry.sha, entry.path], { env });
   }
 }
 
 function snapshotPaths(root) {
-  rejectSubmodules(root);
   const tracked = splitNul(gitText(['-C', root, 'ls-files', '-z']));
   const untracked = splitNul(gitText(['-C', root, 'ls-files', '--others', '--exclude-standard', '-z']));
   const relativePaths = [...new Set([...tracked, ...untracked])].sort();
@@ -168,9 +186,20 @@ export function snapshot(project) {
   const root = worktreeRoot(project);
   const relativePaths = snapshotPaths(root);
   const files = {};
+  const gitlinks = listGitlinks(root);
+  const gitlinkPaths = new Set(gitlinks.map((entry) => entry.path));
+
+  for (const entry of gitlinks) {
+    files[entry.path] = {
+      hash: hashBuffer(Buffer.from(entry.sha)),
+      mode: '160000',
+      type: 'gitlink',
+    };
+  }
 
   for (const relativePath of relativePaths) {
     if (relativePath === '.git' || relativePath.startsWith('.git/')) continue;
+    if (gitlinkPaths.has(relativePath)) continue;
 
     const absolutePath = resolve(root, relativePath);
     let stat;
@@ -212,7 +241,11 @@ export function snapshotTree(project) {
 
   return withTemporaryIndex((env) => {
     git(['-C', root, 'read-tree', 'HEAD'], { env });
-    git(['-C', root, 'add', '-A', '--', '.'], { env });
+    const headGitlinks = listGitlinks(root, env);
+    const liveGitlinks = listGitlinks(root);
+    const excluded = uniqueGitlinkPaths(headGitlinks, liveGitlinks);
+    removeIndexPaths(root, env, headGitlinks.map((entry) => entry.path));
+    addWorktreeExcept(root, env, excluded);
     return gitText(['-C', root, 'write-tree'], { env }).trim();
   });
 }
@@ -240,7 +273,10 @@ export function createWorktree(project, destination, baseCommit, baseTree = unde
     });
   }
 
-  git(['-C', info.root, 'worktree', 'add', '--detach', absoluteDestination, commit]);
+  const addArgs = ['-C', info.root, 'worktree', 'add', '--detach'];
+  if (baseTree !== undefined) addArgs.push('--no-checkout');
+  addArgs.push(absoluteDestination, commit);
+  git(addArgs);
   const created = realpathSync(absoluteDestination);
   if (baseTree !== undefined) {
     git(['-C', created, 'read-tree', '--reset', '-u', baseTree]);
@@ -256,7 +292,10 @@ export function makePatch(worktree, patchPath, baseTree = 'HEAD') {
 
   withTemporaryIndex((env) => {
     git(['-C', root, 'read-tree', baseTree], { env });
-    git(['-C', root, 'add', '-A', '--', '.'], { env });
+    const baseGitlinks = listGitlinks(root, env);
+    const liveGitlinks = listGitlinks(root);
+    addWorktreeExcept(root, env, uniqueGitlinkPaths(baseGitlinks, liveGitlinks));
+    pinGitlinks(root, env, liveGitlinks);
     const patch = git(['-C', root, 'diff', '--no-ext-diff', '--cached', '--binary', baseTree], { env });
     writeFileSync(absolutePatchPath, patch);
   });

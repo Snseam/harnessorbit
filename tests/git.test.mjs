@@ -244,7 +244,7 @@ test('snapshot refuses tracked paths that pass through symlink ancestors', { ski
   }
 });
 
-test('snapshot and makePatch explicitly reject gitlinks/submodules', () => {
+test('snapshot and makePatch treat cacheinfo gitlinks as opaque pointers', () => {
   const directory = repo();
   const parent = mkdtempSync(join(tmpdir(), 'cao-git-submodule-'));
   try {
@@ -252,11 +252,49 @@ test('snapshot and makePatch explicitly reject gitlinks/submodules', () => {
     commitAll(directory);
     const head = getProjectInfo(directory).head;
     git(directory, ['update-index', '--add', '--cacheinfo', '160000', head, 'vendor']);
+    const indexBefore = stagedFingerprint(directory);
 
-    assertOrchestratorCode(() => snapshot(directory), 'unsupported_submodule');
+    const recorded = snapshot(directory);
+    assert.equal(recorded.files.vendor.type, 'gitlink');
+    assert.equal(recorded.files.vendor.mode, '160000');
+    assert.equal(stagedFingerprint(directory), indexBefore);
 
     const patchPath = join(parent, 'submodule.patch');
-    assertOrchestratorCode(() => makePatch(directory, patchPath), 'unsupported_submodule');
+    makePatch(directory, patchPath);
+    assert.equal(existsSync(patchPath), true);
+    assert.equal(stagedFingerprint(directory), indexBefore);
+  } finally {
+    cleanup(directory);
+    cleanup(parent);
+  }
+});
+
+test('committed leftover gitlink that is not a listed worktree still snapshots', () => {
+  const directory = repo();
+  const parent = mkdtempSync(join(tmpdir(), 'cao-git-leftover-gitlink-'));
+  try {
+    writeFileSync(join(directory, 'file.txt'), 'base\n');
+    commitAll(directory);
+    const head = getProjectInfo(directory).head;
+    mkdirSync(join(directory, '.claude', 'worktrees', 'bug-audit'), { recursive: true });
+    git(directory, ['update-index', '--add', '--cacheinfo', '160000', head, '.claude/worktrees/bug-audit']);
+    git(directory, ['commit', '-m', 'leftover gitlink']);
+
+    const listed = git(directory, ['worktree', 'list', '--porcelain']);
+    assert.equal(listed.includes('.claude/worktrees/bug-audit'), false);
+
+    const recorded = snapshot(directory);
+    assert.equal(recorded.files['.claude/worktrees/bug-audit'].type, 'gitlink');
+    assert.equal(recorded.files['.claude/worktrees/bug-audit'].mode, '160000');
+
+    const baseTree = snapshotTree(directory);
+    const trees = git(directory, ['ls-tree', '-r', baseTree]);
+    assert.equal(/160000/.test(trees), false);
+    assert.equal(git(directory, ['cat-file', '-t', baseTree]).trim(), 'tree');
+
+    const worktree = createWorktree(directory, join(parent, 'work'), getProjectInfo(directory).head, baseTree);
+    const candidate = snapshot(worktree);
+    assert.equal(candidate.files['.claude/worktrees/bug-audit'], undefined);
   } finally {
     cleanup(directory);
     cleanup(parent);

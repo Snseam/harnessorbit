@@ -24,6 +24,7 @@ export function publicTokenUsage(value) {
 function publicTiming(value) {
   if (!value || typeof value !== 'object') return null;
   const phases = ['prepare', 'launch', 'execute', 'collect', 'verify', 'integrate'];
+  const lastErrorCode = cleanText(value.evidence?.lastErrorCode ?? value.lastErrorCode, 80);
   return {
     phase: [...phases, 'blocked', 'finished', 'unknown'].includes(value.phase) ? value.phase : 'unknown',
     durationsMs: Object.fromEntries(phases.map(phase => [phase, counter(value.durationsMs?.[phase])])),
@@ -32,6 +33,7 @@ function publicTiming(value) {
     lastObservedAt: date(value.lastObservedAt),
     blockerCategory: cleanText(value.blocker?.category ?? value.blockerCategory, 40),
     legacyPrehistory: value.coverage?.hasLegacyPrehistory === true || value.legacyPrehistory === true,
+    ...(lastErrorCode ? { lastErrorCode } : {}),
   };
 }
 

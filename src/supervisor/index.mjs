@@ -51,6 +51,15 @@ function canProgressImmediately(snapshot, integrate) {
   return snapshot.status === 'submitted' || canIntegrate(snapshot, integrate);
 }
 
+function attentionItem(snapshot, reason) {
+  return {
+    key: `${snapshot.taskId}:${snapshot.attemptId}:${reason}`,
+    taskId: snapshot.taskId,
+    attemptId: snapshot.attemptId,
+    reason,
+  };
+}
+
 export class Supervisor {
   constructor({ orchestrator, now = Date.now, sleep = defaultSleep } = {}) {
     if (!orchestrator || typeof orchestrator !== 'object') throw new TypeError('Supervisor requires an orchestrator.');
@@ -298,12 +307,8 @@ export class Supervisor {
     if (snapshot.executorKind === 'host' && !['accepted', 'submitted'].includes(snapshot.status)) {
       items.push({ key: `${snapshot.taskId}:${snapshot.attemptId}:host`, taskId: snapshot.taskId, attemptId: snapshot.attemptId, reason: 'host_report_or_stop_required' });
     }
-    if (HOLD.has(snapshot.status)) {
-      items.push({ key: `${snapshot.taskId}:${snapshot.attemptId}:${snapshot.status}`, taskId: snapshot.taskId, attemptId: snapshot.attemptId, reason: snapshot.status });
-    }
-    if (['needs_input', 'cancelling'].includes(snapshot.status)) {
-      const reason = snapshot.errorCode || snapshot.status;
-      items.push({ key: `${snapshot.taskId}:${snapshot.attemptId}:${reason}`, taskId: snapshot.taskId, attemptId: snapshot.attemptId, reason });
+    if (HOLD.has(snapshot.status) || ['needs_input', 'cancelling'].includes(snapshot.status)) {
+      items.push(attentionItem(snapshot, snapshot.errorCode || snapshot.status));
     }
     for (let index = 0; index < snapshot.childStatuses.length; index++) {
       const child = snapshot.childStatuses[index];

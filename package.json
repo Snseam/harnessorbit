@@ -15,6 +15,8 @@
     "check": "node scripts/check.mjs",
     "smoke": "node scripts/smoke.mjs",
     "smoke:profiles": "node scripts/smoke-profiles.mjs",
+    "benchmark:internal": "node scripts/internal-benchmark.mjs",
+    "benchmark:real": "node scripts/real-benchmark.mjs",
     "test:herdr": "node --test tests/integration/herdr.test.mjs",
     "test:tokscale": "node --test tests/integration/tokscale.test.mjs"
   },

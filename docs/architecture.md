@@ -73,7 +73,6 @@ The orchestrator is the state machine and coordination layer.
 - `cancel` closes the owned worker when identity still matches. Checkout cancellation releases the checkout hold only when there are no changes relative to that task baseline.
 - `cleanup` stops the run's Herdr server and closes the run for future dispatch. It retains worktrees, evidence, and any checkout/integration holds.
 
-
 ## Agent Monitor: `src/monitor/*`
 
 The Agent Monitor is a local read-only status surface for CAO projects and related native agent metadata. The default scope is the current CAO project: `monitor start --open` resolves the current working directory to its Git root and shows matching CAO runs plus associated Codex/Claude children when they can be linked. `monitor start --run <runId>` narrows the scope to one run, while `monitor start --all` is an explicit machine-wide view. The three scope forms are intentionally exclusive. `--codex-home` and `--claude-home` point at the corresponding configuration roots, not project directories. `--coordinator` can be supplied when an older or cross-directory Codex coordinator thread should be associated with the project. All monitor state uses the same CAO state directory as the run commands.
@@ -106,6 +105,8 @@ The default state root is `~/.local/state/codex-agent-orchestrator`; `--state-di
       candidate.patch
       integration-<random>.json
 ```
+
+`herdr-server.log` is Herdr daemon stdio. Preparing-to-failed reasons live on `attempt.state.errorCode` and `inspect` `lastError`, not in that log.
 
 JSON writes use a temporary file and atomic rename. Locks are directory locks with pid/hostname/nonce owners. CAO only recovers a stale lock when the owner is on the same host and the process is definitely dead. Checkout and integration project locks live under `<stateRoot>/locks/`, so they coordinate only callers using the same state root.
 
@@ -143,7 +144,7 @@ The Git layer handles snapshots, worktrees, patches, and integration checks.
 
 - Snapshots include tracked files and untracked files that are not ignored by Git. Tracked files are included even if they match ignore patterns.
 - Snapshots record hash, mode, and type; symlink targets are hashed without following the link.
-- Snapshots reject submodules and paths that pass through symlink ancestors, and never read `.git`.
+- Snapshots treat gitlinks as opaque pointers (`type: gitlink`) and do not check submodule content out into candidates. They still reject paths that pass through symlink ancestors, and never read `.git`.
 - Worktree tasks use `git worktree add --detach`. If the source checkout is dirty, CAO writes the current tracked plus untracked/non-ignored state into a tree and resets the candidate worktree to that tree, preserving the user's baseline.
 - `makePatch` uses a temporary `GIT_INDEX_FILE` to produce a binary patch without touching the user's real index.
 - `applyPatch` runs `git apply --check` and then `git apply`; it does not stage, commit, or push.

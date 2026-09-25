@@ -194,6 +194,21 @@ test('summarizeRun preserves retries, failures, cancels, unjudged outcomes, and 
   assert.equal(serialized.includes('secret-profile-token'), false);
 });
 
+test('summarizeTask does not substitute an old attempt for an invalid current pointer', () => {
+  const accepted = {
+    id: 'a1',
+    taskId: 'task',
+    status: 'accepted',
+    performance: trackAttempt(null, { id: 'a1', taskId: 'task', status: 'accepted' }, at(1)),
+  };
+  const report = summarizeRun({
+    id: 'run',
+    tasks: { task: { definition: { id: 'task' }, currentAttempt: 'missing', attempts: [accepted] } },
+  }, { now: at(10) });
+  assert.equal(report.tasks[0].outcome.currentStatus, null);
+  assert.equal(report.tasks[0].outcome.invalidCurrentAttempt, true);
+});
+
 test('accepted idle time before integration is unassigned rather than live model time', () => {
   const accepted = {
     id: 'a1',

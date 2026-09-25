@@ -31,7 +31,9 @@ export async function startHostTask(orchestrator, runId, input, { thread, retry 
   const definition = validateTask({ ...input, agent: 'codex', isolation: 'checkout' });
   invariant(!definition.agentArgs.length, 'invalid_host_task', 'Host work cannot launch CLI arguments.');
   invariant(!definition.deadlineAt || Date.parse(definition.deadlineAt) > Date.now(), 'deadline_exceeded', 'Host task deadline has passed.');
-  const reserved = await orchestrator._reserve(runId, definition, '', retry, { executorKind: 'host', ownerThreadId, routeDecision });
+  const run = await orchestrator.loadRun(runId);
+  await orchestrator._assertDirectoryScope(run.project, definition);
+  const reserved = await orchestrator.reserveTask(runId, definition, '', retry, { executorKind: 'host', ownerThreadId, routeDecision });
   if (reserved.duplicate) return { ...(await orchestrator.inspect(runId, definition.id)), duplicate: true };
   const { attempt } = reserved;
   try {
@@ -39,7 +41,7 @@ export async function startHostTask(orchestrator, runId, input, { thread, retry 
     await writeJsonAtomic(path.join(attempt.directory, 'task.json'), definition);
   } catch (error) {
     const unchanged = (await git.snapshot(attempt.cwd)).hash === attempt.baseline.hash;
-    await orchestrator._update(runId, definition.id, attempt.id, a => {
+    await orchestrator.updateAttempt(runId, definition.id, attempt.id, a => {
       a.status = 'failed'; a.checkoutReleased = unchanged;
       a.hostStoppedEvidence = { source: 'controller-before-host-work', at: now() };
       a.lastError = { code: 'host_setup_failed', message: 'Host task files could not be prepared.' };
@@ -50,9 +52,9 @@ export async function startHostTask(orchestrator, runId, input, { thread, retry 
 }
 
 export async function reportHostTask(orchestrator, runId, taskId, value, { thread } = {}) {
-  await orchestrator._attempt(runId, taskId);
+  await orchestrator.currentAttempt(runId, taskId);
   return withLock(path.join(runPath(orchestrator.root, runId), `verify-${taskId}.lock`), async () => {
-    const { task, attempt } = await orchestrator._attempt(runId, taskId);
+    const { task, attempt } = await orchestrator.currentAttempt(runId, taskId);
     assertHostOwner(orchestrator, attempt, thread);
     validateResult(value, task.definition, attempt);
     invariant(value.hostStopped === true, 'host_not_stopped', 'Report hostStopped:true only after editing and owned children have stopped.');
@@ -64,7 +66,7 @@ export async function reportHostTask(orchestrator, runId, taskId, value, { threa
     const unexpected = outsideScope(changedPaths, task.definition.allowedPaths);
     // Persist the report as evidence, never as an assertion of acceptance.
     await writeJsonAtomic(attempt.resultFile, value);
-    await orchestrator._update(runId, taskId, attempt.id, a => {
+    await orchestrator.updateAttempt(runId, taskId, attempt.id, a => {
       invariant(['running', 'needs_input'].includes(a.status) && !a.cancelRequested, 'host_report_not_allowed', 'Host task changed during submission.');
       a.report = value; a.reportHash = hash(value); a.snapshot = snapshot; a.changedPaths = changedPaths; a.outsideScope = unexpected;
       a.hostStoppedEvidence = { source: 'host-reported', at: now(), ownerThreadId: a.ownerThreadId };
@@ -79,11 +81,11 @@ export async function reportHostTask(orchestrator, runId, taskId, value, { threa
 }
 
 export async function releaseHostTask(orchestrator, runId, taskId, { thread, ackStopped = false, children } = {}) {
-  const { run } = await orchestrator._attempt(runId, taskId);
+  const { run } = await orchestrator.currentAttempt(runId, taskId);
   const projectKey = crypto.createHash('sha256').update(run.project).digest('hex');
   return withLock(path.join(orchestrator.root, 'locks', `project-${projectKey}`), () =>
     withLock(path.join(runPath(orchestrator.root, runId), `verify-${taskId}.lock`), async () => {
-      const { task, attempt } = await orchestrator._attempt(runId, taskId);
+      const { task, attempt } = await orchestrator.currentAttempt(runId, taskId);
       assertHostOwner(orchestrator, attempt, thread);
       invariant(ackStopped, 'host_stop_confirmation_required', 'Confirm that host editing and owned children have stopped.');
       invariant(!['accepted', 'integrated', 'verifying'].includes(attempt.status), 'host_release_not_allowed', 'Accepted work is already delivered; an active verifier must finish before release.');
@@ -93,7 +95,7 @@ export async function releaseHostTask(orchestrator, runId, taskId, { thread, ack
       const ids = new Set(reported.map(child => child.id));
       invariant((attempt.report?.children || []).every(child => ids.has(child.id)), 'children_unfinished', 'Do not omit previously reported children.');
       const unchanged = (await git.snapshot(attempt.cwd)).hash === attempt.baseline.hash;
-      await orchestrator._update(runId, taskId, attempt.id, a => {
+      await orchestrator.updateAttempt(runId, taskId, attempt.id, a => {
         a.hostStoppedEvidence = { source: 'host-reported', at: now(), ownerThreadId: a.ownerThreadId };
         a.releasedChildren = reported; a.cancelRequested = true; a.status = 'cancelled';
         a.checkoutReleased = unchanged;

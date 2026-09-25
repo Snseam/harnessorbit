@@ -47,6 +47,13 @@ Notable changes to Codex Agent Orchestrator are recorded here. Pre-1.0 interface
 
 ### Fixed
 
+- Treat leftover Git gitlinks as opaque snapshot pointers so nested worktree leftovers no longer fail `preparing`.
+- Surface a bounded `errorCode` on `attempt.state` events, monitor timings, and supervisor HOLD attention; `herdr-server.log` remains Herdr stdio.
+- Record `permission_required` or `worker_blocked` when Herdr is blocked, and restore `running` after that wait ends without auto-approving prompts.
+- Annotate provider saturation on collect without replacing `lastError`; monitor waiting copy is not a CAO retry.
+- Reject directory scopes missing a trailing slash before reserving an attempt; worktree scope violations cannot retry leftover files.
+- Close the Codex install-paste locate paths to exact `stat`s so installation does not walk session history.
+
 - Restore the preflight-discovered agent directory inside every owned Herdr pane, including PATH discoveries, so login-shell PATH changes do not silently start older agents or Node runtimes.
 - Resolve state-root aliases before resuming attempts, preventing macOS `/var` aliases from breaking telemetry identity checks and cleanup.
 - Release adaptive Claude capacity when startup is cancelled after the worker closes but before an assignment is sent; submitted or still-unknown child work continues to hold capacity.

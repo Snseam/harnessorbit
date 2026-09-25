@@ -441,6 +441,7 @@ function normalizePerformance(raw) {
     lastObservedAt: asIso(raw.lastObservedAt),
     blockerCategory: asText(raw.blockerCategory, 40),
     legacyPrehistory: raw.legacyPrehistory === true,
+    lastErrorCode: asText(raw.lastErrorCode, 80),
   };
 }
 

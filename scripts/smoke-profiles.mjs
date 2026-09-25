@@ -12,6 +12,7 @@ import { prepareExecution } from '../src/execution-config.mjs';
 import { Herdr } from '../src/runtime/herdr.mjs';
 import { fixture, promptData, task } from '../tests/helpers.mjs';
 import { createClaudeSmokeIsolation } from './helpers/claude-smoke-isolation.mjs';
+import { classifyClaudeBlockedOutput } from '../src/blocked-output.mjs';
 
 const PROFILE_IDS = ['alpha', 'beta'];
 const CLAUDE_ARGS = [
@@ -219,6 +220,7 @@ async function dispatchTasks(service, runId, inputs) {
 }
 
 async function nudgeIfTrustPrompt(service, runId, taskId, terminalText) {
+  if (!classifyClaudeBlockedOutput(terminalText)) return;
   if (terminalText.includes('Welcome to Claude Code') && terminalText.includes('Security notes:') && terminalText.includes('Press Enter to continue')) {
     await service.input(runId, taskId, { keys: ['enter'] });
   }

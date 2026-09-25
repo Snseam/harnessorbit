@@ -27,16 +27,16 @@ test('optional absolute deadline is strict, canonical and leaves legacy task dig
   }
 });
 
-test('preflight discovers newly introduced unsupported submodule before creating worker', async t => {
+test('preflight and dispatch treat cacheinfo gitlinks as opaque pointers', async t => {
   const { service, run, project, runtime } = await setup(t);
   const head = execFileSync('git', ['-C', project, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   execFileSync('git', ['-C', project, 'update-index', '--add', '--cacheinfo', `160000,${head},nested`]);
-  await assert.rejects(service.preflight(run.id, task()), e => e.code === 'unsupported_submodule');
+  await service.preflight(run.id, task());
   assert.equal((await service.status(run.id)).tasks.length, 0);
   const dispatched = await service.dispatch(run.id, task());
-  assert.equal(dispatched.attempt.status, 'failed');
-  assert.equal(dispatched.attempt.lastError.code, 'unsupported_submodule');
-  assert.equal(runtime.starts, 0);
+  assert.notEqual(dispatched.attempt.lastError?.code, 'unsupported_submodule');
+  assert.notEqual(dispatched.attempt.status, 'failed');
+  assert.ok(runtime.starts > 0);
 });
 
 test('missing runtime and expired task fail before worker launch and do not hold untouched checkout', async t => {
@@ -138,6 +138,84 @@ test('expired verification is bounded while explicit recover can recheck retaine
   assert.ok(failed.attempt.deadlineExceededAt);
   service.command = async () => ({ code: 0, stdout: '', stderr: '' });
   assert.equal((await service.recover(run.id, task().id)).attempt.status, 'accepted');
+});
+
+test('collect stamps blocked lastError and restores running after the wait ends', async t => {
+  const { service, run, runtime } = await setup(t);
+  const dispatched = await service.dispatch(run.id, task());
+  const worker = runtime.workers.get(dispatched.attempt.workerName);
+  worker.agent_status = 'blocked';
+  runtime.readAgent = async () => 'Yes, I trust this folder SECRET';
+  const blocked = await service.collect(run.id, task().id);
+  assert.equal(blocked.attempt.status, 'needs_input');
+  assert.equal(blocked.attempt.lastError.code, 'permission_required');
+  assert.equal(JSON.stringify(blocked.attempt.lastError).includes('SECRET'), false);
+  await assert.rejects(service.requestReport(run.id, task().id), e => e.code === 'report_request_not_allowed');
+  worker.agent_status = 'working';
+  worker.interactive_ready = true;
+  const resumed = await service.collect(run.id, task().id);
+  assert.equal(resumed.attempt.status, 'running');
+  assert.equal(resumed.attempt.lastError, undefined);
+});
+
+test('unclassified Herdr blocked waits use worker_blocked without auto-approving', async t => {
+  const { service, run, runtime } = await setup(t);
+  const dispatched = await service.dispatch(run.id, task());
+  const worker = runtime.workers.get(dispatched.attempt.workerName);
+  worker.agent_status = 'blocked';
+  runtime.readAgent = async () => 'pane is waiting on an unknown dialog';
+  const blocked = await service.collect(run.id, task().id);
+  assert.equal(blocked.attempt.lastError.code, 'worker_blocked');
+  await assert.rejects(service.requestReport(run.id, task().id), e => e.code === 'report_request_not_allowed');
+});
+
+test('provider saturation annotates collect without replacing lastError', async t => {
+  const { service, run, runtime } = await setup(t);
+  const dispatched = await service.dispatch(run.id, task());
+  const worker = runtime.workers.get(dispatched.attempt.workerName);
+  worker.agent_status = 'blocked';
+  runtime.readAgent = async () => 'Selected model is at capacity';
+  const blocked = await service.collect(run.id, task().id);
+  assert.equal(blocked.attempt.lastError.code, 'worker_blocked');
+  assert.equal(blocked.attempt.providerObservation.code, 'provider_saturated');
+  assert.equal(JSON.stringify(blocked.attempt.lastError).includes('capacity'), false);
+  await assert.rejects(service.requestReport(run.id, task().id), e => e.code === 'report_request_not_allowed');
+  worker.agent_status = 'working';
+  worker.interactive_ready = true;
+  const resumed = await service.collect(run.id, task().id);
+  assert.equal(resumed.attempt.status, 'running');
+  assert.equal(resumed.attempt.lastError, undefined);
+  assert.equal(resumed.attempt.providerObservation.code, 'provider_saturated');
+});
+
+test('idle missing result keeps missing_result when pane shows saturation', async t => {
+  const runtime = new FakeHerdr(async () => {});
+  const { service, run } = await setup(t, runtime);
+  const dispatched = await service.dispatch(run.id, task());
+  const worker = runtime.workers.get(dispatched.attempt.workerName);
+  worker.agent_status = 'idle';
+  worker.interactive_ready = true;
+  runtime.readAgent = async () => 'Selected model is at capacity';
+  await service._update(run.id, task().id, dispatched.attempt.id, a => {
+    a.submissionStartedAt = new Date(Date.now() - 6000).toISOString();
+  });
+  const collected = await service.collect(run.id, task().id, { waitMs: 0 });
+  assert.equal(collected.attempt.status, 'needs_input');
+  assert.equal(collected.attempt.lastError.code, 'missing_result');
+  assert.equal(collected.attempt.providerObservation.code, 'provider_saturated');
+});
+
+test('failed startup writes bounded errorCode on attempt.state events', async t => {
+  const runtime = new FakeHerdr();
+  runtime.preflight = async () => ({ herdr: { available: true }, agent: { available: false } });
+  const { service, run } = await setup(t, runtime);
+  const failed = await service.dispatch(run.id, task({ isolation: 'checkout' }));
+  assert.equal(failed.attempt.lastError.code, 'preflight_unavailable');
+  const file = path.join(service.root, 'runs', run.id, 'events.jsonl');
+  const events = (await fs.readFile(file, 'utf8')).trim().split('\n').map(line => JSON.parse(line)).filter(e => e.type === 'attempt.state' && e.to === 'failed');
+  assert.equal(events.at(-1).errorCode, 'preflight_unavailable');
+  assert.equal(Object.hasOwn(events.at(-1), 'message'), false);
+  assert.equal(Object.hasOwn(events.at(-1), 'details'), false);
 });
 
 test('performance events follow committed state and event append failure marks incomplete coverage', async t => {
