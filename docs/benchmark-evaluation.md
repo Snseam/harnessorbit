@@ -1,6 +1,6 @@
 # Paired Benchmark Evaluation
 
-CAO's benchmark evaluator is a statistics harness for controlled experiments. It does not run agents, does not enable adaptive dispatch by default, and does not claim that CAO is faster from smoke tests or shadow routing.
+HarnessOrbit's benchmark evaluator is a statistics harness for controlled experiments. It does not run agents, does not enable adaptive dispatch by default, and does not claim that HarnessOrbit is faster from smoke tests or shadow routing.
 
 Run it with a predeclared plan and a result file:
 
@@ -21,6 +21,6 @@ Each report also includes two cancellation sensitivity views:
 
 Pairwise comparisons are matched by cohort, task id, and repetition. The evaluator reports planned pairs, observed matched pairs, missing pair members, and completed-pair deltas. Completed-pair deltas only use pairs where both arms produced observed full-acceptance results. `benefitClaim` remains `null`: rollout claims require enough real, controlled, paired data and a separate release decision. Unpaired data can still be inspected, but it cannot justify a speed or completion-rate claim.
 
-The schema checks accounting shape, not whether a claimed result is truthful. Keep raw transcripts, commits, check logs, and acceptance artifacts available for review. CAO should stay opt-in until CI or a separate release process verifies enough real benchmark evidence.
+The schema checks accounting shape, not whether a claimed result is truthful. Keep raw transcripts, commits, check logs, and acceptance artifacts available for review. HarnessOrbit should stay opt-in until CI or a separate release process verifies enough real benchmark evidence.
 
 The example files are intentionally small and incomplete. They demonstrate accounting behavior, not performance evidence.

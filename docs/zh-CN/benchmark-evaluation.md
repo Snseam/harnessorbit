@@ -1,6 +1,6 @@
 # 成对 Benchmark 评估
 
-CAO 的 benchmark 评估器是受控实验的统计框架。它不启动 agent，不把 adaptive dispatch 设为默认，也不会用 smoke test 或 shadow routing 声称 CAO 变快。
+HarnessOrbit 的 benchmark 评估器是受控实验的统计框架。它不启动 agent，不把 adaptive dispatch 设为默认，也不会用 smoke test 或 shadow routing 声称 HarnessOrbit 变快。
 
 使用预先声明的实验计划和结果文件运行：
 
@@ -21,6 +21,6 @@ node benchmarks/evaluate.mjs benchmarks/example-plan.json benchmarks/example-res
 
 配对比较按 cohort、task id 和 repetition 匹配。评估器会报告计划配对数、实际观察到的配对数、缺失 pair 成员数和完成配对的耗时差。完成配对耗时差只使用两个实验臂都产生实际完整验收结果的 pair。`benefitClaim` 保持为 `null`：默认启用或宣称收益需要足够的真实、受控、成对数据和单独发布决策。无法配对的数据可以检查，但不能支撑速度或完成率收益结论。
 
-schema 只校验统计口径，不证明结果内容真实。原始 transcript、commit、检查日志和验收产物仍需保留给评审。没有 CI 或单独发布流程确认足够真实 benchmark 证据之前，CAO 仍应保持 opt-in。
+schema 只校验统计口径，不证明结果内容真实。原始 transcript、commit、检查日志和验收产物仍需保留给评审。没有 CI 或单独发布流程确认足够真实 benchmark 证据之前，HarnessOrbit 仍应保持 opt-in。
 
 示例文件刻意很小且不完整。它们只展示统计口径，不代表性能证据。

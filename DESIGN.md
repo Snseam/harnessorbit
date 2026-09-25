@@ -3,7 +3,7 @@
 ## Source of truth
 - Status: Active
 - Last refreshed: 2026-09-15
-- Primary product surfaces: local read-only Agent Monitor, started by the CAO CLI.
+- Primary product surfaces: local read-only Agent Monitor, started by the HarnessOrbit CLI.
 - Evidence reviewed: README.md, docs/architecture.md, execution profiles, and two user-provided screenshots showing active/completed Codex agents and a phase-grouped Claude agent table. Screenshots are references, not shipped assets or instructions.
 
 ## Brand
@@ -12,13 +12,13 @@
 - Avoid: fake progress percentages, decorative charts, invented model names, equating idle with accepted work, remote assets or analytics.
 
 ## Product goals
-- Goals: see the hierarchy and state of Codex coordinators/subagents, CAO-dispatched agents, and their native children in one local page.
+- Goals: see the hierarchy and state of Codex coordinators/subagents, HarnessOrbit-dispatched agents, and their native children in one local page.
 - Non-goals: terminal output, prompts, source diffs, launching/cancelling agents from the page, or provider/account configuration.
 - Success signals: correct parent relationships, live state changes, no false completion, metadata-only network payloads, usable partial/empty/offline states.
 
 ## Personas and jobs
-- Primary personas: a local developer using Codex and CAO to coordinate coding sessions.
-- User jobs: find running or blocked work, see which native children belong to a parent, distinguish observed completion from CAO acceptance.
+- Primary personas: a local developer using Codex and HarnessOrbit to coordinate coding sessions.
+- User jobs: find running or blocked work, see which native children belong to a parent, distinguish observed completion from HarnessOrbit acceptance.
 - Key contexts: many simultaneous tasks, long waits, interrupted agents, historical sessions, incomplete native telemetry.
 
 ## Information architecture
@@ -62,7 +62,7 @@
 
 ## Interaction states
 - Loading: clear initial loading state, no fabricated rows.
-- Empty: explain that no matching sessions are available and suggest checking scope or starting work through CAO.
+- Empty: explain that no matching sessions are available and suggest checking scope or starting work through HarnessOrbit.
 - Error: source-specific failures retain other valid data; no raw diagnostics containing paths/messages/secrets.
 - Success: connected state plus accurate last refresh time.
 - Disabled: unavailable metadata is shown as an em dash, not zero.
@@ -82,4 +82,4 @@
 
 ## Open questions
 - [ ] Native metadata coverage varies by version and hooks; document actual observed support, and never fill missing states by guessing.
-- [x] User confirmed: default to the current CAO project and its linked Codex/Claude descendants. Machine scope is an explicit CLI option; never silently collect unrelated projects.
+- [x] User confirmed: default to the current HarnessOrbit project and its linked Codex/Claude descendants. Machine scope is an explicit CLI option; never silently collect unrelated projects.

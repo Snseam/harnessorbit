@@ -26,7 +26,7 @@ function waitingLabel(attempt) {
     : attempt.status === 'needs_input' && attempt.lastObservedState === 'blocked'
       ? 'needs_input · blocked'
       : attempt.status;
-  if (attempt.providerObservation?.code) return `Provider saturated · not a CAO retry · ${base}`;
+  if (attempt.providerObservation?.code) return `Provider saturated · not a HarnessOrbit retry · ${base}`;
   return base;
 }
 
@@ -213,7 +213,7 @@ export class MonitorCollector {
     const nodes = [...entries.map(e => e.node), ...(codex.nodes || []), ...(claude.nodes || [])];
     const ids = new Set(nodes.map(n => n.id));
     for (const id of rootIds) if (!ids.has(`codex:${id}`)) nodes.push({ id: `codex:${id}`, agent: 'codex', kind: 'coordinator', label: 'Codex coordinator', nativeSessionId: id, status: 'unknown', statusLabel: 'Live status unavailable', source: 'codex', confidence: 'unknown', relation: 'cao', projectId: this.scope.project });
-    // An explicit run filter also limits native child trees to the selected CAO/caller roots.
+    // An explicit run filter also limits native child trees to the selected HarnessOrbit/caller roots.
     let selectedNodes = nodes;
     if (this.scope.runId) {
       const keep = new Set([...entries.map(e => e.node.id), ...rootIds.map(id => `codex:${id}`)]);
@@ -242,10 +242,10 @@ export class MonitorCollector {
     return publicSnapshot({
       nodes: selectedNodes, projects: [...projects.values()], scope: this.scope, currentConversationId: this.scope.coordinatorId, truncated: result.truncated || codex.truncated || claude.truncated,
       sources: [
-        { id: 'cao', label: 'CAO tasks', status: result.damaged ? 'partial' : 'connected', detail: result.damaged ? `${result.damaged} records could not be read.` : `${runs.length} runs; acceptance comes from CAO verification.` },
+        { id: 'cao', label: 'HarnessOrbit tasks', status: result.damaged ? 'partial' : 'connected', detail: result.damaged ? `${result.damaged} records could not be read.` : `${runs.length} runs; acceptance comes from HarnessOrbit verification.` },
         { id: 'codex', label: 'Codex agents', ...codex.health },
         { id: 'claude', label: 'Claude agents', ...claude.health },
-        { id: 'herdr', label: 'Herdr runtime', status: runtimeUnavailable ? liveCount ? 'partial' : 'unavailable' : 'connected', detail: liveRuns.length ? `${liveCount} active runtimes observed; idle is not acceptance.` : 'No active CAO runtime requires observation.' },
+        { id: 'herdr', label: 'Herdr runtime', status: runtimeUnavailable ? liveCount ? 'partial' : 'unavailable' : 'connected', detail: liveRuns.length ? `${liveCount} active runtimes observed; idle is not acceptance.` : 'No active HarnessOrbit runtime requires observation.' },
       ],
     }, now);
   }

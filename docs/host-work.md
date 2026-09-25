@@ -7,8 +7,8 @@ Host tasks register work performed by the current Codex conversation. They use t
 Create a task file with the usual `id`, `objective`, `allowedPaths`, and nonempty executable `checks`. Omit `agent`/`isolation` or set `codex`/`checkout`; external `execution` profiles and launch arguments are not accepted.
 
 ```bash
-node bin/cao.mjs init --project /path/to/project --id demo
-node bin/cao.mjs host start --run demo --file task.json --thread THREAD_ID
+node bin/harnessorbit.mjs init --project /path/to/project --id demo
+node bin/harnessorbit.mjs host start --run demo --file task.json --thread THREAD_ID
 ```
 
 After registration, make the scoped change. The response contains the task, attempt id, nonce and baseline. Use those exact ids in a result file:
@@ -31,8 +31,8 @@ After registration, make the scoped change. The response contains the task, atte
 Only declare `hostStopped` after editing and owned native children have stopped. `checks` in this report are self-reported evidence, not acceptance.
 
 ```bash
-node bin/cao.mjs host report --run demo --task TASK_ID --file report.json --thread THREAD_ID
-node bin/cao.mjs host verify --run demo --task TASK_ID --thread THREAD_ID
+node bin/harnessorbit.mjs host report --run demo --task TASK_ID --file report.json --thread THREAD_ID
+node bin/harnessorbit.mjs host verify --run demo --task TASK_ID --thread THREAD_ID
 ```
 
 Collection checks actual changed paths and the current nonce; verification checks that the snapshot stays stable and runs each configured command independently. A false success report cannot bypass failing tests. Accepted host work has `deliveryMode: "in-place"`; it is not applied again through `integrate`. Full project acceptance is still distinct from candidate checks.
@@ -47,4 +47,4 @@ The current thread id is used automatically when the host provides it. An explic
 - If edits remain, the checkout hold remains. `host recover --thread THREAD_ID` independently rechecks retained edits and never restarts a worker or reapplies a patch.
 - A supervisor can verify a stopped host report when invoked with the owning conversation identity. Running/unconfirmed host work produces attention; the supervisor does not try to read or control a fictitious terminal.
 
-Other CAO writers sharing the state directory respect the checkout hold. Manual tools and other state directories remain outside that coordination boundary. Unknown/running reported children prevent submission or release.
+Other HarnessOrbit writers sharing the state directory respect the checkout hold. Manual tools and other state directories remain outside that coordination boundary. Unknown/running reported children prevent submission or release.

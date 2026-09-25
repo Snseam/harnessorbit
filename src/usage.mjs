@@ -133,7 +133,7 @@ export class UsageService {
       source: { name: 'tokscale', ...version, dataHome: options.home, counterBasis: 'local-client-records', costIncluded: false },
       filters: { agents: options.clients, model: options.model, since: options.since, until: options.until, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, datePrecision: 'local-calendar-day' },
       scope: { type: options.taskId ? 'task' : options.runId ? 'run' : 'machine', runId: options.runId, taskId: options.taskId },
-      notes: ['Counters describe locally recorded usage, not a provider invoice. Missing records cannot establish zero actual usage.', 'Tokscale may refresh public pricing caches; CAO invokes only local models reports and omits monetary estimates.'],
+      notes: ['Counters describe locally recorded usage, not a provider invoice. Missing records cannot establish zero actual usage.', 'Tokscale may refresh public pricing caches; HarnessOrbit invokes only local models reports and omits monetary estimates.'],
     };
     const request = { home: options.home, since: options.since || undefined, until: options.until || undefined };
     const matchesModel = entry => !options.model || entry.model === options.model;
@@ -207,7 +207,7 @@ export class UsageService {
       status: complete ? 'ok' : rows.length ? 'partial' : tasks.length ? 'unattributable' : 'no_matching_tasks',
       attribution: {
         level: 'workspace', exactTaskAttribution: false,
-        basis: 'Recorded CAO working directories; Claude uses encoded project keys. No native session identity or within-day boundary is joined.',
+        basis: 'Recorded HarnessOrbit working directories; Claude uses encoded project keys. No native session identity or within-day boundary is joined.',
         coordinatorAttribution: 'not_tracked',
         completeWorkspaceCoverage: complete,
       },
@@ -222,7 +222,7 @@ export function formatUsageTable(report) {
   const lines = [`Token usage — ${report.scope.type} (${report.status})`, `Source: Tokscale ${clean(report.source.version)} | observed ${clean(report.observedAt)}`];
   if (report.filters) lines.push(`Dates: ${report.filters.since || 'beginning'} through ${report.filters.until || 'latest'} (${clean(report.filters.timezone)})`);
   if (report.scope.runId) lines.push(`Run: ${clean(report.scope.runId)}${report.scope.taskId ? ` | Task: ${clean(report.scope.taskId)}` : ''}`);
-  lines.push(report.attribution.level === 'machine' ? 'Scope: machine local records; not CAO-only.' : 'Attribution: workspace-based, NOT exact task usage.');
+  lines.push(report.attribution.level === 'machine' ? 'Scope: machine local records; not HarnessOrbit-only.' : 'Attribution: workspace-based, NOT exact task usage.');
   const headers = ['Agent', 'Model', 'Provider', 'Input', 'Output', 'Cache read', 'Cache write', 'Reasoning', 'Total'];
   const number = value => new Intl.NumberFormat('en-US').format(value);
   const cells = report.rows.map(r => [clean(r.agent), clean(r.model), clean(r.provider || (report.attribution.level === 'workspace' ? 'not grouped' : 'unknown')), ...buckets.map(k => number(r[k])), number(r.totalTokens)]);

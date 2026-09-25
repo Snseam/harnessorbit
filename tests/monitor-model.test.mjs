@@ -8,7 +8,7 @@ test('publicSnapshot exposes only browser contract fields and strips sensitive t
   const snapshot = publicSnapshot({
     scope: { project: '/project', runId: 'run1' },
     projects: [{ id: '/project', label: 'Project\u0007Name', path: '/project', secret: 'PROJECT_SECRET' }],
-    sources: [{ id: 'cao', status: 'connected', label: 'CAO', detail: 'ok', secret: 'SOURCE_SECRET' }],
+    sources: [{ id: 'cao', status: 'connected', label: 'HarnessOrbit', detail: 'ok', secret: 'SOURCE_SECRET' }],
     nodes: [{
       id: 'node1', parentId: null, agent: 'codex', kind: 'agent', label: 'Worker\u001b[31m', role: 'implementer', model: 'gpt',
       projectId: '/project', runId: 'run1', taskId: 'task1', attemptId: 'attempt1', nativeSessionId: 'session1',

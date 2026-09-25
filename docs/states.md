@@ -2,13 +2,13 @@
 
 > 中文: [zh-CN/states.md](zh-CN/states.md)
 
-This document describes CAO runs, attempts, isolation modes, holds, and recovery behavior. The authoritative state is `run.json` under the configured state root.
+This document describes HarnessOrbit runs, attempts, isolation modes, holds, and recovery behavior. The authoritative state is `run.json` under the configured state root.
 
 An optional foreground `supervise` command advances these same states. Task `deadlineAt`, one-shot report repair, atomic submission, and phase timing are described in [supervision and performance](supervision.md). They do not turn native idle state into acceptance or clear checkout/integration holds.
 
 ## Run
 
-`init` creates a run with the target project root, base commit, baseline snapshot, initial dirty flag, max parallelism, and a CAO-owned Herdr session.
+`init` creates a run with the target project root, base commit, baseline snapshot, initial dirty flag, max parallelism, and a HarnessOrbit-owned Herdr session.
 
 `cleanup` stops the run's Herdr session, writes `closedAt` / `serverStoppedAt`, and prevents new dispatch in that run. It does not remove worktrees, attempt directories, evidence, target project files, checkout holds, or integration holds.
 
@@ -34,22 +34,22 @@ integration_failed/integration_cancelled -> recover -> integrating -> integrated
 
 | Status               | Meaning                                                                                                                                                                        |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `preparing`          | Attempt is reserved; CAO is preparing its directory and isolation.                                                                                                             |
-| `launching`          | Herdr workspace/pane exists; CAO is starting the agent.                                                                                                                        |
+| `preparing`          | Attempt is reserved; HarnessOrbit is preparing its directory and isolation.                                                                                                             |
+| `launching`          | Herdr workspace/pane exists; HarnessOrbit is starting the agent.                                                                                                                        |
 | `ready`              | Agent is ready; assignment has not yet been sent.                                                                                                                              |
-| `sending`            | CAO has claimed the right to send. If sending fails, the attempt becomes `uncertain`; do not blindly resend.                                                                   |
+| `sending`            | HarnessOrbit has claimed the right to send. If sending fails, the attempt becomes `uncertain`; do not blindly resend.                                                                   |
 | `running`            | Assignment was acknowledged and the worker is expected to write `result.json`.                                                                                                 |
 | `uncertain`          | Delivery or observation failed; use `resume` / `collect` to reconcile.                                                                                                         |
 | `needs_input`        | Worker is blocked, result requested input, native children are unresolved, `unresolved` is nonempty, paths are out of scope, or the result is invalid.                         |
-| `submitted`          | CAO collected a valid candidate and it can be verified.                                                                                                                        |
+| `submitted`          | HarnessOrbit collected a valid candidate and it can be verified.                                                                                                                        |
 | `verifying`          | Worker is closed and checks are running.                                                                                                                                       |
 | `accepted`           | Checks passed; a worktree task has a verified patch.                                                                                                                           |
 | `rework`             | Verification failed; `retry` can continue in the same candidate cwd.                                                                                                           |
-| `integrating`        | CAO is applying or rechecking retained checkout state in the target project.                                                                                                   |
+| `integrating`        | HarnessOrbit is applying or rechecking retained checkout state in the target project.                                                                                                   |
 | `integrated`         | Target checkout contains the change and target checks passed.                                                                                                                  |
 | `integration_failed` | Patch apply failed, or target recheck failed after apply/recover. Applied changes are retained for inspection or repair, and the project is held.                              |
 | `cancelled`          | Attempt was cancelled.                                                                                                                                                         |
-| `interrupted`        | Worker or controller disappeared and CAO cannot safely continue automatically.                                                                                                 |
+| `interrupted`        | Worker or controller disappeared and HarnessOrbit cannot safely continue automatically.                                                                                                 |
 | `failed`             | Startup or flow failed without a usable worker. The reason code is on `inspect` `lastError` and `attempt.state.errorCode`; `herdr-server.log` is Herdr stdio, not that reason. |
 
 ## Isolation modes
@@ -58,23 +58,23 @@ integration_failed/integration_cancelled -> recover -> integrating -> integrated
 
 This is the default. The first attempt creates a detached Git worktree under the attempt directory. `retry` reuses the previous candidate cwd instead of creating a fresh worktree for every attempt, so partial work and failed evidence remain available to the next worker.
 
-When verification passes, CAO creates `candidate.patch`. `integrate` later applies that patch to the target checkout and reruns checks there.
+When verification passes, HarnessOrbit creates `candidate.patch`. `integrate` later applies that patch to the target checkout and reruns checks there.
 
 A worktree task that depends on another task requires that dependency to be `integrated`; otherwise the new worktree cannot see the dependency result.
 
 ### `checkout`
 
-A checkout task writes directly in the target checkout. CAO uses a project-level checkout hold across runs sharing the same `stateRoot`.
+A checkout task writes directly in the target checkout. HarnessOrbit uses a project-level checkout hold across runs sharing the same `stateRoot`.
 
-A checkout hold applies to unaccepted checkout work. If a checkout task fails, is interrupted, or is cancelled after making changes, it continues to hold the project and blocks new tasks and integrations. Continue with `retry` on the original task, or stop the worker and use `recover` to verify the current checkout. If cancellation sees no changes relative to the task baseline, CAO marks `checkoutReleased` and releases the hold.
+A checkout hold applies to unaccepted checkout work. If a checkout task fails, is interrupted, or is cancelled after making changes, it continues to hold the project and blocks new tasks and integrations. Continue with `retry` on the original task, or stop the worker and use `recover` to verify the current checkout. If cancellation sees no changes relative to the task baseline, HarnessOrbit marks `checkoutReleased` and releases the hold.
 
-This coordination only applies to callers using the same state root. A different state root, manual shell, or external tool is outside CAO's lock.
+This coordination only applies to callers using the same state root. A different state root, manual shell, or external tool is outside HarnessOrbit's lock.
 
 ## Scope is not a sandbox
 
 `allowedPaths` is a verification scope, not a filesystem sandbox. The worker process still runs with the local user's permissions.
 
-CAO enforces scope after collection:
+HarnessOrbit enforces scope after collection:
 
 - Task paths must be relative paths or directory prefixes; globs, absolute paths, backslashes, traversal, and `.git` are rejected.
 - Directory prefixes must end with `/`. A path without a trailing slash is an exact file. Preflight, dispatch, and host start fail with `directory_scope_missing_slash` when snapshot files exist under a missing-slash directory. `src/` and `.` remain legal; there is no file-count cap.
@@ -109,9 +109,9 @@ The worker must write the attempt's `result.json` last. It must match the task i
 }
 ```
 
-`status` must be `submitted` or `needs_input`. Child statuses must be `completed`, `cancelled`, `running`, or `unknown`. If any child is `running` / `unknown`, or if `unresolved` is nonempty, CAO keeps the attempt in `needs_input`.
+`status` must be `submitted` or `needs_input`. Child statuses must be `completed`, `cancelled`, `running`, or `unknown`. If any child is `running` / `unknown`, or if `unresolved` is nonempty, HarnessOrbit keeps the attempt in `needs_input`.
 
-CAO does not observe native children. Child reporting is a worker contract, not telemetry.
+HarnessOrbit does not observe native children. Child reporting is a worker contract, not telemetry.
 
 ## Prompt dispatch
 
@@ -150,7 +150,7 @@ If `git apply --check` or `git apply` fails, the project normally remains unchan
 
 After repairing the retained checkout, run `recover`. Recovery for incomplete integrations rechecks the current checkout and does not apply `candidate.patch` again. Recovery for stopped checkout tasks snapshots the current checkout, checks scope, and routes back through verification.
 
-CAO never resets, commits, or pushes automatically.
+HarnessOrbit never resets, commits, or pushes automatically.
 
 ## Current verification boundary
 

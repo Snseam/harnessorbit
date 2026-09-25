@@ -210,7 +210,7 @@ function makeResult(request, {
       providerId: clip(fallback.providerId, 96),
       reasonCode: clip(fallback.reasonCode, 128),
     } : { used: false, providerId: null, reasonCode: null },
-    // A provider never mutates CAO state. This field only records that a
+    // A provider never mutates HarnessOrbit state. This field only records that a
     // caller explicitly applied an advisory ranking to an eligible list.
     applied: applied === true && mode === 'online' && request.lowRisk && request.eligibility?.approved === true && safeAction !== 'hold',
     createdAt: new Date().toISOString(),
@@ -348,7 +348,7 @@ export class JevDecisionProvider {
         questions: {
           decision: {
             type: 'choice',
-            instructions: 'Choose the best eligible candidate for this bounded CAO decision, or choose hold when evidence is insufficient.',
+            instructions: 'Choose the best eligible candidate for this bounded HarnessOrbit decision, or choose hold when evidence is insufficient.',
             criteria,
           },
         },

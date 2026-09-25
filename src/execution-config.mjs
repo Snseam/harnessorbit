@@ -74,7 +74,7 @@ export async function prepareExecution({ task, attempt, profile, gateway, enviro
     // Command-backed auth also works when the CLI uses an existing app-server daemon.
     const tokenReader = await save('codex-token.cjs', `const fs = require('node:fs'); process.stdout.write(fs.readFileSync(${JSON.stringify(gateway.tokenFile)}, 'utf8').trim());\n`);
     const tomlString = value => JSON.stringify(value);
-    const provider = `{name="CAO",base_url=${tomlString(endpoint + '/v1')},wire_api="responses",supports_websockets=false,request_max_retries=0,stream_max_retries=0,auth={command=${tomlString(process.execPath)},args=[${tomlString(tokenReader)}],timeout_ms=5000,refresh_interval_ms=0}}`;
+    const provider = `{name="HarnessOrbit",base_url=${tomlString(endpoint + '/v1')},wire_api="responses",supports_websockets=false,request_max_retries=0,stream_max_retries=0,auth={command=${tomlString(process.execPath)},args=[${tomlString(tokenReader)}],timeout_ms=5000,refresh_interval_ms=0}}`;
     launch.args.push('-c', `model=${tomlString(profile.model)}`, '-c', `model_provider=${tomlString(providerName)}`, '-c', `model_providers.${providerName}=${provider}`, '--add-dir', attempt.directory);
     nativeLogRoots = [path.resolve(environment.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions')];
   } else if (profile.agent === 'pi') {
@@ -92,7 +92,7 @@ export async function prepareExecution({ task, attempt, profile, gateway, enviro
     // Runtime inline config overrides project config while preserving unrelated settings.
     env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
       model: `${providerName}/${profile.model}`,
-      provider: { [providerName]: { npm: '@ai-sdk/openai-compatible', name: 'CAO', options: { baseURL: endpoint + '/v1', apiKey: token }, models: { [profile.model]: { name: profile.model } } } },
+      provider: { [providerName]: { npm: '@ai-sdk/openai-compatible', name: 'HarnessOrbit', options: { baseURL: endpoint + '/v1', apiKey: token }, models: { [profile.model]: { name: profile.model } } } },
     });
     launch.args.push('--model', `${providerName}/${profile.model}`);
     nativeLogRoots = [path.join(environment.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'opencode')];

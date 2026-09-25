@@ -13,7 +13,7 @@
   ],
   "arms": [
     { "id": "direct-codex", "label": "Direct Codex baseline" },
-    { "id": "adaptive-cao", "label": "CAO adaptive dispatch" }
+    { "id": "adaptive-cao", "label": "HarnessOrbit adaptive dispatch" }
   ],
   "repetitions": [1, 2, 3]
 }

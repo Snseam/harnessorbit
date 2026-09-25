@@ -1,6 +1,6 @@
 # HarnessOrbit development and acceptance
 
-This branch treats HarnessOrbit as a business-outcome layer over CAO. CAO's
+This branch treats HarnessOrbit as a business-outcome layer over HarnessOrbit. HarnessOrbit's
 `run.json`, Git snapshots, independent checks, verification evidence and
 integration result remain authoritative. Jev is an optional advisory
 DecisionProvider and starts in shadow mode.
@@ -66,13 +66,13 @@ provider recovery, high-risk misses, context size, tokens and cost.
 The local Jev credential is configured for the direct TypeSafe endpoint
 `https://api.typesafe.ai/v1/systemone` with the pinned `jev-1.13.0` model. The official
 Vercel AI Gateway endpoints use a separate gateway credential; their 401 result
-is retained as an integration boundary and does not block deterministic CAO
+is retained as an integration boundary and does not block deterministic HarnessOrbit
 fallback or shadow operation.
 
 ## Acceptance gates
 
 1. New and existing tests pass, with sandbox-bound failures listed separately.
-2. Jev unavailable produces the deterministic path and the same CAO state
+2. Jev unavailable produces the deterministic path and the same HarnessOrbit state
    authority.
 3. Shadow receipts are schema-versioned and contain only digests and bounded
    metadata.

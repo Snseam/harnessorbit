@@ -34,9 +34,11 @@ import { runInternalBenchmark, createInternalBenchmarkPlan } from '../src/intern
 import { replayShadowTraces } from '../src/shadow-replay.mjs';
 import { DeterministicDecisionProvider, JevDecisionProvider } from '../src/decision-provider.mjs';
 
-export const help = `Codex Agent Orchestrator (CAO) 0.1.0
+export const help = `HarnessOrbit 0.1.0
 
-Usage: node bin/cao.mjs <command> [options]
+Usage: node bin/harnessorbit.mjs <command> [options]
+
+The legacy node bin/cao.mjs entrypoint remains supported.
 
   init       --project PATH [--id ID] [--max-parallel 4]
   harness init --project PATH [--include-paths src/,docs/]
@@ -351,7 +353,7 @@ export async function main(argv = process.argv.slice(2)) {
       if (!selector) return { selectedProfileId: null, mode: 'inherited-agent-config', agent: task.agent };
       return explainRoute(profiles, selector, { agent: task.agent === 'auto' ? null : task.agent });
     }
-    case 'route reservations': return { reservations: await listReservations(profiles.root), scope: 'CAO-attempts' };
+    case 'route reservations': return { reservations: await listReservations(profiles.root), scope: 'HarnessOrbit attempts' };
     case 'gateway start': {
       const primary = await profiles.resolve(required('profile'));
       return gateways.start({ id: o.id, profileIds: [primary.id, ...primary.fallbacks], allowShared: !!o['allow-shared'] });

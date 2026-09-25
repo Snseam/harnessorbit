@@ -29,4 +29,4 @@ Adaptive remains opt-in. The live checks above do not establish cross-agent qual
 
 Use the [paired evaluator](benchmark-evaluation.md) to account for predeclared trials, including failures and missing results. It is an offline statistics tool, not an agent runner or evidence authenticator. Do not import these three smoke successes as the planned multi-task pilot or enable adaptive by default from them.
 
-Rollback for new work is `node bin/cao.mjs mode enable --strategy delegated --calibration-policy off` in the relevant conversation. Running attempts keep their original route binding; changing the strategy does not stop or replace them. Continue their normal verification or explicit cancellation/cleanup.
+Rollback for new work is `node bin/harnessorbit.mjs mode enable --strategy delegated --calibration-policy off` in the relevant conversation. Running attempts keep their original route binding; changing the strategy does not stop or replace them. Continue their normal verification or explicit cancellation/cleanup.

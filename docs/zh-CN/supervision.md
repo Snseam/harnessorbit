@@ -2,25 +2,25 @@
 
 > English: [../supervision.md](../supervision.md)
 
-CAO 可以对已有任务自动推进收集和独立验收，减少正常阶段逐条等待模型决定下一条命令的开销。原有任务身份、Git 范围、验收与整合 hold 继续生效。
+HarnessOrbit 可以对已有任务自动推进收集和独立验收，减少正常阶段逐条等待模型决定下一条命令的开销。原有任务身份、Git 范围、验收与整合 hold 继续生效。
 
 ## 使用已有 run
 
 ```bash
 # 可选的只读启动预检：检查 Git 快照与所需执行文件。
-node bin/cao.mjs preflight --run demo --file task.json
+node bin/harnessorbit.mjs preflight --run demo --file task.json
 
 # 协调已有任务一次，不创建或重新执行实现任务。
-node bin/cao.mjs step --run demo
+node bin/harnessorbit.mjs step --run demo
 
 # 在等待预算内轮询并推进正常阶段。
-node bin/cao.mjs supervise --run demo --wait-ms 30000
+node bin/harnessorbit.mjs supervise --run demo --wait-ms 30000
 
 # 显式允许整合已验收 worktree 补丁，以及每个 attempt 一次报告补交。
-node bin/cao.mjs supervise --run demo --integrate --repair-reports
+node bin/harnessorbit.mjs supervise --run demo --integrate --repair-reports
 
 # 只读查询已经落盘的性能记录。
-node bin/cao.mjs performance report --run demo
+node bin/harnessorbit.mjs performance report --run demo
 ```
 
 使用自定义状态目录时，传入与原 run 相同的 `--state-dir`。预检不登录、不刷新凭据、不调用模型；找到执行文件不代表账号实际可用。dispatch 也会在启动 worker 前预检；不支持的 Git 快照和缺失的运行文件会提前失败并保留诊断。
@@ -39,7 +39,7 @@ node bin/cao.mjs performance report --run demo
 
 权限、认证、陈旧 nonce、越界修改、未完成/未知子任务、检查失败和不明确的控制器状态都会需要处理。监督器不会批准权限、重试实现、切换提供商、新建任务、清除 hold、提交或推送。缺少可信进展会要求诊断，不会仅因终端安静就判断进程已停止。
 
-Herdr `blocked` 等待会把 `lastError` 记为 `permission_required` 或 `worker_blocked`。先 `inspect --output`，只对已检查的对话框发 `cao input`，再 `resume`。pane 离开 `blocked` 后，collect 会恢复 `running`。监督 attention 使用该错误码；旧的 `:failed` attention key 不迁移。提供商满载记在 `providerObservation`，不替换 `lastError`；monitor waiting 不是 CAO retry。`inspect.retryAdvice` 说明 worktree 越界要换新任务，还是 checkout 可以 retry。
+Herdr `blocked` 等待会把 `lastError` 记为 `permission_required` 或 `worker_blocked`。先 `inspect --output`，只对已检查的对话框发 `cao input`，再 `resume`。pane 离开 `blocked` 后，collect 会恢复 `running`。监督 attention 使用该错误码；旧的 `:failed` attention key 不迁移。提供商满载记在 `providerObservation`，不替换 `lastError`；monitor waiting 不是 HarnessOrbit retry。`inspect.retryAdvice` 说明 worktree 越界要换新任务，还是 checkout 可以 retry。
 
 ## 可选任务截止时间
 
@@ -54,7 +54,7 @@ Herdr `blocked` 等待会把 `lastError` 记为 `permission_required` 或 `worke
 新 attempt 目录包含 `submission.json`、`task.json` 与 `prompt.txt`。worker 可将原有结果 JSON 通过 stdin 传给：
 
 ```bash
-node /absolute/path/to/cao/bin/cao.mjs result submit --attempt-dir /absolute/attempt --stdin
+node /absolute/path/to/cao/bin/harnessorbit.mjs result submit --attempt-dir /absolute/attempt --stdin
 ```
 
 也可使用 `--file /path/to/report.json`。helper 校验身份、结构与大小后原子写入 `result.json`，拒绝符号链接结果文件。返回的 `accepted: false` 表示它只收到了报告；仍需按权威 run 记录收集并独立验收。旧 worker 直接写结果文件的方式继续兼容。

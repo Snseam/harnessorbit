@@ -187,7 +187,7 @@ async function profileConfig(resource, { profiles, environment }) {
   invariant(model, 'probe_model_unknown', 'Pi calibration requires an explicit profile model.');
   const metadata = plain(profile.modelMetadata) ? profile.modelMetadata : null;
   const providerConfig = {
-    name: 'CAO Calibration',
+    name: 'HarnessOrbit Calibration',
     baseUrl: profile.protocol === 'anthropic' || endpoint.endsWith('/v1') ? endpoint : `${endpoint}/v1`,
     api: PROTOCOL_API[profile.protocol],
     apiKey: token || 'cao-loopback-probe',
