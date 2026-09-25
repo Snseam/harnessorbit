@@ -163,10 +163,10 @@ test('collector labels provider saturation without changing waiting status', asy
   const snapshot = await new MonitorCollector({ root: state, project, codex: codexFake(), claude: claudeFake(), herdr }).snapshot();
   const blocked = snapshot.nodes.find(node => node.taskId === 'blocked-task');
   assert.equal(blocked.status, 'waiting');
-  assert.equal(blocked.statusLabel, 'Provider saturated · not a CAO retry · needs_input · blocked');
+  assert.equal(blocked.statusLabel, 'Provider saturated · not a HarnessOrbit retry · needs_input · blocked');
   const rework = snapshot.nodes.find(node => node.taskId === 'rework-task');
   assert.equal(rework.status, 'waiting');
-  assert.equal(rework.statusLabel, 'Provider saturated · not a CAO retry · rework');
+  assert.equal(rework.statusLabel, 'Provider saturated · not a HarnessOrbit retry · rework');
 });
 
 test('collector marks active CAO attempts unknown on terminal identity mismatch and never treats idle as accepted', async t => {

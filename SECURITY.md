@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-CAO is an early preview. Security fixes are maintained on `main`; separate release maintenance branches have not been established. Update to the latest available fix before reporting a recurring problem.
+HarnessOrbit is an early preview. Security fixes are maintained on `main`; separate release maintenance branches have not been established. Update to the latest available fix before reporting a recurring problem.
 
 ## Report a vulnerability privately
 
 Use this repository's **Security → Report a vulnerability** option:
 
-[GitHub private vulnerability reporting](https://github.com/Snseam/codex-agent-orchestrator/security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/Snseam/harnessorbit/security/advisories/new)
 
 Include the affected revision, operating system and tool versions, the expected boundary, and a minimal reproduction using dummy data. Keep tokens, provider credentials, private source code, and real agent transcripts out of the report unless they are strictly necessary; redact them when possible.
 
@@ -16,7 +16,7 @@ Do not disclose exploit details in public issues. If private reporting is unavai
 
 ## Relevant boundaries
 
-CAO launches local coding agents and user-specified verification commands with the caller's permissions. It is not a filesystem or process sandbox. Git worktrees, allowed paths, and state locks coordinate work but do not isolate credentials, ignored untracked files, network access, or other external side effects.
+HarnessOrbit launches local coding agents and user-specified verification commands with the caller's permissions. It is not a filesystem or process sandbox. Git worktrees, allowed paths, and state locks coordinate work but do not isolate credentials, ignored untracked files, network access, or other external side effects.
 
 Only run tasks and repositories you intend to authorize. Agent permissions remain the responsibility of the configured agent installation. Logs and state can contain source code or sensitive output; keep the state directory private and do not publish live test artifacts.
 

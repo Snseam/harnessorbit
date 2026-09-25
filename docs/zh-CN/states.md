@@ -2,13 +2,13 @@
 
 > English: [../states.md](../states.md)
 
-本文说明 CAO 的 run、task、attempt 状态和安全边界。实际状态以 `run.json` 为准。
+本文说明 HarnessOrbit 的 run、task、attempt 状态和安全边界。实际状态以 `run.json` 为准。
 
 可选前台 `supervise` 命令推进同一组状态。任务 `deadlineAt`、一次报告补交、原子提交及阶段计时见[监督与性能记录](supervision.md)。它们不会将原生 idle 当作验收通过，也不会清除 checkout/integration hold。
 
 ## Run
 
-`init` 创建 run：记录项目 root、base commit、baseline snapshot、是否初始 dirty、最大并发和 CAO 专用 Herdr session。`status` 不带 `--run` 时列出所有 run。
+`init` 创建 run：记录项目 root、base commit、baseline snapshot、是否初始 dirty、最大并发和 HarnessOrbit 专用 Herdr session。`status` 不带 `--run` 时列出所有 run。
 
 `cleanup` 只停止该 run 的 Herdr session，写入 `closedAt`/`serverStoppedAt`，并关闭该 run 后续新 dispatch。它不会删除 worktree、attempt 目录、证据文件或目标项目文件，也不会清除 checkout 或 integration hold。
 
@@ -39,7 +39,7 @@ integration_failed/integration_cancelled -> recover -> integrating -> integrated
 | `preparing`          | attempt 已预留，正在准备目录、worktree 或 checkout。                                                                                                                      |
 | `launching`          | Herdr workspace/pane 已创建，正在启动 agent。                                                                                                                             |
 | `ready`              | agent 已就绪，尚未发送任务。                                                                                                                                              |
-| `sending`            | CAO 已声明将发送 prompt；失败后进入 `uncertain`，不能盲目重发。                                                                                                           |
+| `sending`            | HarnessOrbit 已声明将发送 prompt；失败后进入 `uncertain`，不能盲目重发。                                                                                                           |
 | `running`            | prompt 已交给 agent，等待 result JSON。                                                                                                                                   |
 | `uncertain`          | 提交或观察失败，可能已经送达；用 `resume`/`collect` 对账。                                                                                                                |
 | `needs_input`        | agent 阻塞、result 要求输入、child 未完成、unresolved 非空、越界修改或 result 无效。                                                                                      |
@@ -66,13 +66,13 @@ integration_failed/integration_cancelled -> recover -> integrating -> integrated
 
 ### `checkout`
 
-worker 直接写目标项目 checkout。CAO 会在相同 stateRoot 下加项目级单写锁：任一 run 中有 active checkout 任务时，其他 checkout 任务不能启动。checkout 任务失败、取消或中断后，如果 checkout 相对该任务 baseline 有改动，会继续 hold，阻止同项目新 task 与 integration；可以对原 task `retry`，或在 worker 停止后用 `recover` 复验当前 checkout。若 cancel 时 checkout 没有改动，CAO 会标记 `checkoutReleased` 并释放 hold。
+worker 直接写目标项目 checkout。HarnessOrbit 会在相同 stateRoot 下加项目级单写锁：任一 run 中有 active checkout 任务时，其他 checkout 任务不能启动。checkout 任务失败、取消或中断后，如果 checkout 相对该任务 baseline 有改动，会继续 hold，阻止同项目新 task 与 integration；可以对原 task `retry`，或在 worker 停止后用 `recover` 复验当前 checkout。若 cancel 时 checkout 没有改动，HarnessOrbit 会标记 `checkoutReleased` 并释放 hold。
 
-限制：这个锁只覆盖相同 stateRoot。另一个 stateRoot、手工 shell 或外部工具不受 CAO 锁约束。
+限制：这个锁只覆盖相同 stateRoot。另一个 stateRoot、手工 shell 或外部工具不受 HarnessOrbit 锁约束。
 
 ## Scope 不是 sandbox
 
-`allowedPaths` 用于收集后的验收判断，不是进程沙箱。agent 仍以本机用户权限运行。CAO 的保护点是：
+`allowedPaths` 用于收集后的验收判断，不是进程沙箱。agent 仍以本机用户权限运行。HarnessOrbit 的保护点是：
 
 - 任务路径必须是相对路径或目录前缀，不允许 glob、绝对路径、反斜杠、路径穿越和 `.git`。
 - 目录前缀必须以 `/` 结尾；没有尾斜杠的路径是精确文件。当快照里已有该路径下的文件时，preflight、dispatch 和 host start 会以 `directory_scope_missing_slash` 失败。`src/` 和 `.` 仍然合法，没有文件数上限。
@@ -107,13 +107,13 @@ agent 必须最后写入 attempt 的 `result.json`。字段必须匹配 prompt �
 }
 ```
 
-`status` 只能是 `submitted` 或 `needs_input`。`children` 里的状态只能是 `completed`、`cancelled`、`running`、`unknown`。只要存在 `running`/`unknown` child，或 `unresolved` 非空，CAO 都会把 attempt 保持在 `needs_input`。
+`status` 只能是 `submitted` 或 `needs_input`。`children` 里的状态只能是 `completed`、`cancelled`、`running`、`unknown`。只要存在 `running`/`unknown` child，或 `unresolved` 非空，HarnessOrbit 都会把 attempt 保持在 `needs_input`。
 
-CAO 不会真实监测原生 children。child 报告是 agent 与控制器之间的契约，不是 telemetry。
+HarnessOrbit 不会真实监测原生 children。child 报告是 agent 与控制器之间的契约，不是 telemetry。
 
 ## Prompt dispatch
 
-CAO 把完整 assignment、范围、检查命令、child 报告契约和 result JSON skeleton 写入 attempt 目录的 `prompt.txt`。真正发给 agent 的 prompt 是短入口：要求 agent 完整读取 `prompt.txt`，然后执行其中任务。这样减少长 prompt 直接粘贴到交互终端时的控制风险。
+HarnessOrbit 把完整 assignment、范围、检查命令、child 报告契约和 result JSON skeleton 写入 attempt 目录的 `prompt.txt`。真正发给 agent 的 prompt 是短入口：要求 agent 完整读取 `prompt.txt`，然后执行其中任务。这样减少长 prompt 直接粘贴到交互终端时的控制风险。
 
 ## Verification
 
@@ -140,7 +140,7 @@ CAO 把完整 assignment、范围、检查命令、child 报告契约和 result 
 6. 在目标项目重新运行 checks。
 7. 检查复验期间目标项目快照稳定。
 
-如果 apply 失败，状态为 `integration_failed`，目标项目通常未改动。如果 apply 成功但复验失败或不稳定，状态仍为 `integration_failed`，已应用的改动会保留在目标项目中。此 hold 跨 run 生效，阻止同项目新 dispatch 和其他 integration。修复当前 checkout 后运行 `recover`；recover 只重新检查当前 checkout，不会再次 apply patch。CAO 不会自动 reset、commit 或 push。
+如果 apply 失败，状态为 `integration_failed`，目标项目通常未改动。如果 apply 成功但复验失败或不稳定，状态仍为 `integration_failed`，已应用的改动会保留在目标项目中。此 hold 跨 run 生效，阻止同项目新 dispatch 和其他 integration。修复当前 checkout 后运行 `recover`；recover 只重新检查当前 checkout，不会再次 apply patch。HarnessOrbit 不会自动 reset、commit 或 push。
 
 ## 当前验证边界
 

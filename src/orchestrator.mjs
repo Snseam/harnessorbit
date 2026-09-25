@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
@@ -62,7 +63,13 @@ async function hasNativeProjectOverrides(agent, directories) {
 }
 
 export function defaultStateRoot() {
-  return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'codex-agent-orchestrator');
+  const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+  const current = path.join(base, 'harnessorbit');
+  const legacy = path.join(base, 'codex-agent-orchestrator');
+  // Keep existing legacy state usable after the public product rename. New
+  // installations use the HarnessOrbit root; when only the legacy root exists,
+  // continue using it so runs and conversation preferences are not stranded.
+  return existsSync(current) || !existsSync(legacy) ? current : legacy;
 }
 
 export class Orchestrator {

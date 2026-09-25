@@ -42,7 +42,7 @@ function validateClients(clients) {
   }
   for (const client of clients) {
     if (!ALLOWED_CLIENTS.has(client)) {
-      invalid('Tokscale client is not supported by CAO', { client });
+      invalid('Tokscale client is not supported by HarnessOrbit', { client });
     }
   }
   return clients;
@@ -50,7 +50,7 @@ function validateClients(clients) {
 
 function validateGroupBy(groupBy) {
   if (!ALLOWED_GROUP_BY.has(groupBy)) {
-    invalid('Tokscale groupBy is not supported by CAO', { groupBy });
+    invalid('Tokscale groupBy is not supported by HarnessOrbit', { groupBy });
   }
   return groupBy;
 }

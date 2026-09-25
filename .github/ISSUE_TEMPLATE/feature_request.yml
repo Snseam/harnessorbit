@@ -13,7 +13,7 @@ body:
     attributes:
       label: Problem or use case
       description: What workflow are you trying to improve?
-      placeholder: I want Codex Agent Orchestrator to...
+      placeholder: I want HarnessOrbit to...
     validations:
       required: true
   - type: textarea

@@ -26,7 +26,7 @@ test('install creates a reusable symlink and status reports source and CLI paths
   assert.equal(first.source, source);
   assert.equal(first.cliPath, path.join(source, 'scripts', 'cao.mjs'));
   assert.equal(first.hint.canonical, '$cao');
-  assert.equal(first.hint.desktop, 'Type /CAO, select CAO, then send the skill mention.');
+  assert.equal(first.hint.desktop, 'Type /HarnessOrbit, select HarnessOrbit, then send the skill mention. The legacy /CAO command remains available.');
   assert.equal(first.hint.cli, '$cao or /skills');
 
   const linkStats = await fs.lstat(path.join(skillsDir, 'cao'));

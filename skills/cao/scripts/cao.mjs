@@ -8,7 +8,10 @@ import { spawn } from 'node:child_process';
 const script = await fs.realpath(fileURLToPath(import.meta.url));
 const skillPath = path.resolve(path.dirname(script), '..');
 const repository = path.resolve(skillPath, '../..');
-const cliPath = path.join(repository, 'bin/cao.mjs');
+const canonicalCliPath = path.join(repository, 'bin/harnessorbit.mjs');
+const legacyCliPath = path.join(repository, 'bin/cao.mjs');
+let cliPath = canonicalCliPath;
+try { await fs.access(canonicalCliPath); } catch { cliPath = legacyCliPath; }
 const args = process.argv.slice(2);
 
 if (args.length === 1 && args[0] === '--paths') {
@@ -27,7 +30,7 @@ if (args.length === 1 && args[0] === '--paths') {
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', terminate);
   child.once('error', error => {
-    console.error(`Could not start CAO: ${error.message}`);
+    console.error(`Could not start HarnessOrbit: ${error.message}`);
     process.exitCode = 1;
   });
   child.once('close', (code, signal) => {

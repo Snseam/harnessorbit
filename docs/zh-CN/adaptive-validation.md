@@ -29,4 +29,4 @@
 
 [配对评估器](benchmark-evaluation.md)用于统计预先登记的试验，失败和缺失结果同样计入分母。它是离线统计工具，不负责启动 Agent 或验证证据真伪。不能用这三个冒烟成功代替多任务试点，也不能据此默认启用自适应。
 
-需要回退新任务的策略时，在相应对话执行 `node bin/cao.mjs mode enable --strategy delegated --calibration-policy off`。运行中的尝试保留原路由绑定；策略切换不会停止或替换它们，仍需正常验收，或明确取消并清理。
+需要回退新任务的策略时，在相应对话执行 `node bin/harnessorbit.mjs mode enable --strategy delegated --calibration-policy off`。运行中的尝试保留原路由绑定；策略切换不会停止或替换它们，仍需正常验收，或明确取消并清理。

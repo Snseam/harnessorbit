@@ -22,7 +22,7 @@ const command = async argv => {
   if (result.code !== 0) throw new Error(result.stderr || result.stdout);
   return result.stdout;
 };
-const cao = async (...argv) => JSON.parse(await command([process.execPath, path.join(root, 'bin/cao.mjs'), ...argv, '--state-dir', journal.stateRoot])).data;
+const cao = async (...argv) => JSON.parse(await command([process.execPath, path.join(root, 'bin/harnessorbit.mjs'), ...argv, '--state-dir', journal.stateRoot])).data;
 
 if (resumeIndex >= 0) {
   file = path.resolve(args[resumeIndex + 1]); journal = JSON.parse(await fs.readFile(file, 'utf8'));

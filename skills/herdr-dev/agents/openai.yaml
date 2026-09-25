@@ -1,4 +1,4 @@
 interface:
   display_name: "Herdr Dev"
-  short_description: "Coordinate coding agents with verified CAO task workflows"
-  default_prompt: "Use $herdr-dev to coordinate this project's development through CAO and Herdr, verify candidates and integrate accepted work."
+  short_description: "Coordinate coding agents with verified HarnessOrbit task workflows"
+  default_prompt: "Use $herdr-dev to coordinate this project's development through HarnessOrbit and Herdr, verify candidates and integrate accepted work."

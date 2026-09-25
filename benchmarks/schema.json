@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Snseam/codex-agent-orchestrator/benchmarks/schema.json",
-  "title": "CAO Paired Benchmark Inputs",
+  "$id": "https://github.com/Snseam/harnessorbit/benchmarks/schema.json",
+  "title": "HarnessOrbit Paired Benchmark Inputs",
   "type": "object",
   "properties": {
     "plan": {

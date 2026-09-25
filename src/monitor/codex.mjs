@@ -272,7 +272,7 @@ async function collectProxy({ home, rootIds, project, all, limit, now, proxyRunn
   const cacheKey = path.resolve(home);
   if ((proxyFailureUntilByHome.get(cacheKey) ?? 0) > Date.now()) throw new Error('app-server proxy failure cache active');
   const requests = [
-    { id: 1, method: 'initialize', params: { clientInfo: { name: 'cao-monitor', title: 'CAO Monitor', version: '0.1.0' }, capabilities: { experimentalApi: true, requestAttestation: false, optOutNotificationMethods: ['item/agentMessage/delta', 'command/exec/outputDelta', 'process/outputDelta'] } } },
+    { id: 1, method: 'initialize', params: { clientInfo: { name: 'harnessorbit-monitor', title: 'HarnessOrbit Monitor', version: '0.1.0' }, capabilities: { experimentalApi: true, requestAttestation: false, optOutNotificationMethods: ['item/agentMessage/delta', 'command/exec/outputDelta', 'process/outputDelta'] } } },
     { method: 'initialized' },
     { id: 2, method: 'thread/loaded/list', params: { limit } },
   ];

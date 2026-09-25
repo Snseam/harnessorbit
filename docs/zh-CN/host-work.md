@@ -1,4 +1,4 @@
-# 将当前 Codex 的工作纳入 CAO
+# 将当前 Codex 的工作纳入 HarnessOrbit
 
 > English: [../host-work.md](../host-work.md)
 
@@ -7,8 +7,8 @@ host 任务登记当前 Codex 对话直接完成的工作，使用目标 checkou
 任务文件仍需 `id`、`objective`、`allowedPaths` 和非空的可执行 `checks`。省略 `agent`/`isolation`，或指定 `codex`/`checkout`；不接受外部 execution profile 和启动参数。
 
 ```bash
-node bin/cao.mjs init --project /path/to/project --id demo
-node bin/cao.mjs host start --run demo --file task.json --thread THREAD_ID
+node bin/harnessorbit.mjs init --project /path/to/project --id demo
+node bin/harnessorbit.mjs host start --run demo --file task.json --thread THREAD_ID
 ```
 
 登记成功后再修改代码。返回结果包含 taskId、attemptId、nonce 和基线。结果文件使用这些实际 ID：
@@ -31,11 +31,11 @@ node bin/cao.mjs host start --run demo --file task.json --thread THREAD_ID
 只有本次编辑和自己启动的原生子代理都已停止，才能声明 `hostStopped`。报告中的 checks 仍是自报证据。
 
 ```bash
-node bin/cao.mjs host report --run demo --task TASK_ID --file report.json --thread THREAD_ID
-node bin/cao.mjs host verify --run demo --task TASK_ID --thread THREAD_ID
+node bin/harnessorbit.mjs host report --run demo --task TASK_ID --file report.json --thread THREAD_ID
+node bin/harnessorbit.mjs host verify --run demo --task TASK_ID --thread THREAD_ID
 ```
 
-CAO 核对实际变更范围、当前 nonce 和快照，并独立运行配置的 checks。自报成功不能绕过失败检查。通过后标记 `deliveryMode: "in-place"`，不会通过 integrate 重复应用修改。候选通过与完整项目验收仍是两个层次。
+HarnessOrbit 核对实际变更范围、当前 nonce 和快照，并独立运行配置的 checks。自报成功不能绕过失败检查。通过后标记 `deliveryMode: "in-place"`，不会通过 integrate 重复应用修改。候选通过与完整项目验收仍是两个层次。
 
 环境提供当前 thread id 时可省略 `--thread`；显式 ID 必须与当前对话和已登记 owner 一致。它用于本地任务关联，不是 OS 安全或认证机制。
 
@@ -47,4 +47,4 @@ CAO 核对实际变更范围、当前 nonce 和快照，并独立运行配置的
 - checkout 有修改时仍保持 hold；`host recover --thread THREAD_ID` 独立检查保留的代码，不重新启动 worker，也不重放补丁。
 - 同一 owner 对话调用的 supervisor 可以验收已经停止并提交的 host 任务；运行中或未确认停止时返回 attention，不尝试操作虚构终端。
 
-写锁只约束共用同一状态目录的 CAO 操作，不是文件系统沙箱。已报告的未知/运行中子任务会阻止提交或释放。
+写锁只约束共用同一状态目录的 HarnessOrbit 操作，不是文件系统沙箱。已报告的未知/运行中子任务会阻止提交或释放。

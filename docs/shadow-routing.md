@@ -5,9 +5,9 @@
 Shadow routing explains an advisory executor choice using the task brief and existing resource evidence. It never dispatches, calibrates, reserves capacity or changes provider configuration. Every decision reports `mode: "shadow"` and `applied: false`.
 
 ```bash
-node bin/cao.mjs mode enable --strategy shadow --preference balanced
-node bin/cao.mjs route shadow --file task.json
-node bin/cao.mjs route shadow --file task.json --thread THREAD_ID --record
+node bin/harnessorbit.mjs mode enable --strategy shadow --preference balanced
+node bin/harnessorbit.mjs route shadow --file task.json
+node bin/harnessorbit.mjs route shadow --file task.json --thread THREAD_ID --record
 ```
 
 `--record` persists a sanitized, versioned decision under the current conversation. Omitting it is a read-only preview. Existing conversations remain delegated; selecting shadow preserves ordinary execution choices while the skill records the recommendation. Preferences are balanced, fastest, subscription-first and quality-first. Current evidence is insufficient for comparable production latency: these are conservative rules, not a learned scheduler or a speed guarantee.

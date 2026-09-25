@@ -158,7 +158,7 @@ export class ProjectLedger {
       type,
       status,
       digest,
-      summary: `CAO evidence observed: ${type}.`,
+      summary: `HarnessOrbit evidence observed: ${type}.`,
       metadata: { runId, taskId, attemptId },
       references,
     });

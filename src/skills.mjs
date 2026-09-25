@@ -99,7 +99,7 @@ async function assertInstallTargetOutsideSource(skillPath, source) {
   const sourceReal = await fs.realpath(source);
   const target = await resolvePotentialPath(skillPath);
   if (inside(sourceReal, target)) {
-    throw skillError('skill_target_recursive', `Refusing to install CAO skill inside its own source directory: ${skillPath}`, {
+    throw skillError('skill_target_recursive', `Refusing to install HarnessOrbit skill inside its own source directory: ${skillPath}`, {
       skillPath,
       source,
       target,
@@ -110,8 +110,8 @@ async function assertInstallTargetOutsideSource(skillPath, source) {
 function commandHint() {
   return {
     canonical: '$cao',
-    display: 'CAO',
-    desktop: 'Type /CAO, select CAO, then send the skill mention.',
+    display: 'HarnessOrbit',
+    desktop: 'Type /HarnessOrbit, select HarnessOrbit, then send the skill mention. The legacy /CAO command remains available.',
     cli: '$cao or /skills',
     note: 'Bare slash text without selecting a skill mention may depend on the client.',
   };
@@ -146,8 +146,8 @@ export async function installCaoSkill({ skillsDir = defaultSkillsDir(), sourceDi
   const directory = path.resolve(skillsDir);
   const skillPath = path.join(directory, 'cao');
   const info = await sourceInfo(sourceDir);
-  invariant(info.sourceExists, 'skill_source_missing', `CAO skill source directory does not exist: ${info.source}`, { source: info.source });
-  invariant(info.sourceUsable, 'skill_source_invalid', `CAO skill source is incomplete: ${info.source}`, { source: info.source, invalid: info.sourceInvalid });
+  invariant(info.sourceExists, 'skill_source_missing', `HarnessOrbit skill source directory does not exist: ${info.source}`, { source: info.source });
+  invariant(info.sourceUsable, 'skill_source_invalid', `HarnessOrbit skill source is incomplete: ${info.source}`, { source: info.source, invalid: info.sourceInvalid });
 
   const current = await linkInfo(skillPath, info.source);
   if (current.managedLink) {
@@ -193,7 +193,7 @@ export async function uninstallCaoSkill({ skillsDir = defaultSkillsDir(), source
     return { ...(await statusCaoSkill({ skillsDir: directory, sourceDir: info.source })), removed: true };
   }
   if (current.link || current.conflict) {
-    throw skillError('skill_conflict', `Refusing to remove non-CAO skill path: ${skillPath}`, {
+    throw skillError('skill_conflict', `Refusing to remove non-HarnessOrbit skill path: ${skillPath}`, {
       skillPath,
       source: info.source,
       target: current.target,

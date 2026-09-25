@@ -5,9 +5,9 @@
 Shadow 根据任务说明和现有资源证据解释“建议交给谁”，不会派发任务、运行校准、占用容量或更改 provider。每份决策都标记 `mode: "shadow"`、`applied: false`。
 
 ```bash
-node bin/cao.mjs mode enable --strategy shadow --preference balanced
-node bin/cao.mjs route shadow --file task.json
-node bin/cao.mjs route shadow --file task.json --thread THREAD_ID --record
+node bin/harnessorbit.mjs mode enable --strategy shadow --preference balanced
+node bin/harnessorbit.mjs route shadow --file task.json
+node bin/harnessorbit.mjs route shadow --file task.json --thread THREAD_ID --record
 ```
 
 `--record` 保存当前对话下的脱敏、版本化决策，省略时只预览。旧会话继续 delegated；启用 shadow 后，skill 记录建议，但保留原有执行选择。可选 balanced、fastest、subscription-first、quality-first。目前缺少可比较的生产任务延迟证据，因此使用保守规则，不是已经训练好的调度器或提速保证。

@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with Codex Agent Orchestrator.
+description: Report a reproducible problem with HarnessOrbit.
 title: "[Bug]: "
 labels:
   - bug
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Codex Agent Orchestrator. Do not include API keys, tokens, private repository contents, or other credentials.
+        Thanks for helping improve HarnessOrbit. Do not include API keys, tokens, private repository contents, or other credentials.
   - type: textarea
     id: summary
     attributes:
@@ -37,13 +37,13 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Share versions that matter, such as OS, Node.js, Herdr, Claude Code, Pi, and CAO.
+      description: Share versions that matter, such as OS, Node.js, Herdr, Claude Code, Pi, and HarnessOrbit.
       placeholder: |
         OS:
         Node.js:
         Herdr:
         Agent CLI:
-        Codex Agent Orchestrator:
+        HarnessOrbit:
     validations:
       required: true
   - type: textarea

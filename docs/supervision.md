@@ -2,25 +2,25 @@
 
 > 中文: [zh-CN/supervision.md](zh-CN/supervision.md)
 
-CAO can now advance existing tasks through collection and independent verification without a separate model decision at every normal stage. It preserves the existing task/attempt identity, Git scope, verification, and integration holds.
+HarnessOrbit can now advance existing tasks through collection and independent verification without a separate model decision at every normal stage. It preserves the existing task/attempt identity, Git scope, verification, and integration holds.
 
 ## Use with an existing run
 
 ```bash
 # Optional read-only preflight before dispatch: Git snapshot and required executables.
-node bin/cao.mjs preflight --run demo --file task.json
+node bin/harnessorbit.mjs preflight --run demo --file task.json
 
 # Reconcile existing tasks once; never creates or retries an implementation task.
-node bin/cao.mjs step --run demo
+node bin/harnessorbit.mjs step --run demo
 
 # Poll and advance normal stages. Stop on a blocker or when the wait budget expires.
-node bin/cao.mjs supervise --run demo --wait-ms 30000
+node bin/harnessorbit.mjs supervise --run demo --wait-ms 30000
 
 # Explicitly permit integrating accepted worktree patches and one report-only repair.
-node bin/cao.mjs supervise --run demo --integrate --repair-reports
+node bin/harnessorbit.mjs supervise --run demo --integrate --repair-reports
 
 # Query committed performance evidence without starting or observing an agent.
-node bin/cao.mjs performance report --run demo
+node bin/harnessorbit.mjs performance report --run demo
 ```
 
 Use the same `--state-dir` as the run when it is not the default. Preflight does not authenticate, refresh credentials, or make a model request; an executable being present does not prove its account is usable. Dispatch also performs preflight before starting a worker. Unsupported Git snapshots and missing runtime executables fail early, retaining diagnostic evidence.
@@ -39,13 +39,13 @@ Without `--integrate`, accepted worktree patches stay ready for review. Checkout
 
 Permission prompts, authentication, stale nonces, scope violations, unknown/running children, failed checks, and ambiguous controller state require attention. Supervision does not approve prompts, retry implementation, change providers, create new tasks, clear holds, commit, or push. Lack of confirmed progress triggers attention rather than guessing that a silent process has stopped.
 
-A Herdr `blocked` wait records `lastError` as `permission_required` or `worker_blocked`. Inspect with `inspect --output`, send `cao input` only for that inspected dialog, then `resume`. After the pane leaves `blocked`, collect restores `running`. Supervisor attention uses that error code; leftover `:failed` attention keys are not migrated. Provider saturation is recorded as `providerObservation` and does not replace `lastError`; monitor waiting is not a CAO retry. `inspect.retryAdvice` tells whether a scope violation needs a new worktree task or a checkout retry.
+A Herdr `blocked` wait records `lastError` as `permission_required` or `worker_blocked`. Inspect with `inspect --output`, send `cao input` only for that inspected dialog, then `resume`. After the pane leaves `blocked`, collect restores `running`. Supervisor attention uses that error code; leftover `:failed` attention keys are not migrated. Provider saturation is recorded as `providerObservation` and does not replace `lastError`; monitor waiting is not a HarnessOrbit retry. `inspect.retryAdvice` tells whether a scope violation needs a new worktree task or a checkout retry.
 
 ## Optional task deadline
 
 Set `deadlineAt` to an absolute UTC timestamp in task JSON, for example `"2030-01-02T03:04:05.000Z"` (replace with your actual deadline). It is preserved across attempts, preventing retries from resetting the task's budget. Omit it to retain legacy behavior.
 
-Launch and independent checks enforce this deadline while their controllers are running. Supervision also checks it before advancing work. If no controller is running, a worker can continue past the deadline; the next supervision call reconciles and cancels expired work. CAO cannot promise hard real-time termination of unobserved native descendants.
+Launch and independent checks enforce this deadline while their controllers are running. Supervision also checks it before advancing work. If no controller is running, a worker can continue past the deadline; the next supervision call reconciles and cancels expired work. HarnessOrbit cannot promise hard real-time termination of unobserved native descendants.
 
 Expiry does not discard edits or release an uncertain writer. Explicit `recover` can run bounded checks on retained checkout/integration state after expiry, without restarting the worker or replaying a patch. Starting more implementation work needs a task with an appropriate new deadline.
 
@@ -54,7 +54,7 @@ Expiry does not discard edits or release an uncertain writer. Explicit `recover`
 New attempt directories contain `submission.json` alongside `task.json` and `prompt.txt`. A worker may pipe its existing result JSON into:
 
 ```bash
-node /absolute/path/to/cao/bin/cao.mjs result submit --attempt-dir /absolute/attempt --stdin
+node /absolute/path/to/cao/bin/harnessorbit.mjs result submit --attempt-dir /absolute/attempt --stdin
 ```
 
 Alternatively use `--file /path/to/report.json`. The helper validates identity, report shape and size, then atomically writes `result.json`; it refuses symlink result files. It returns `accepted: false`: only collection against the authoritative run and independent verification can accept work. Direct result-file writing remains compatible with older workers.

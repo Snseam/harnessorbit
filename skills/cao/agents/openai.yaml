@@ -1,4 +1,4 @@
 interface:
-  display_name: "CAO"
-  short_description: "Use CAO by default in this Codex conversation"
-  default_prompt: "Use $cao to enable CAO as the default development workflow for this conversation."
+  display_name: "HarnessOrbit"
+  short_description: "Use HarnessOrbit by default in this Codex conversation"
+  default_prompt: "Use $cao to enable HarnessOrbit as the default development workflow for this conversation."

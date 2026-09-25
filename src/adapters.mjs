@@ -9,17 +9,17 @@ export const capabilities = {
   },
   pi: {
     herdrKind: 'pi',
-    nativeDelegation: 'Pi core has no built-in subagents; extensions/packages/external panes may add them, not observed or enforced by CAO',
+    nativeDelegation: 'Pi core has no built-in subagents; extensions/packages/external panes may add them, not observed or enforced by HarnessOrbit',
     maxChildren: 'reported in prompt contract only',
   },
   opencode: {
     herdrKind: 'opencode',
-    nativeDelegation: 'OpenCode subagents depend on local config and permissions; not observed or enforced by CAO',
+    nativeDelegation: 'OpenCode subagents depend on local config and permissions; not observed or enforced by HarnessOrbit',
     maxChildren: 'reported in prompt contract only',
   },
   codex: {
     herdrKind: 'codex',
-    nativeDelegation: 'local Codex lifecycle metadata can be observed where supported; live coverage varies and native delegation is not controlled by CAO',
+    nativeDelegation: 'local Codex lifecycle metadata can be observed where supported; live coverage varies and native delegation is not controlled by HarnessOrbit',
     maxChildren: 'reported in prompt contract only',
   },
 };
@@ -71,7 +71,7 @@ export function compilePrompt(task, attempt) {
   const maxChildren = Number.isInteger(task.maxChildren) ? task.maxChildren : 0;
   const skeleton = resultSkeleton(task, attempt);
 
-  return `You are working under Codex Agent Orchestrator.
+  return `You are working under HarnessOrbit.
 
 Task:
 ${task.objective}
@@ -110,7 +110,7 @@ Child/inner-agent reporting:
 
 Result contract:
 - Write the result file last, after edits and checks.
-- Prefer the atomic submission helper with the result JSON on stdin. Its argv is ${JSON.stringify([process.execPath, fileURLToPath(new URL('../bin/cao.mjs', import.meta.url)), 'result', 'submit', '--attempt-dir', attempt.directory, '--stdin'])}. It validates your report; it does not accept the task or run checks for you. Direct result-file writing remains supported.
+- Prefer the atomic submission helper with the result JSON on stdin. Its argv is ${JSON.stringify([process.execPath, fileURLToPath(new URL('../bin/harnessorbit.mjs', import.meta.url)), 'result', 'submit', '--attempt-dir', attempt.directory, '--stdin'])}. It validates your report; it does not accept the task or run checks for you. Direct result-file writing remains supported.
 - The result file must contain one JSON object with this shape:
 ${JSON.stringify(skeleton, null, 2)}
 - status must be "submitted" when you have delivered work for verification, or "needs_input" when blocked on user/controller input.

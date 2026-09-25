@@ -1,13 +1,14 @@
 {
-  "name": "codex-agent-orchestrator",
+  "name": "harnessorbit",
   "version": "0.1.0",
   "private": true,
-  "description": "Codex-led coding agent orchestration and local status monitoring via Herdr, with Git worktree isolation and independent verification.",
+  "description": "Local, verification-first execution for coding agents via Herdr, with Git worktree isolation and independent verification.",
   "type": "module",
   "engines": {
     "node": ">=22.13"
   },
   "bin": {
+    "harnessorbit": "bin/harnessorbit.mjs",
     "cao": "bin/cao.mjs"
   },
   "scripts": {
@@ -24,11 +25,11 @@
   "author": "Snseam",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Snseam/codex-agent-orchestrator.git"
+    "url": "git+https://github.com/Snseam/harnessorbit.git"
   },
-  "homepage": "https://github.com/Snseam/codex-agent-orchestrator#readme",
+  "homepage": "https://github.com/Snseam/harnessorbit#readme",
   "bugs": {
-    "url": "https://github.com/Snseam/codex-agent-orchestrator/issues"
+    "url": "https://github.com/Snseam/harnessorbit/issues"
   },
   "keywords": [
     "coding-agent",

@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to Codex Agent Orchestrator are recorded here. Pre-1.0 interfaces may change between releases.
+Notable changes to HarnessOrbit are recorded here. Pre-1.0 interfaces may change between releases.
 
 ## Unreleased
 
@@ -16,7 +16,7 @@ Notable changes to Codex Agent Orchestrator are recorded here. Pre-1.0 interface
 - Opt-in adaptive dispatch (`dispatch --adaptive` or `mode enable --strategy adaptive`) that binds one eligible resource to an attempt, pins retries to that binding, and treats unfinished or unknown native children as blockers. Preference ranking uses completion rate before elapsed time; it is not a live-agent speed or quality guarantee.
 - Optional bounded task briefs and unapplied `route shadow` recommendations with versioned per-conversation preferences. Existing dispatch defaults remain delegated.
 - Current-Codex `host start/report/verify/release/recover` workflow with checkout ownership, explicit stopped reports, bounded retries and independent in-place verification; cancellation does not pretend to stop the App turn.
-- English/Chinese host and shadow-routing guides, updated CAO skill guidance, and host/external executor metadata in monitor snapshots.
+- English/Chinese host and shadow-routing guides, updated HarnessOrbit skill guidance, and host/external executor metadata in monitor snapshots.
 
 - Native/managed `resources list/check`, including NVM installations, distinct Pi provider/model candidates, configuration fingerprints, quota freshness and cached call-verification evidence.
 - Explicit isolated Claude/Pi `calibrate` quick/code suites, bounded model calls, private temporary configuration, independent code checks and real/mock-aware evidence caching. These probes are not production harness or overall quality benchmarks.
@@ -27,30 +27,30 @@ Notable changes to Codex Agent Orchestrator are recorded here. Pre-1.0 interface
 - `performance report` with observed phase/blocked durations, outcome and legacy-data coverage, sequenced post-commit observation events, and sanitized timing metadata in monitor snapshots. These are execution observations, not model inference benchmarks or speedup claims.
 - English and Chinese supervision guides and regression coverage for acknowledgement loss, controller concurrency, deadline/recovery behavior, and end-to-end CLI verification/integration.
 
-- Installable **CAO** Codex skill, a copyable README installation request, and `skill install/status/uninstall` commands with linked-checkout updates and conflict protection.
-- Per-conversation `mode enable/status/disable` preferences for continuing CAO development across turns, with independent project/agent/profile/limit settings and recovery notes. Desktop activation uses the `/CAO` skill suggestion; CLI supports `$cao` and `/skills`.
+- Installable **HarnessOrbit** Codex skill, a copyable README installation request, and `skill install/status/uninstall` commands with linked-checkout updates and conflict protection.
+- Per-conversation `mode enable/status/disable` preferences for continuing HarnessOrbit development across turns, with independent project/agent/profile/limit settings and recovery notes. Desktop activation uses the `/HarnessOrbit` skill suggestion; CLI supports `$cao` and `/skills`.
 - `usage` queries local Claude Code, Codex CLI, Pi, and OpenCode token records through optional Tokscale tooling (`>=4.16.0 <5`).
-- Agent/model/date filters, JSON or terminal-table output, and CAO run/task workspace attribution with explicit precision and coverage metadata.
+- Agent/model/date filters, JSON or terminal-table output, and HarnessOrbit run/task workspace attribution with explicit precision and coverage metadata.
 - Separate input, output, cache read/write, and reasoning counters; incomplete or shared checkout usage is not presented as an exact task total.
 - An opt-in synthetic Tokscale integration test and bilingual token-usage documentation.
 - Execution profiles for selecting native Claude, Codex, Pi, and OpenCode runtime settings per task without rewriting global provider files.
-- Profile CRUD/default/export, stored and environment secret references, CC Switch source discovery/import, route explanation, gateway lifecycle commands, and CAO-attempt reservation tracking.
+- Profile CRUD/default/export, stored and environment secret references, CC Switch source discovery/import, route explanation, gateway lifecycle commands, and HarnessOrbit-attempt reservation tracking.
 - Profiled local gateway relay with same-protocol fallbacks, model rewriting, source drift checks, and private per-attempt native configuration for Claude Code, Codex CLI, Pi, and OpenCode.
 - Bilingual execution-profile documentation and architecture notes covering routing, CC Switch schema-18 limits, secrets, gateway behavior, and current validation evidence.
 - Profiled execution smoke evidence covers Herdr 0.9+ with two Claude sessions against a local simulated Anthropic API: separate models/keys, Read/Write/Bash/tool-result submission, two independently accepted tasks, 16 matched gateway requests, unchanged global provider files, and runtime release. This is not a real model-quality or provider-billing measurement.
-- Local Agent Monitor commands (`monitor start/status/stop/snapshot`) for read-only localhost metadata dashboards over CAO projects, individual runs, or explicit machine-wide scope.
-- Monitor source adapters for CAO state, Codex app-server/SQLite metadata, and Claude hook/local metadata, with source freshness labels and no storage of prompts, tool inputs, tool outputs, or replies.
-- CAO-managed Claude hook telemetry for sanitized child lifecycle metadata, with graceful degradation for disabled hooks, bare launches, unsafe settings, or unmanaged sessions.
-- Monitor validation evidence covers a CAO-managed Claude Explore child reporting `SubagentStart -> running -> SubagentStop -> completed`; independent acceptance and integration passed, and generated settings were removed after worker shutdown while existing event evidence remained. Browser checks cover desktop/mobile layouts, conversation isolation and retained selection, unlinked-only snapshots, token details, known zero, missing usage, and partial records.
-- Agent Monitor Project and Conversation views, including explicit conversation-root graph relationships for Codex subagents, CAO external agents, and Claude children without project-path parent guessing.
-- Per-agent token metadata in monitor snapshots (`nodes.tokens` / `tokenUsage`) with session/turn/observed scope, source, completeness, and partial/scanned-window handling. These observations are not provider billing, subscription balance, or exact CAO task cost.
+- Local Agent Monitor commands (`monitor start/status/stop/snapshot`) for read-only localhost metadata dashboards over HarnessOrbit projects, individual runs, or explicit machine-wide scope.
+- Monitor source adapters for HarnessOrbit state, Codex app-server/SQLite metadata, and Claude hook/local metadata, with source freshness labels and no storage of prompts, tool inputs, tool outputs, or replies.
+- HarnessOrbit-managed Claude hook telemetry for sanitized child lifecycle metadata, with graceful degradation for disabled hooks, bare launches, unsafe settings, or unmanaged sessions.
+- Monitor validation evidence covers a HarnessOrbit-managed Claude Explore child reporting `SubagentStart -> running -> SubagentStop -> completed`; independent acceptance and integration passed, and generated settings were removed after worker shutdown while existing event evidence remained. Browser checks cover desktop/mobile layouts, conversation isolation and retained selection, unlinked-only snapshots, token details, known zero, missing usage, and partial records.
+- Agent Monitor Project and Conversation views, including explicit conversation-root graph relationships for Codex subagents, HarnessOrbit external agents, and Claude children without project-path parent guessing.
+- Per-agent token metadata in monitor snapshots (`nodes.tokens` / `tokenUsage`) with session/turn/observed scope, source, completeness, and partial/scanned-window handling. These observations are not provider billing, subscription balance, or exact HarnessOrbit task cost.
 
 ### Fixed
 
 - Treat leftover Git gitlinks as opaque snapshot pointers so nested worktree leftovers no longer fail `preparing`.
 - Surface a bounded `errorCode` on `attempt.state` events, monitor timings, and supervisor HOLD attention; `herdr-server.log` remains Herdr stdio.
 - Record `permission_required` or `worker_blocked` when Herdr is blocked, and restore `running` after that wait ends without auto-approving prompts.
-- Annotate provider saturation on collect without replacing `lastError`; monitor waiting copy is not a CAO retry.
+- Annotate provider saturation on collect without replacing `lastError`; monitor waiting copy is not a HarnessOrbit retry.
 - Reject directory scopes missing a trailing slash before reserving an attempt; worktree scope violations cannot retry leftover files.
 - Close the Codex install-paste locate paths to exact `stat`s so installation does not walk session history.
 
@@ -82,4 +82,4 @@ Initial public preview.
 - Two local Claude Code scenarios passed: controlled failure/repair and normal task-file dispatch, including project integration checks.
 - Pi, OpenCode, and Codex CLI live workflows remain unverified. Native subagent monitoring, a background scheduler, and large-scale performance evaluation are not included.
 
-[0.1.0]: https://github.com/Snseam/codex-agent-orchestrator/releases/tag/v0.1.0
+[0.1.0]: https://github.com/Snseam/harnessorbit/releases/tag/v0.1.0

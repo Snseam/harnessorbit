@@ -2,7 +2,7 @@
 
 Date: 2026-09-24 (Asia/Shanghai)
 
-This report records the evidence for the CAO branch integration. It keeps
+This report records the evidence for the HarnessOrbit branch integration. It keeps
 implementation facts, observed measurements, statistical claims and unknowns
 separate.
 
