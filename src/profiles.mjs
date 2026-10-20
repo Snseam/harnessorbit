@@ -11,7 +11,7 @@ const protocols = new Set(['anthropic', 'openai-responses', 'openai-chat']);
 const credentialTypes = new Set(['none', 'env', 'stored', 'cc-switch']);
 const authSchemes = new Set(['bearer', 'api-key']);
 const sourceTypes = new Set(['native', 'cc-switch', 'external-gateway']);
-const quotaStates = new Set(['unknown', 'available', 'exhausted']);
+const quotaStates = new Set(['unknown', 'available', 'exhausted', 'unavailable']);
 const publicKeys = new Set([
   'id', 'name', 'agent', 'model', 'protocol', 'endpoint', 'credential', 'source', 'enabled',
   'capabilities', 'priority', 'account', 'quota', 'quality', 'speed', 'costPerMillion',

@@ -437,3 +437,31 @@ test('get selects exact id and reports typed not found errors', async t => {
     error => error.code === 'resource_not_found' && error.details.id === 'profile-missing',
   );
 });
+
+test('profile resource fingerprints stay stable across repeated checks and list mode reuses observed authentication', async t => {
+  const { home, state, bin } = await fixture(t);
+  await writeExecutable(path.join(bin, 'claude'));
+  const store = new ProfileStore({ root: state });
+  await store.put(profile('claude-main', { credential: { type: 'none' }, endpoint: 'http://127.0.0.1:9/v1' }));
+  const runner = async (argv) => {
+    if (argv[1] === '--version') return { code: 0, stdout: 'Claude Code 1.2.3\n', stderr: '', truncated: false };
+    return { code: 0, stdout: '{"authenticated":true}', stderr: '', truncated: false };
+  };
+  const first = await new ResourceService({ root: state, home, environment: { PATH: bin }, profiles: store, runner, now: () => Date.parse('2026-09-17T01:00:00.000Z') })
+    .discover({ check: true, agents: ['claude'] });
+  const second = await new ResourceService({ root: state, home, environment: { PATH: bin }, profiles: store, runner, now: () => Date.parse('2026-09-17T01:05:00.000Z') })
+    .discover({ check: true, agents: ['claude'] });
+  const pick = (inventory, id) => inventory.resources.find(resource => resource.id === id);
+  assert.equal(pick(first, 'profile-claude-main').fingerprint, pick(second, 'profile-claude-main').fingerprint);
+  assert.equal(pick(second, 'native-claude').authentication.state, 'observed');
+  assert.equal(pick(second, 'native-claude').configured, true);
+
+  const listed = await new ResourceService({
+    root: state, home, environment: { PATH: bin }, profiles: store,
+    runner: async () => { throw new Error('list mode must not probe'); },
+    now: () => Date.parse('2026-09-17T01:10:00.000Z'),
+  }).discover({ agents: ['claude'] });
+  assert.equal(pick(listed, 'native-claude').authentication.state, 'observed');
+  assert.equal(pick(listed, 'native-claude').configured, true);
+  assert.equal(pick(listed, 'native-claude').fingerprint, pick(second, 'native-claude').fingerprint);
+});

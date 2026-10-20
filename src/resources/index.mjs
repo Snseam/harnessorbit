@@ -608,8 +608,9 @@ function publicProfileResourceFingerprint(profile, nativeResource) {
       installed: nativeResource.installed,
       executable: nativeResource.executable,
       discoverySource: nativeResource.discoverySource,
+      // Only the observed version participates; the observation timestamp would change the
+      // fingerprint on every `resources check` and invalidate unrelated calibration records.
       version: nativeResource.version,
-      versionObservation: nativeResource.versionObservation,
     } : null,
   });
 }
@@ -798,6 +799,11 @@ export class ResourceService {
         if (stored?.version && stored?.versionObservation?.basisFingerprint === basisFingerprint && versionObservationFresh(stored.versionObservation, nowMs)) {
           version = stored.version;
           versionObservation = { ...stored.versionObservation, fresh: true };
+          // Reuse probe-observed authentication for the same configuration so OAuth-only
+          // installations stay `configured` in list mode, which adaptive dispatch relies on.
+          if (stored.authentication?.state === 'observed' && typeof stored.authentication.source === 'string') {
+            checkAuth = { state: 'observed', source: stored.authentication.source };
+          }
         }
       }
       const authentication = nativeAuth(entry.agent, this.environment, config, checkAuth);

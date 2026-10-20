@@ -209,3 +209,33 @@ test('unknown run and unsafe identifiers fail without creating run directories',
   await assert.rejects(service.verify('missing', '../../bad'), e => e.code === 'invalid_id');
   await assert.rejects(fs.stat(path.join(stateRoot, 'runs', 'missing')), e => e.code === 'ENOENT');
 });
+
+test('native error codes in lastError never block a state transition event', async t => {
+  const { service, run } = await setup(t);
+  const launched = await service.dispatch(run.id, task());
+  const updated = await service.updateAttempt(run.id, task().id, launched.attempt.id, attempt => {
+    attempt.lastError = { code: 'EACCES', message: 'permission denied' };
+    attempt.status = 'failed';
+  });
+  assert.equal(updated.status, 'failed');
+  assert.equal(updated.lastError.code, 'EACCES');
+  const events = (await fs.readFile(path.join(service.root, 'runs', run.id, 'events.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line));
+  const transition = events.find(event => event.type === 'attempt.state' && event.to === 'failed');
+  assert.equal(transition.errorCode, 'eacces');
+  const sensitive = await service.updateAttempt(run.id, task().id, launched.attempt.id, attempt => {
+    attempt.lastError = { code: 'invalid_token' };
+    attempt.status = 'interrupted';
+  });
+  assert.equal(sensitive.status, 'interrupted');
+});
+
+test('status reports task ids and attempt ids separately', async t => {
+  const { service, run } = await setup(t);
+  const launched = await service.dispatch(run.id, task());
+  const status = await service.status(run.id);
+  assert.equal(status.tasks[0].id, task().id);
+  assert.equal(status.tasks[0].attemptId, launched.attempt.id);
+  assert.equal(status.tasks[0].agent, 'claude');
+  assert.equal(status.tasks[0].isolation, 'worktree');
+});

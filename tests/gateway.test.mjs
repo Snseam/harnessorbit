@@ -91,7 +91,7 @@ async function fakeUpstream(handler) {
     for await (const chunk of req) chunks.push(chunk);
     const bodyText = Buffer.concat(chunks).toString('utf8');
     let body = null;
-    if (bodyText) body = JSON.parse(bodyText);
+    if (bodyText) { try { body = JSON.parse(bodyText); } catch { body = bodyText; } }
     const record = { method: req.method, url: req.url, headers: req.headers, body };
     requests.push(record);
     await handler(req, res, record, requests.length);
@@ -898,6 +898,32 @@ test('Gateway rejects the next request when a CC Switch source snapshot drifts w
     } finally {
       await upstream.close();
       await rm(sourceDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+test('Gateway forwards a non-JSON POST body instead of failing with gateway_exception', async () => {
+  await withTemp(async (root) => {
+    const upstream = await fakeUpstream((req, res) => {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('bad request');
+    });
+    try {
+      const { manager, handle, token } = await startGateway(root, [baseProfile('p1', upstream.endpoint)]);
+      const response = await fetch(`${handle.endpoint}/v1/responses`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'text/plain' },
+        body: 'not json at all',
+      });
+      assert.equal(response.status, 400);
+      await response.text();
+      const log = await readFile(join(root, 'gateways', 'gw1', 'gateway.log'), 'utf8');
+      assert.doesNotMatch(log, /gateway_exception/);
+      assert.match(log, /"resolvedModel":null/);
+      await waitForIdle(manager, 'gw1');
+      await manager.stop('gw1');
+    } finally {
+      await upstream.close();
     }
   });
 });
