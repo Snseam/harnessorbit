@@ -166,15 +166,16 @@ async function readBody(req, limit) {
 }
 
 function rewriteBody(buffer, profile, pathname) {
-  if (buffer.length === 0 || reqMaySkipRewrite(pathname)) return { body: buffer, requestedModel: null, hasState: false };
+  const passthrough = { body: buffer, requestedModel: null, resolvedModel: null, hasState: false };
+  if (buffer.length === 0 || reqMaySkipRewrite(pathname)) return passthrough;
   let value;
   try {
     value = JSON.parse(buffer.toString('utf8'));
   } catch {
-    return { body: buffer, requestedModel: null, hasState: false };
+    return passthrough;
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return { body: buffer, requestedModel: null, hasState: false };
+    return passthrough;
   }
   const requestedModel = typeof value.model === 'string' ? value.model : null;
   const mapped = requestedModel && profile.modelMap?.[requestedModel] ? profile.modelMap[requestedModel] : profile.model;
@@ -182,6 +183,7 @@ function rewriteBody(buffer, profile, pathname) {
   return {
     body: Buffer.from(JSON.stringify(value)),
     requestedModel,
+    resolvedModel: typeof value.model === 'string' ? value.model : null,
     hasState: typeof value.previous_response_id === 'string' && value.previous_response_id.length > 0,
   };
 }
@@ -238,6 +240,9 @@ function upstreamRequest(req, profile, config, pathname, body, { signal }) {
       timeout: config.upstreamTimeoutMs,
     }, (response) => resolve({ response, url }));
     request.on('socket', (socket) => {
+      // A reused keep-alive socket is already open and never emits connect again;
+      // bytes may reach upstream immediately, so treat it as connected.
+      if (socket.readyState === 'open') upstreamConnected = true;
       socket.once('connect', () => {
         upstreamConnected = true;
       });
@@ -286,7 +291,11 @@ async function pipeResponse(upstream, res, abortController) {
       res.end();
       resolve();
     });
-    upstream.on('error', reject);
+    upstream.on('error', (error) => {
+      // Headers are already sent; close the client response instead of leaving it hanging.
+      res.destroy(error);
+      reject(error);
+    });
     res.on('close', () => {
       abortController.abort();
       resolve();
@@ -358,7 +367,7 @@ async function handleProxy(req, res, config) {
       endpointHost: new URL(profile.endpoint).host,
       path: pathname,
       requestedModel: rewrite.requestedModel,
-      resolvedModel: reqMaySkipRewrite(pathname) ? null : JSON.parse(rewrite.body.toString('utf8') || '{}')?.model ?? null,
+      resolvedModel: rewrite.resolvedModel,
     }).catch(() => {});
 
     try {

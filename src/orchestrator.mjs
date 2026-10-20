@@ -36,10 +36,14 @@ const checkoutHold = t => t.definition.isolation === 'checkout' && !['accepted',
 const stopped = a => a.executorKind === 'host' ? Boolean(a.hostStoppedEvidence) : a.workerClosed;
 const missing = error => ['agent_not_found', 'agent_not_running', 'pane_not_found'].includes(error.code);
 const serializeError = e => ({ code: e.code || 'error', message: e.message, details: e.details || {} });
+// Runtime events only accept lowercase `[a-z][a-z0-9_.-]*` codes without secret-like words.
+// Native errors such as EACCES must never block a state transition, so normalize instead of failing.
 const boundedEventErrorCode = (code) => {
   if (typeof code !== 'string' || !code) return null;
-  const bounded = code.replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 80);
-  return bounded || null;
+  const bounded = code.replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 80).toLowerCase().replace(/[^a-z0-9_.-]/g, '_');
+  if (!bounded) return null;
+  const normalized = /^[a-z]/.test(bounded) ? bounded : `error_${bounded}`;
+  return /(secret|token|password|credential|authorization)/.test(normalized) ? 'error' : normalized;
 };
 const current = record => record.attempts.find(a => a.id === record.currentAttempt);
 const inside = (parent, child) => child === parent || child.startsWith(parent + path.sep);
@@ -694,7 +698,8 @@ export class Orchestrator {
   async status(runId) {
     if (!runId) return (await state.listRuns(this.root)).map(r => ({ id: r.id, project: r.project, taskCount: Object.keys(r.tasks || {}).length, createdAt: r.createdAt }));
     const run = await this._loadRun(runId);
-    return { ...run, stateDirectory: state.runPath(this.root, runId), tasks: Object.values(run.tasks).map(t => ({ id: t.definition.id, agent: t.definition.agent, isolation: t.definition.isolation, ...current(t) })) };
+    // Task identity must win over the spread attempt record, whose `id` is the attempt id.
+    return { ...run, stateDirectory: state.runPath(this.root, runId), tasks: Object.values(run.tasks).map(t => ({ ...current(t), id: t.definition.id, attemptId: current(t)?.id ?? null, agent: t.definition.agent, isolation: t.definition.isolation })) };
   }
 
   async input(runId, taskId, { keys, text } = {}) {

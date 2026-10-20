@@ -514,6 +514,7 @@ test('collectClaude reads bounded local fallback without duplicating managed ses
     sessionId: 'local-one',
     cwd: project,
     isSidechain: true,
+    type: 'user',
     parentUuid: 'parent-one',
     message: { content: 'must not appear' },
     toolUseResult: { output: 'must not appear' },
@@ -524,5 +525,6 @@ test('collectClaude reads bounded local fallback without duplicating managed ses
   assert.equal(result.nodes[0].source, 'claude-local');
   assert.equal(result.nodes[0].relation, 'unlinked');
   assert.equal(result.nodes[0].status, 'unknown');
+  assert.equal(result.nodes[0].role, null);
   assert.equal(JSON.stringify(result).includes('must not appear'), false);
 });

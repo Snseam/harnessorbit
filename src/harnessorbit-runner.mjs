@@ -6,6 +6,7 @@ import { createContextPacket } from './context-packet.mjs';
 import {
   createDecisionRequest,
   decideWithFallback,
+  decisionDigest,
   DeterministicDecisionProvider,
   JevDecisionProvider,
 } from './decision-provider.mjs';
@@ -53,7 +54,7 @@ export function buildGovernedPrompt(prompt, { context, decision } = {}) {
 function spawnCodex({ command, cwd, prompt, timeoutMs = 900_000, env = process.env, spawnImpl = spawn } = {}) {
   return new Promise(resolve => {
     const startedAt = Date.now();
-    const child = spawn(command, [
+    const child = spawnImpl(command, [
       'exec', '--ephemeral', '--json', '--sandbox', 'workspace-write',
       '--skip-git-repo-check', '-C', cwd, prompt,
     ], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -131,7 +132,7 @@ export async function runHarnessOrbit({
     harnessOrbit: {
       version: HARNESSORBIT_RUNNER_VERSION,
       contextDigest: packet.packetDigest,
-      decisionDigest: digest(decision),
+      decisionDigest: decisionDigest(decision),
       finalLocalAction: decision.finalLocalAction,
     },
   };

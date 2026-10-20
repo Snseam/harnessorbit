@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { claudeProjectSlug, usageForClaudeSession } from './claude-usage.mjs';
+import { claudeProjectSlug, readClaudeUsage, usageForClaudeSession } from './claude-usage.mjs';
 
 const HOOK_EVENTS = [
   'SessionStart',
@@ -593,12 +593,14 @@ async function collectFallback({ home, project, knownCwds, managedSessions, now,
       cwd ||= safeText(event.cwd, null, 1024);
       if (event.isSidechain === true) isSidechain = true;
       parentUuid ||= safeText(event.parentUuid || event.sourceToolAssistantUUID, null, 256);
-      agentType ||= safeText(event.agent_type || event.type, null, 80);
+      // `type` on a transcript line is user/assistant/summary, not an agent role.
+      agentType ||= safeText(event.agent_type || event.agentType, null, 80);
     }
     if (!sessionId || managedSessions.has(sessionId)) continue;
     if ((project || knownCwds?.size) && !cwdInScope(cwd, project, knownCwds)) continue;
     const id = `claude:${safeIdPart(sessionId)}:${safeIdPart(parentUuid || 'local')}`;
-    const localUsage = await usageForClaudeSession({ home, cwd, sessionId });
+    // Read usage from this transcript itself so a subagent row never inherits its parent's log.
+    const localUsage = await readClaudeUsage(file);
     nodes.push(baseNode({
       id,
       parentId: null,

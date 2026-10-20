@@ -21,3 +21,28 @@ test('HarnessOrbit runner never forwards provider credentials to the Codex child
   const env = childEnvironment({ JEV_JBSD_API_KEY: 'private', JEV_ENDPOINT: 'https://example.invalid', PATH: '/bin' });
   assert.deepEqual(env, { PATH: '/bin' });
 });
+
+test('HarnessOrbit runner records a content-bound decision digest and honours the injected spawner', async t => {
+  const { EventEmitter } = await import('node:events');
+  const { fixture } = await import('./helpers.mjs');
+  const { runHarnessOrbit } = await import('../src/harnessorbit-runner.mjs');
+  const crypto = await import('node:crypto');
+  const f = await fixture();
+  t.after(f.remove);
+  const spawned = [];
+  const spawnImpl = (command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => true;
+    spawned.push({ command, args });
+    setImmediate(() => { child.stdout.emit('data', 'ok'); child.emit('close', 0, null); });
+    return child;
+  };
+  const result = await runHarnessOrbit({ cwd: f.project, prompt: 'Fix add', stateRoot: f.stateRoot, codexCommand: 'fake-codex', env: { PATH: '/bin' }, spawnImpl });
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].command, 'fake-codex');
+  assert.equal(result.outcome, 'accepted');
+  assert.match(result.harnessOrbit.decisionDigest, /^[a-f0-9]{64}$/);
+  assert.notEqual(result.harnessOrbit.decisionDigest, crypto.createHash('sha256').update('[object Object]').digest('hex'));
+});
