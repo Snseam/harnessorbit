@@ -93,6 +93,48 @@ test('store identity: a fresh root refuses every remote call until the host init
   assert.equal((await coop.store.inspect()).status, 'store_metadata_missing');
 });
 
+test('init crash windows: the one-generation plan is persisted before any data file; rerunning init replays it, refuses unexpected files, and never adopts a marked file without its plan', async t => {
+  const { coop, codex, grok, jobId, files, control } = await setup(t, { init: false });
+  const first = await coop.store.init();
+  const done = await control();
+  assert.equal(done.migration.from, 'init'); assert.equal(done.migration.state, 'none'); assert.equal(done.migration.expected.recipientsSha, done.boundary.recipientsSha);
+  const plan = { ...done, migration: { ...done.migration, state: 'in_progress', phase: 'prepared', completedAt: null }, boundary: null };
+  // (a) Crash right after the plan: no data file exists yet. Remote calls are blocked with the init hint; init completes with the same generation.
+  await fs.unlink(files.journal); await fs.unlink(files.receipts); await fs.unlink(files.recipients);
+  await fs.writeFile(files.store, JSON.stringify(plan));
+  for (const call of [() => coop.inbox(codex, {}), () => coop.report(grok, report(jobId)), () => coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex' })]) await assert.rejects(call(), e => e.code === 'migration_in_progress' && e.details.from === 'init' && /store init/.test(e.details.operatorAction));
+  await assert.rejects(coop.store.migrate({ resume: true }), e => e.code === 'migration_in_progress' && e.details.from === 'init');
+  assert.equal((await coop.store.inspect()).status, 'migration_in_progress');
+  assert.equal((await coop.store.init()).generation, first.generation, 'the saved plan is replayed with its generation');
+  assert.equal((await control()).migration.state, 'none');
+  assert.equal(sha(await fs.readFile(files.recipients)), done.boundary.recipientsSha, 'the planned recipients image, byte for byte');
+  // (b) Crash after the files were created, before the boundary: init completes; nothing is rewritten.
+  await fs.writeFile(files.store, JSON.stringify(plan));
+  const marked = await fs.readFile(files.recipients);
+  assert.equal((await coop.store.init()).generation, first.generation);
+  assert.ok(Buffer.compare(marked, await fs.readFile(files.recipients)) === 0);
+  assert.equal((await coop.inbox(codex, {}).catch(e => e.code)), 'consumer_not_registered', 'the store is usable again');
+  // (c) A file that does not match the plan blocks init and is left alone.
+  await fs.writeFile(files.store, JSON.stringify(plan));
+  const foreign = jsonFileBytes({ schemaVersion: 1, generation: first.generation, revision: 0, recipients: { x: { id: 'x', kind: 'inbox', epoch: 'e' } } });
+  await fs.writeFile(files.recipients, foreign);
+  await assert.rejects(coop.store.init(), e => e.code === 'init_blocked');
+  assert.equal((await fs.readFile(files.recipients, 'utf8')), foreign, 'not erased, not adopted');
+  await fs.writeFile(files.recipients, marked);
+  await fs.appendFile(files.journal, 'x');
+  await assert.rejects(coop.store.init(), e => e.code === 'init_blocked' && /journal/.test(e.message));
+  await fs.writeFile(files.journal, '');
+  assert.equal((await coop.store.init()).generation, first.generation);
+  // (d) A marked recipients file without store.json is never a plan: metadata missing, init refuses.
+  await fs.unlink(files.store);
+  await assert.rejects(coop.store.init(), e => e.code === 'store_not_empty' && e.details.status === 'store_metadata_missing');
+  await assert.rejects(coop.inbox(codex, {}), e => e.code === 'store_metadata_missing');
+  assert.ok(Buffer.compare(marked, await fs.readFile(files.recipients)) === 0, 'the marker is not erased');
+  // A completed store never re-initialises.
+  await fs.writeFile(files.store, JSON.stringify(await (async () => { await fs.writeFile(files.store, JSON.stringify(plan)); await coop.store.init(); return control(); })()));
+  await assert.rejects(coop.store.init(), e => e.code === 'store_initialized');
+});
+
 test('upgrade: a nonempty pre-protocol store is migrated in place with identical bytes, ids, epochs, acks and the unresolved attempt; one generation; resume replays only the saved plan', async t => {
   const f = await setup(t, { init: false });
   const { coop, grok, codex, jobId, files, control } = f;
@@ -172,6 +214,17 @@ test('upgrade: an interrupted migration is resumable with the same generation an
   await fs.appendFile(files.journal, v1Line({ v: 1, kind: 'event', seq: 3, event: { eventId: '33333333-3333-4333-8333-333333333333' }, idempotency: {}, deliveries: [] }));
   await assert.rejects(coop.store.migrate({ resume: true }), e => e.code === 'migration_blocked' && e.details.file === 'journal.jsonl');
   assert.equal((await control()).migration.state, 'in_progress', 'still blocked, not silently completed');
+  // Tail-repair boundary: the plan froze the exact original image. A same-length change to the torn
+  // tail (not the validated prefix) is not that image, so the planned truncation is not applied.
+  const prepared = { ...plan, migration: { ...plan.migration, state: 'in_progress', phase: 'prepared', completedAt: null }, boundary: null };
+  await fs.writeFile(files.store, JSON.stringify(prepared));
+  await fs.writeFile(files.journal, Buffer.concat([original.journal.subarray(0, original.journal.length - 2), Buffer.from('XX')]));
+  assert.equal(plan.migration.repair.journal.originalSha, sha(original.journal));
+  await assert.rejects(coop.store.migrate({ resume: true }), e => e.code === 'migration_blocked' && /neither the frozen original image/.test(e.message));
+  assert.equal((await fs.stat(files.journal)).size, original.journal.length, 'nothing was truncated');
+  await fs.writeFile(files.journal, original.journal);
+  assert.equal((await coop.store.migrate({ resume: true })).generation, first.generation);
+  assert.deepEqual((await coop.inbox(codex, {})).events.map(e => e.seq), [1, 2]);
 });
 
 test('upgrade refusals: a complete legacy row with a bad checksum, a broken sequence, or chained rows without store.json never migrate', async t => {
@@ -182,6 +235,10 @@ test('upgrade refusals: a complete legacy row with a bad checksum, a broken sequ
   await fs.writeFile(files.journal, good.replace('"legacy 2"', '"tampered"'));
   await assert.rejects(coop.store.migrate({ fromV1: true }), e => e.code === 'legacy_prefix_invalid');
   assert.equal(await fs.readFile(files.store, 'utf8').catch(e => e.code), 'ENOENT', 'nothing was written');
+  // Parseable JSON with a bad checksum and no newline is a complete bad row, not a disposable tail.
+  await fs.writeFile(files.journal, good.replace('"legacy 2"', '"tampered"').slice(0, -1));
+  await assert.rejects(coop.store.migrate({ fromV1: true }), e => e.code === 'legacy_prefix_invalid');
+  assert.equal(await fs.readFile(files.store, 'utf8').catch(e => e.code), 'ENOENT');
   const [l1, l2] = good.trim().split('\n');
   await fs.writeFile(files.journal, `${l2}\n${l1}\n`);
   await assert.rejects(coop.store.migrate({ fromV1: true }), e => e.code === 'legacy_prefix_invalid' && /contiguous/.test(e.message));
@@ -334,6 +391,13 @@ test('chain discipline beyond the boundary: a complete bad row is corruption, an
   // Complete row, bad checksum, terminated: corruption.
   await fs.appendFile(files.journal, `${row(record, boundary.eventLastSha).replace('"seq":2', '"seq":3')}\n`);
   await assert.rejects(coop.inbox(codex, {}), e => e.code === 'journal_corrupt' && /bad checksum/.test(e.message));
+  await fs.writeFile(files.journal, committed);
+  // Complete JSON, bad checksum, no trailing newline: corruption, not a removable fragment; bytes untouched.
+  const badNoNewline = row(record, boundary.eventLastSha).replace('"seq":2', '"seq":3');
+  await fs.appendFile(files.journal, badNoNewline);
+  await assert.rejects(coop.inbox(codex, {}), e => e.code === 'journal_corrupt' && /bad checksum/.test(e.message));
+  assert.equal((await fs.readFile(files.journal, 'utf8')), `${committed.toString()}${badNoNewline}`, 'nothing was truncated or delimited');
+  assert.equal((await coop.store.inspect()).status, 'corrupt');
   await fs.writeFile(files.journal, committed);
   // A v1-style row without prev appended by an old binary after migration is equally nonconforming.
   await fs.appendFile(files.journal, v1Line(record));

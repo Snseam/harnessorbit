@@ -79,13 +79,15 @@ export function jsonFileBytes(value) { return `${JSON.stringify(value, null, 2)}
 const genesis = generation => `genesis:${generation}`;
 
 // Parses one journal line. A record's sha covers everything but the sha itself, including `prev`.
+// `parseable` separates a complete JSON row that fails its checksum (corruption, whatever follows
+// it) from bytes that are not a row at all (an interrupted append, repairable only at the tail).
 function parseLine(raw) {
   let parsed = null;
-  try { parsed = JSON.parse(raw); } catch { return { ok: false }; }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false };
+  try { parsed = JSON.parse(raw); } catch { return { ok: false, parseable: false }; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, parseable: false };
   const { sha: stored, ...rest } = parsed;
-  if (typeof stored !== 'string' || sha(canonical(rest)) !== stored) return { ok: false };
-  return { ok: true, record: rest, sha: stored, prev: typeof rest.prev === 'string' ? rest.prev : null };
+  if (typeof stored !== 'string' || sha(canonical(rest)) !== stored) return { ok: false, parseable: true };
+  return { ok: true, parseable: true, record: rest, sha: stored, prev: typeof rest.prev === 'string' ? rest.prev : null };
 }
 
 // Append-only logs with a per-line checksum and, from this protocol on, a per-line chain.
@@ -136,8 +138,9 @@ class Journal {
       const parsed = parseLine(line.raw);
       if (!parsed.ok) {
         if (inCommitted) return fail('rolled_back', `${this.name} line ${i + 1} inside the committed boundary is not intact`);
-        if (line.terminated || i !== scanned.lines.length - 1) return fail('corrupt', `${this.name} line ${i + 1} is a complete row with a bad checksum`);
-        out.repair = { truncateTo: line.start, droppedLine: i + 1 }; // incomplete final fragment beyond the committed prefix
+        // Parseable JSON is a complete row whatever follows it: a checksum failure there is corruption.
+        if (parsed.parseable || line.terminated || i !== scanned.lines.length - 1) return fail('corrupt', `${this.name} line ${i + 1} is a complete row with a bad checksum`);
+        out.repair = { truncateTo: line.start, droppedLine: i + 1 }; // genuinely incomplete final fragment beyond the committed prefix
         break;
       }
       if (i >= legacy.lines && parsed.prev !== prev) {
@@ -223,7 +226,7 @@ export class CoopStore {
     const control = await readJson(this.storeFile, { optional: true });
     if (!control) { const c = await this._classifyWithoutControl(); throw storeError(c.status, c.operatorAction, { status: c.status, operatorAction: c.operatorAction }); }
     invariant(control.schema === STORE_SCHEMA && typeof control.generation === 'string', 'store_unsupported_version', `store.json is not ${STORE_SCHEMA}; this binary cannot use it.`, { status: 'store_unsupported_version', operatorAction: 'Use a binary that understands this store version.' });
-    if (control.migration?.state === 'in_progress') throw storeError('migration_in_progress', 'A store migration was interrupted; finish it before using the store.', { status: 'migration_in_progress', phase: control.migration.phase, operatorAction: 'With writers stopped: access coop store migrate --resume' });
+    if (control.migration?.state === 'in_progress') throw storeError('migration_in_progress', control.migration.from === 'init' ? 'Store initialisation was interrupted; finish it before using the store.' : 'A store migration was interrupted; finish it before using the store.', { status: 'migration_in_progress', from: control.migration.from, phase: control.migration.phase, operatorAction: control.migration.from === 'init' ? 'On the host: rerun access coop store init (it replays the saved plan)' : 'With writers stopped: access coop store migrate --resume' });
     const { sha: stored, ...boundary } = control.boundary || {};
     invariant(typeof stored === 'string' && sha(canonical(boundary)) === stored, 'store_metadata_invalid', 'store.json carries a boundary that does not match its checksum.', { status: 'store_metadata_invalid', operatorAction: 'Restore store.json from backup.' });
     return control;
@@ -352,29 +355,43 @@ export class CoopStore {
     return content;
   }
 
-  // Host-only. Creates the expected empty files and the control record with a fresh generation;
-  // refuses any root that already holds data. An init interrupted before store.json completes with
-  // the generation the marked recipients file already carries.
+  // Host-only. The one-generation init plan (the expected recipients image) is persisted in
+  // store.json before any data file exists; then the expected empty files are created; then the
+  // boundary completes. Rerunning init replays the saved plan with the same generation and refuses
+  // any file that does not match it. A root that already holds data is never adopted.
   init() {
     return this.lock(async () => {
       await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
-      invariant(!(await readJson(this.storeFile, { optional: true })), 'store_initialized', 'The cooperation store is already initialised.', { status: 'store_initialized' });
-      const [journal, receipts, existing, intent] = await Promise.all([this.journal.scan(), this.receipts.scan(), readJson(this.recipientsFile, { optional: true }), this._readText(this.intentFile)]);
-      invariant(journal.size === 0 && receipts.size === 0 && intent === null, 'store_not_empty', 'This root holds cooperation data without store metadata: a legacy store is migrated with "access coop store migrate --from-v1"; a store that lost store.json is restored from backup.', { status: 'store_not_empty' });
-      let generation = uuid();
-      if (existing) {
-        invariant(typeof existing.generation === 'string' && existing.revision === 0 && Object.keys(existing.recipients || {}).length === 0, 'store_not_empty', 'recipients.json already holds registrations; this root is not empty.', { status: 'store_not_empty' });
-        generation = existing.generation;
+      const control = await readJson(this.storeFile, { optional: true });
+      if (control) {
+        invariant(control.schema === STORE_SCHEMA && control.migration?.state === 'in_progress' && control.migration.from === 'init', 'store_initialized', 'The cooperation store is already initialised.', { status: 'store_initialized' });
+        return this._resumeInit(control);
       }
-      await fs.writeFile(this.journal.file, '', { flag: 'a', mode: 0o600 });
-      await fs.writeFile(this.receipts.file, '', { flag: 'a', mode: 0o600 });
+      const classified = await this._classifyWithoutControl();
+      invariant(classified.status === 'store_uninitialized', 'store_not_empty', `This root is not empty (${classified.status}). ${classified.operatorAction}`, { status: classified.status, operatorAction: classified.operatorAction });
+      const generation = uuid(); const at = now();
       const content = { schemaVersion: COOP_VERSION, generation, revision: 0, recipients: {} };
-      if (!existing) await writeJsonAtomic(this.recipientsFile, content);
-      const at = now();
-      const boundary = boundaryOf({ eventSeq: 0, eventLines: 0, eventBytes: 0, eventLastSha: null, receiptLines: 0, receiptBytes: 0, receiptLastSha: null, recipientsRevision: 0, recipientsSha: sha(jsonFileBytes(content)), retentionFloor: 0, updatedAt: at });
-      await writeJsonAtomic(this.storeFile, { schema: STORE_SCHEMA, generation, initializedAt: at, migration: { state: 'none', from: null, phase: null, startedAt: null, completedAt: null, baseline: null, repair: null }, boundary, lastRecovery: null });
-      return { generation, initialized: true };
+      const plan = { schema: STORE_SCHEMA, generation, initializedAt: at, migration: { state: 'in_progress', from: 'init', phase: 'prepared', startedAt: at, completedAt: null, baseline: null, repair: null, expected: { recipientsSha: sha(jsonFileBytes(content)), recipientsContent: content } }, boundary: null, lastRecovery: null };
+      await writeJsonAtomic(this.storeFile, plan);
+      return this._resumeInit(plan);
     });
+  }
+
+  async _resumeInit(control) {
+    const expected = control.migration.expected;
+    const blocked = detail => storeError('init_blocked', `${detail}; the saved init plan cannot be applied. Inspect the store and restore the root to its state when init was prepared.`, { status: 'init_blocked', operatorAction: 'access coop store inspect; remove or restore the unexpected file; rerun access coop store init' });
+    const [journal, receipts, recipientsText, intent] = await Promise.all([this.journal.scan(), this.receipts.scan(), this._readText(this.recipientsFile), this._readText(this.intentFile)]);
+    if (journal.size !== 0) throw blocked('journal.jsonl is not empty');
+    if (receipts.size !== 0) throw blocked('receipts.jsonl is not empty');
+    if (intent !== null) throw blocked('recipients.intent.json exists');
+    await fs.writeFile(this.journal.file, '', { flag: 'a', mode: 0o600 });
+    await fs.writeFile(this.receipts.file, '', { flag: 'a', mode: 0o600 });
+    if (recipientsText === null) await writeJsonAtomic(this.recipientsFile, expected.recipientsContent);
+    else if (sha(recipientsText) !== expected.recipientsSha) throw blocked('recipients.json does not match the planned image');
+    const at = now();
+    const boundary = boundaryOf({ eventSeq: 0, eventLines: 0, eventBytes: 0, eventLastSha: null, receiptLines: 0, receiptBytes: 0, receiptLastSha: null, recipientsRevision: 0, recipientsSha: expected.recipientsSha, retentionFloor: 0, updatedAt: at });
+    await writeJsonAtomic(this.storeFile, { ...control, migration: { ...control.migration, state: 'none', phase: 'complete', completedAt: at }, boundary });
+    return { generation: control.generation, initialized: true };
   }
 
   // Verifies a pre-protocol log: every row intact, no chain required. Only an incomplete final
@@ -384,7 +401,7 @@ export class CoopStore {
     for (const line of scanned.lines) {
       const parsed = parseLine(line.raw);
       if (!parsed.ok) {
-        invariant(!line.terminated && line.index === scanned.lines.length - 1, 'legacy_prefix_invalid', `Legacy log has a complete row with a bad checksum at line ${line.index + 1}; nothing is migrated.`, { status: 'legacy_prefix_invalid', line: line.index + 1 });
+        invariant(!parsed.parseable && !line.terminated && line.index === scanned.lines.length - 1, 'legacy_prefix_invalid', `Legacy log has a complete row with a bad checksum at line ${line.index + 1}; nothing is migrated.`, { status: 'legacy_prefix_invalid', line: line.index + 1 });
         out.repair = { truncateTo: line.start, droppedLine: line.index + 1 }; break;
       }
       invariant(parsed.prev === null, 'store_metadata_missing', 'A chained row exists in a store without store.json; restore store.json from backup instead of migrating.', { status: 'store_metadata_missing' });
@@ -420,7 +437,8 @@ export class CoopStore {
       if (control) {
         invariant(control.schema === STORE_SCHEMA, 'store_unsupported_version', 'store.json is of an unknown version.', { status: 'store_unsupported_version' });
         invariant(control.migration?.state === 'in_progress', 'store_initialized', 'This store is already on the current protocol; nothing to migrate.', { status: 'store_initialized' });
-        invariant(resume, 'migration_in_progress', 'An interrupted migration exists; rerun with --resume to replay its plan.', { status: 'migration_in_progress', phase: control.migration.phase });
+        invariant(control.migration.from === 'v1', 'migration_in_progress', 'An interrupted initialisation exists on this root; rerun "access coop store init" to replay its plan.', { status: 'migration_in_progress', from: 'init', phase: control.migration.phase });
+        invariant(resume, 'migration_in_progress', 'An interrupted migration exists; rerun with --resume to replay its plan.', { status: 'migration_in_progress', from: 'v1', phase: control.migration.phase });
         return this._resumeMigration(control);
       }
       invariant(!resume, 'migration_not_started', 'No interrupted migration exists on this root.', { status: 'migration_not_started' });
@@ -439,7 +457,9 @@ export class CoopStore {
         migration: {
           state: 'in_progress', from: 'v1', phase: 'prepared', startedAt: at, completedAt: null,
           baseline: { eventLines: events.lines, eventBytes: events.bytes, eventsSha: events.sha, eventLastSha: events.lastSha, eventSeq: events.records.length ? events.records.at(-1).seq : 0, receiptLines: acks.lines, receiptBytes: acks.bytes, receiptsSha: acks.sha, receiptLastSha: acks.lastSha, recipientsSha: recipientsText === null ? null : sha(recipientsText), recipientsContent },
-          repair: { journal: { bytesBefore: journal.size, ...(events.repair || {}) }, receipts: { bytesBefore: receipts.size, ...(acks.repair || {}) } },
+          // Exact original images (whole-file sha before any repair) plus the one tail-only repair each
+          // log may need; resume applies a repair only to a file that is still exactly that image.
+          repair: { journal: { bytesBefore: journal.size, originalSha: journal.size ? sha(journal.text) : null, ...(events.repair || {}) }, receipts: { bytesBefore: receipts.size, originalSha: receipts.size ? sha(receipts.text) : null, ...(acks.repair || {}) } },
         },
         boundary: null, lastRecovery: null,
       };
@@ -455,7 +475,7 @@ export class CoopStore {
     const blocked = detail => storeError('migration_blocked', `${journal.name} ${detail}; the migration plan cannot be applied. Inspect the store and restore the file to its state at preparation time.`, { status: 'migration_blocked', file: journal.name, operatorAction: 'access coop store inspect; restore the file; then migrate --resume' });
     const buffer = Buffer.from(scanned.text, 'utf8');
     if (scanned.size === bytes && (bytes === 0 || sha(buffer) === expected)) return { repaired: false };
-    if (scanned.size !== repair.bytesBefore) throw blocked('changed since the migration plan was prepared');
+    if (scanned.size !== repair.bytesBefore || (repair.originalSha !== undefined && sha(buffer) !== repair.originalSha)) throw blocked('is neither the frozen original image nor the planned result');
     if (repair.addDelimiter) {
       if (sha(Buffer.concat([buffer, Buffer.from('\n')])) !== expected) throw blocked('differs from the frozen pre-image');
       await fs.appendFile(journal.file, '\n', { mode: 0o600 }); return { repaired: true, addedDelimiter: true };
