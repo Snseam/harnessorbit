@@ -347,21 +347,32 @@ export class CoopService {
   // Observer path: a bounded observation of a bound session's transition from working to ready.
   // It is recorded under the observer's own identity, keyed by the transition identity so a
   // restart or a repeated poll cannot emit it twice, and it is never a completion claim.
-  async observe({ sessionId, transitionId, observedAt, fromState, toState, bindingId, via = 'observer' } = {}) {
+  // Two observer signals, both only observations:
+  //  - session.ready: the screen showed a working → ready transition (fallback when no native source).
+  //  - agent.turn_finished: the provider's own native record says a turn ended (Claude Code end_turn).
+  // Keyed by the caller's stable identity (screen transition or provider message id) so restarts and
+  // repeated polls never emit the same signal twice.
+  async observe({ sessionId, transitionId, observedAt, fromState, toState, bindingId, via = 'observer', type = 'session.ready', signal = null } = {}) {
     invariant(this.sessions, 'sessions_unavailable', 'Live sessions are not enabled on this server.');
+    invariant(OBSERVER_TYPES.includes(type), 'invalid_event', 'Observer events are session.ready or agent.turn_finished.');
     const record = await this.sessions.get(sessionId).catch(() => null);
     invariant(record && record.bindingId === bindingId, 'session_not_found', `Session ${sessionId} is not bound (or was re-bound).`);
     const owner = await this.principals.get(record.principalId).catch(() => null);
     invariant(owner && owner.incarnation === record.principalIncarnation && owner.permissions.sessions === true, 'permission_denied', 'The binding’s principal is no longer current or lacks the sessions permission; not observing.');
     invariant(typeof transitionId === 'string' && /^[0-9a-f]{16,64}$/.test(transitionId), 'invalid_event', 'transitionId must be a hex transition identity.');
-    invariant(fromState === 'busy' && toState === 'idle', 'invalid_event', 'Only a working → ready transition is emitted; an initial idle snapshot is not a completion.');
-    const type = 'agent.turn_finished';
-    const payload = { observation: 'working_to_ready', fromState, toState, observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'The agent’s prompt became ready for input again. This is an observation, not task completion and not verification.' };
+    let payload;
+    if (type === 'agent.turn_finished') {
+      invariant(signal && signal.source === 'native_end_turn' && typeof signal.providerSessionId === 'string' && typeof signal.providerMessageId === 'string', 'invalid_event', 'agent.turn_finished needs the provider’s native end_turn record identity.');
+      payload = { observation: 'native_end_turn', provider: signal.provider || record.agent.kind, providerSessionId: signal.providerSessionId, providerMessageId: signal.providerMessageId, providerTimestamp: signal.providerTimestamp || null, observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'The provider’s own record says a model turn ended (end_turn). This is an observation of the turn boundary, not task completion and not verification.' };
+    } else {
+      invariant(fromState === 'busy' && toState === 'idle', 'invalid_event', 'Only a working → ready transition is emitted; an initial idle snapshot is not a completion.');
+      payload = { observation: 'working_to_ready', fromState, toState, observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'The agent’s prompt became ready for input again (screen observation). Not a provider turn boundary, not task completion, not verification.' };
+    }
     const body = { type, task: `harnessorbit:session/${record.id}`, payload };
     const bodyHash = sha(canonical(body));
     return this.store.lock(async () => {
       const state = await this.store.load();
-      const keyHash = sha(`observer:${record.bindingId}:${transitionId}`);
+      const keyHash = sha(`observer:${type}:${record.bindingId}:${transitionId}`);
       const existing = state.byKey.get(`${owner.id}:${owner.incarnation}:${keyHash}`);
       if (existing) return this._reported(existing, state, { reused: true });
       const event = {
@@ -437,7 +448,7 @@ export class CoopService {
         if (attempt && ['accepted', 'dead', 'revoked'].includes(attempt.outcome)) continue;
         const recipient = recipients[delivery.consumerId];
         const revoked = !recipient || recipient.revokedAt || recipient.epoch !== delivery.epoch;
-        out.push({ eventId: record.event.eventId, seq: record.seq, consumerId: delivery.consumerId, kind: delivery.kind, epoch: delivery.epoch, state: revoked ? 'revoked' : (attempt?.outcome || 'pending'), attempts: attempt?.attempts || 0, nextAttemptAt: attempt?.nextAttemptAt || null, recipient: revoked ? null : recipient });
+        out.push({ eventId: record.event.eventId, seq: record.seq, consumerId: delivery.consumerId, kind: delivery.kind, epoch: delivery.epoch, state: revoked ? 'revoked' : (attempt?.outcome || 'pending'), attempts: attempt?.attempts || 0, nextAttemptAt: attempt?.nextAttemptAt || null, unresolved: attempt?.unresolved === true, lastDetail: attempt?.detail || null, recipient: revoked ? null : recipient });
       }
     }
     return out;
@@ -445,13 +456,30 @@ export class CoopService {
 
   // Records one dispatch attempt outcome durably. `unknown` is its own state: the transport may
   // have delivered, so the next attempt reconciles by eventId before any repeated side effect.
-  async recordAttempt({ eventId, consumerId, epoch, outcome, detail = null, attempts = 1, nextAttemptAt = null }) {
-    // deferred: the destination cannot take it right now (wrong runtime, busy thread, missing
-    // secret); it stays pending without consuming the attempt budget.
-    invariant(['accepted', 'unknown', 'failed', 'deferred', 'revoked', 'dead'].includes(outcome), 'invalid_event', 'Unknown attempt outcome.');
-    const receipt = { v: COOP_VERSION, kind: 'attempt', eventId, consumerId, epoch, outcome, detail: detail ? String(detail).slice(0, 200) : null, attempts, nextAttemptAt, at: this.now() };
+  async recordAttempt({ eventId, consumerId, epoch, outcome, detail = null, attempts = 1, nextAttemptAt = null, unresolved = false, receipt: transportReceipt = null }) {
+    // sending: journaled before the external side effect, so a crash afterwards leaves an explicit
+    // unresolved boundary. deferred: the destination cannot take it right now (wrong runtime, busy
+    // thread, missing secret); it stays pending without consuming the attempt budget.
+    invariant(['sending', 'accepted', 'unknown', 'failed', 'deferred', 'revoked', 'dead'].includes(outcome), 'invalid_event', 'Unknown attempt outcome.');
+    const receipt = { v: COOP_VERSION, kind: 'attempt', eventId, consumerId, epoch, outcome, detail: detail ? String(detail).slice(0, 200) : null, attempts, nextAttemptAt, unresolved: unresolved === true, receipt: transportReceipt && typeof transportReceipt === 'object' ? JSON.parse(JSON.stringify(transportReceipt).slice(0, 400)) : null, at: this.now() };
     await this.store.lock(() => this.store.receipts.append(receipt));
     return receipt;
+  }
+
+  // Operator decision for a delivery the transport could not settle: `accepted` records that the
+  // operator confirmed the receiver holds it (out of band); `resend` authorizes exactly one more
+  // send. Neither is automatic, and neither is an inbox acknowledgement.
+  async resolveDelivery({ eventId, consumerId, as, note = null }) {
+    invariant(['accepted', 'resend'].includes(as), 'invalid_event', 'as must be accepted or resend.');
+    const state = await this.store.load();
+    const record = state.byId.get(eventId);
+    const delivery = record?.deliveries.find(d => d.consumerId === consumerId);
+    invariant(record && delivery, 'event_not_delivered', 'No such delivery.', { eventId, consumerId });
+    const attempt = state.attempts.get(`${eventId}:${consumerId}`);
+    invariant(attempt && ['sending', 'unknown'].includes(attempt.outcome), 'delivery_not_unresolved', `The delivery is ${attempt?.outcome || 'pending'}, not unresolved.`, { eventId, consumerId });
+    const detail = `operator ${as}${note ? `: ${String(note).slice(0, 120)}` : ''}`;
+    if (as === 'accepted') return this.recordAttempt({ eventId, consumerId, epoch: delivery.epoch, outcome: 'accepted', detail, attempts: attempt.attempts });
+    return this.recordAttempt({ eventId, consumerId, epoch: delivery.epoch, outcome: 'failed', detail, attempts: attempt.attempts, nextAttemptAt: this.now() });
   }
 
   _publicRecipient(record) {

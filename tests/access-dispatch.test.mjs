@@ -144,8 +144,8 @@ test('the Codex app-server adapter confirms thread ownership before acting: notL
   let mode = 'notLoaded'; const items = [];
   const runtime = fakeCodexRuntime(socketPath, { handle: msg => {
     if (msg.method === 'initialize') return { serverInfo: { name: 'fake-app-server' } };
-    if (msg.method === 'thread/read') return mode === 'notLoaded' ? { status: 'notLoaded' } : mode === 'busy' ? { loaded: true, busy: true, items } : mode === 'vague' ? { id: msg.params.threadId } : { loaded: true, status: 'idle', items };
-    if (msg.method === 'turn/start') { if (mode === 'silent') { items.push({ type: 'toolOutput', eventId: msg.params.toolOutput.eventId }); return null; } items.push({ type: 'toolOutput', eventId: msg.params.toolOutput.eventId }); return { turnId: 't-1' }; }
+    if (msg.method === 'thread/read') return mode === 'notLoaded' ? { status: 'notLoaded' } : mode === 'busy' ? { loaded: true, busy: true, items } : mode === 'nestedBusy' ? { thread: { loaded: true, status: 'running', busy: true, items } } : mode === 'vague' ? { id: msg.params.threadId } : { loaded: true, status: 'idle', items };
+    if (msg.method === 'turn/start') { const held = { type: 'toolOutput', toolOutput: { name: 'orbit_event', namespace: 'harnessorbit', eventId: msg.params.toolOutput.eventId } }; if (mode === 'silent') { items.push(held); return null; } if (mode === 'emptyTurn') { items.push(held); return {}; } items.push(held); return { turnId: 't-1' }; }
     return {};
   } });
   await runtime.listen(); t.after(() => runtime.close());
@@ -157,10 +157,17 @@ test('the Codex app-server adapter confirms thread ownership before acting: notL
   assert.equal((await adapter.deliver(envelope, recipient)).reason, 'capability_unavailable', 'an ownership answer that does not say loaded/notLoaded is not guessed');
   mode = 'busy';
   assert.equal((await adapter.deliver(envelope, recipient)).reason, 'thread_busy');
+  mode = 'nestedBusy';
+  assert.equal((await adapter.deliver(envelope, recipient)).reason, 'thread_busy', 'nested thread state is inspected too');
+  assert.ok(!runtime.received.some(m => m.method === 'turn/start'), 'a busy thread never gets a turn/start');
+  mode = 'emptyTurn';
+  const empty = await adapter.deliver({ ...envelope, eventId: crypto.randomUUID() }, recipient);
+  assert.equal(empty.outcome, 'unknown', 'an empty turn/start reply is not acceptance evidence');
+  assert.equal(empty.reason, 'turn_unconfirmed');
   mode = 'loaded';
   const accepted = await adapter.deliver(envelope, recipient);
   assert.equal(accepted.outcome, 'accepted'); assert.match(accepted.detail, /turn t-1/);
-  const start = runtime.received.find(m => m.method === 'turn/start');
+  const start = runtime.received.filter(m => m.method === 'turn/start').at(-1);
   assert.deepEqual(start.params.input, [], 'no human message is spoofed');
   assert.equal(start.params.threadId, 'thread-1');
   assert.equal(start.params.toolOutput.name, 'orbit_event'); assert.equal(start.params.toolOutput.namespace, 'harnessorbit');
@@ -170,8 +177,13 @@ test('the Codex app-server adapter confirms thread ownership before acting: notL
   const unconfirmed = await adapter.deliver(second, recipient);
   assert.equal(unconfirmed.outcome, 'unknown'); assert.equal(unconfirmed.reason, 'turn_unconfirmed');
   mode = 'loaded';
-  assert.deepEqual(await adapter.reconcile(second, recipient), { known: true }, 'the runtime already holds the turn; no second turn/start is needed');
-  assert.deepEqual(await adapter.reconcile({ eventId: crypto.randomUUID() }, recipient), { known: false });
+  assert.equal((await adapter.reconcile(second, recipient)).known, true, 'the runtime already holds the structured orbit_event record; no second turn/start is needed');
+  const stranger = crypto.randomUUID();
+  items.push({ type: 'userMessage', text: `someone pasted ${stranger} into the chat` });
+  assert.equal((await adapter.reconcile({ eventId: stranger }, recipient)).known, false, 'text that merely mentions the UUID is not our structured record');
+  mode = 'notLoaded';
+  assert.equal((await adapter.reconcile(second, recipient)).known, null, 'the wrong runtime cannot answer');
+  mode = 'loaded';
   await runtime.close();
   assert.equal((await adapter.deliver(envelope, recipient)).reason, 'runtime_unavailable');
   const refusing = fakeCodexRuntime(path.join(dir, 'refuse.sock'), { refuseUpgrade: true, handle: () => ({}) });
@@ -205,11 +217,35 @@ test('the dispatcher retries with backoff, dead-letters terminal failures, defer
   adapters['grok-native-webhook'] = new GrokNativeWebhookAdapter({ fetch: fn2, timeoutMs: 300 });
   await coop.report(grok, report(jobId, { idempotencyKey: 'r-2' }));
   assert.deepEqual((await dispatcher.tick()).map(r => r.outcome), ['dead']);
-  // Attempt budget: three unknown outcomes end in dead with no reconcile capability on this transport.
-  const { fn: fn3 } = fakeFetch([{ abort: true }, { abort: true }, { abort: true }]);
+  // An unknown outcome on a transport without a receipt query is never resent on its own: it stays
+  // unresolved for the operator, who can settle it as accepted or authorize exactly one resend.
+  const { fn: fn3, calls: calls3 } = fakeFetch([{ abort: true }, { status: 200 }]);
   adapters['grok-native-webhook'] = new GrokNativeWebhookAdapter({ fetch: fn3, timeoutMs: 100 });
-  await coop.report(grok, report(jobId, { idempotencyKey: 'r-3' }));
-  for (const expected of ['unknown', 'unknown', 'dead']) { const r = (await dispatcher.tick()).find(x => x.key.endsWith(':grok-hook') && x.outcome !== 'waiting'); assert.equal(r.outcome, expected); clock.advance(60000); }
+  const r3 = await coop.report(grok, report(jobId, { idempotencyKey: 'r-3' }));
+  let unresolved = (await dispatcher.tick()).find(x => x.key.endsWith(':grok-hook') && x.outcome !== 'waiting');
+  assert.equal(unresolved.outcome, 'unknown');
+  for (let i = 0; i < 3; i++) { clock.advance(600000); unresolved = (await dispatcher.tick()).find(x => x.key.endsWith(':grok-hook')); assert.equal(unresolved.outcome, 'unknown'); assert.equal(unresolved.unresolved, true); }
+  assert.equal(calls3.length, 1, 'the body was sent exactly once; a stable eventId is not receiver-side deduplication');
+  const listed = (await coop.pendingDeliveries()).find(d => d.eventId === r3.event.eventId);
+  assert.equal(listed.state, 'unknown'); assert.equal(listed.unresolved, true);
+  await assert.rejects(coop.resolveDelivery({ eventId: r3.event.eventId, consumerId: 'grok-hook', as: 'drop' }), e => e.code === 'invalid_event');
+  await coop.resolveDelivery({ eventId: r3.event.eventId, consumerId: 'grok-hook', as: 'resend', note: 'operator confirmed nothing arrived' });
+  assert.equal((await dispatcher.tick()).find(x => x.key.endsWith(':grok-hook')).outcome, 'accepted');
+  assert.equal(calls3.length, 2, 'exactly one authorized resend');
+  const { fn: fn3b } = fakeFetch([{ abort: true }]);
+  adapters['grok-native-webhook'] = new GrokNativeWebhookAdapter({ fetch: fn3b, timeoutMs: 100 });
+  const r3b = await coop.report(grok, report(jobId, { idempotencyKey: 'r-3b' }));
+  await dispatcher.tick();
+  await coop.resolveDelivery({ eventId: r3b.event.eventId, consumerId: 'grok-hook', as: 'accepted', note: 'seen in the receiver log' });
+  assert.equal((await coop.pendingDeliveries()).some(d => d.eventId === r3b.event.eventId), false);
+  await assert.rejects(coop.resolveDelivery({ eventId: r3b.event.eventId, consumerId: 'grok-hook', as: 'resend' }), e => e.code === 'delivery_not_unresolved');
+  // The in-flight boundary is journaled before the adapter runs: a crash inside deliver leaves `sending`.
+  const crashing = { kind: 'grok-native-webhook', canReconcile: false, deliver: async () => { throw Object.assign(new Error('simulated crash'), { code: 'EPIPE' }); } };
+  adapters['grok-native-webhook'] = crashing;
+  const r3c = await coop.report(grok, report(jobId, { idempotencyKey: 'r-3c' }));
+  assert.equal((await dispatcher.tick()).find(x => x.key.endsWith(':grok-hook')).outcome, 'unknown');
+  const receipts = (await coop.store.receipts.load()).records.filter(r => r.eventId === r3c.event.eventId);
+  assert.deepEqual(receipts.map(r => r.outcome), ['sending', 'unknown'], 'sending was durable before the external call');
   // A recipient without an adapter on this host is deferred, not failed.
   await coop.registerRecipient({ id: 'codex-desktop', kind: 'codex-app-server', socketPath: '/tmp/none.sock', threadId: 'thread-1', types: ['task.blocked'] });
   await coop.report(grok, report(jobId, { idempotencyKey: 'r-4', type: 'task.blocked' }));
@@ -234,7 +270,8 @@ test('the dispatcher retries with backoff, dead-letters terminal failures, defer
   assert.equal(calls4.length, 0, 'the new endpoint never received the old payload');
   assert.ok(hook.epoch);
   // Unknown outcome on a transport that can reconcile: the next tick asks first and resends nothing.
-  const reconciling = { kind: 'codex-app-server', canReconcile: true, delivers: 0, deliver: async () => { reconciling.delivers++; return { outcome: 'unknown', reason: 'turn_unconfirmed' }; }, reconcile: async () => ({ known: true }) };
+  let answer = { known: true };
+  const reconciling = { kind: 'codex-app-server', canReconcile: true, delivers: 0, deliver: async () => { reconciling.delivers++; return { outcome: 'unknown', reason: 'turn_unconfirmed' }; }, reconcile: async () => (typeof answer === 'function' ? answer() : answer) };
   const dispatcher2 = new Dispatcher({ root: stateRoot, coop, principals, adapters: { 'codex-app-server': reconciling }, maxAttempts: 3, baseDelayMs: 1000, now: clock.now, random: () => 0 });
   clock.advance(120000);
   const first = (await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop'));
@@ -243,6 +280,38 @@ test('the dispatcher retries with backoff, dead-letters terminal failures, defer
   const second = (await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop'));
   assert.equal(second.outcome, 'accepted'); assert.equal(second.reconciled, true);
   assert.equal(reconciling.delivers, 1, 'no second turn/start after reconciliation');
+  // known:null keeps the delivery unresolved; nothing is resent.
+  await coop.report(grok, report(jobId, { idempotencyKey: 'r-7', type: 'task.blocked' }));
+  clock.advance(120000);
+  assert.equal((await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop')).outcome, 'unknown');
+  answer = { known: null, reason: 'wrong_runtime' };
+  clock.advance(120000);
+  const stuck = (await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop'));
+  assert.equal(stuck.outcome, 'unknown'); assert.equal(stuck.reason, 'wrong_runtime');
+  assert.equal(reconciling.delivers, 2, 'an unanswered reconciliation never authorizes a resend');
+  // known:false authorizes one resend, but only after authority is re-read across the await: a recipient
+  // re-registered during reconciliation gets nothing.
+  answer = async () => { await coop.revokeRecipient('codex-desktop'); await coop.registerRecipient({ id: 'codex-desktop', kind: 'codex-app-server', socketPath: '/tmp/none.sock', threadId: 'thread-3', types: ['task.blocked'] }); return { known: false, reason: 'structured_record_absent' }; };
+  clock.advance(120000);
+  const raced = (await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop'));
+  assert.equal(raced.outcome, 'revoked'); assert.equal(raced.reason, 'recipient_epoch_changed');
+  assert.equal(reconciling.delivers, 2, 'the re-registered recipient did not receive the old payload');
+  // Source scope narrowed during reconciliation is caught the same way.
+  await coop.report(grok, report(jobId, { idempotencyKey: 'r-8', type: 'task.blocked' }));
+  clock.advance(120000);
+  answer = { known: false };
+  await dispatcher2.tick(); // first attempt: unknown
+  answer = async () => { await principals.update('grok', { agents: ['codex'] }); return { known: false }; };
+  clock.advance(120000);
+  const narrowed = (await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop'));
+  assert.equal(narrowed.outcome, 'revoked');
+  assert.equal(reconciling.delivers, 3);
+  await principals.update('grok', { agents: ['claude', 'codex'] });
+  // A clean known:false after an unresolved attempt resends exactly once.
+  await coop.report(grok, report(jobId, { idempotencyKey: 'r-9', type: 'task.blocked' }));
+  clock.advance(120000); answer = { known: false }; await dispatcher2.tick();
+  clock.advance(120000); const resent = (await dispatcher2.tick()).find(r => r.key.endsWith(':codex-desktop'));
+  assert.equal(resent.outcome, 'unknown'); assert.equal(reconciling.delivers, 5, 'unresolved → known:false → one resend');
   assert.equal(backoffMs(1, { baseMs: 1000, random: () => 0 }), 1000);
   assert.equal(backoffMs(4, { baseMs: 1000, maxMs: 5000, random: () => 0.5 }), 5000);
 });

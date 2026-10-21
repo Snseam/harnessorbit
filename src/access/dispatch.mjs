@@ -9,12 +9,20 @@ import { COOP_SCHEMA } from './coop.mjs';
 // Transport for cooperation events. The dispatcher moves frozen non-inbox deliveries through an
 // adapter chosen by the recipient's kind, with a single sender lease, bounded retries with backoff
 // and jitter, durable attempt outcomes, and authority rechecked immediately before each send.
+//
+// Side-effect discipline: a `sending` record is journaled BEFORE the adapter is called, so a crash
+// between the external send and the local receipt leaves an explicit unresolved boundary, never a
+// pending delivery that a restart would silently send again. An unresolved delivery (`sending` or
+// `unknown`) is sent again only after the transport authoritatively reports the receiver does not
+// hold the event (`known: false`); `known: true` settles it as accepted; anything else stays
+// unresolved for the operator (`access coop resolve`). A stable eventId is not receiver-side
+// deduplication, so transports that cannot answer the question never auto-resend.
+//
 // Transport acceptance (HTTP 2xx, a turn id) is recorded as `accepted`; it is never an inbox
-// acknowledgement, never completion, never verification. Unknown outcomes are reconciled by
-// eventId where the transport allows it before anything is sent again; where it does not, the
-// resend carries the same eventId and the receiver is expected to deduplicate (at-least-once).
+// acknowledgement, never completion, never verification.
 
-export const DISPATCH_OUTCOMES = Object.freeze(['accepted', 'unknown', 'failed', 'deferred', 'revoked', 'dead']);
+export const DISPATCH_OUTCOMES = Object.freeze(['sending', 'accepted', 'unknown', 'failed', 'deferred', 'revoked', 'dead']);
+const UNRESOLVED = new Set(['sending', 'unknown']);
 const MAX_RESPONSE_BYTES = 65536;
 const now = () => new Date().toISOString();
 const redact = (text, secret) => (secret ? String(text).split(secret).join('<redacted>') : String(text)).slice(0, 200);
@@ -28,6 +36,7 @@ export function backoffMs(attempts, { baseMs = 2000, maxMs = 300000, random = Ma
 // `Authorization: Bearer <secret>`. This is not the Standard-Webhooks HMAC protocol of the web
 // automation product. No redirects are followed, responses are bounded, the secret never appears
 // in logs, events or errors. Acceptance here means the HTTP request was accepted, nothing more.
+// The panel offers no receipt query, so an unknown outcome stays unresolved for the operator.
 export class GrokNativeWebhookAdapter {
   constructor({ fetch: fetchImpl = globalThis.fetch, timeoutMs = 10000, allowHttpLoopback = false } = {}) {
     this.kind = 'grok-native-webhook'; this.fetch = fetchImpl; this.timeoutMs = timeoutMs; this.allowHttpLoopback = allowHttpLoopback; this.canReconcile = false;
@@ -57,7 +66,7 @@ export class GrokNativeWebhookAdapter {
       clearTimeout(timer);
       if (error?.name === 'AbortError') return { outcome: 'unknown', reason: 'timeout', detail: `no response within ${this.timeoutMs} ms; the request may have been received` };
       const code = String(error?.cause?.code || error?.code || error?.message || 'network');
-      if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET\b.*before/.test(code)) return { outcome: 'failed', reason: 'unreachable', detail: redact(code, secret) };
+      if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN/.test(code)) return { outcome: 'failed', reason: 'unreachable', detail: redact(code, secret) };
       return { outcome: 'unknown', reason: 'transport', detail: redact(code, secret) };
     }
     clearTimeout(timer);
@@ -152,13 +161,42 @@ export class UnixWebSocket {
   close() { try { if (!this.closed) { this._frame(0x8, Buffer.alloc(0)); } this.socket?.end(); this.socket?.destroy(); } catch { /* closing */ } this.closed = true; }
 }
 
+// Thread state as the app-server reports it, top-level or nested under `thread`.
+function threadState(result) {
+  const t = result?.thread && typeof result.thread === 'object' ? result.thread : result;
+  const status = t?.status ?? null;
+  const loaded = t?.loaded ?? (status ? status !== 'notLoaded' : null);
+  const busy = t?.busy === true || ['running', 'inProgress', 'in_progress', 'working'].includes(status) || (t?.activeTurn && typeof t.activeTurn === 'object');
+  const items = Array.isArray(t?.items) ? t.items : Array.isArray(t?.turns) ? t.turns.flatMap(turn => (Array.isArray(turn?.items) ? turn.items : [turn])) : null;
+  return { loaded, busy, items, status };
+}
+
+// Only a structured record of OUR tool output counts as the receiver holding the event: an item
+// whose tool output is named orbit_event in the harnessorbit namespace with the matching eventId
+// (or whose output JSON carries that event). Text that merely mentions the UUID proves nothing.
+function holdsEvent(items, eventId) {
+  if (!Array.isArray(items)) return null;
+  const matches = item => {
+    const candidates = [item, item?.toolOutput, item?.tool_output, item?.output, item?.payload].filter(v => v && typeof v === 'object');
+    for (const c of candidates) {
+      const name = c.name ?? c.toolName ?? null; const ns = c.namespace ?? null;
+      if (name === 'orbit_event' && ns === 'harnessorbit') {
+        if (c.eventId === eventId) return true;
+        if (typeof c.output === 'string') { try { const parsed = JSON.parse(c.output); if (parsed?.event?.eventId === eventId) return true; } catch { /* not ours */ } }
+      }
+    }
+    return false;
+  };
+  return items.some(matches);
+}
+
 // Codex app-server over its Unix control socket. Before anything is sent, the adapter confirms
-// that THIS runtime actually owns the registered thread (thread/read). A daemon that merely knows
+// that THIS runtime actually owns the registered thread and is idle. A daemon that merely knows
 // the thread but reports it notLoaded is the wrong runtime: the delivery stays pending for the
-// heartbeat and nothing is started or resumed there. Where the runtime does own the thread, the
-// event is handed over as structured tool output on turn/start (input: [], toolOutput orbit_event);
-// it is never dressed up as a human message. An unanswered turn/start is unknown and is reconciled
-// by eventId on the next attempt before any resend.
+// heartbeat and nothing is started or resumed there. Where the runtime owns the thread, the event
+// is handed over as structured tool output on turn/start (input: [], toolOutput orbit_event); it is
+// never dressed up as a human message. turn/start counts as accepted only when the runtime returns
+// a turn identity; an empty or unanswered reply is unknown and reconciled by structured record.
 export class CodexAppServerAdapter {
   constructor({ connect = options => new UnixWebSocket(options), timeoutMs = 10000, clientVersion = '0.4.0' } = {}) {
     this.kind = 'codex-app-server'; this.connect = connect; this.timeoutMs = timeoutMs; this.clientVersion = clientVersion; this.canReconcile = true;
@@ -182,15 +220,6 @@ export class CodexAppServerAdapter {
     return { ws, call };
   }
 
-  // Ownership check shared by deliver and reconcile. Returns { owns, thread } or a deferred outcome.
-  async _owner(call, threadId) {
-    const thread = await call('thread/read', { threadId });
-    const status = thread?.status ?? thread?.thread?.status ?? null;
-    const loaded = thread?.loaded ?? thread?.thread?.loaded ?? (status ? status !== 'notLoaded' : null);
-    if (loaded === null || loaded === undefined) return { owns: null, thread };
-    return { owns: loaded !== false && status !== 'notLoaded', thread };
-  }
-
   async deliver(envelope, recipient) {
     const { threadId } = recipient.transport;
     let session;
@@ -202,10 +231,10 @@ export class CodexAppServerAdapter {
     }
     try {
       await session.call('initialize', { clientInfo: { name: 'harnessorbit', version: this.clientVersion } });
-      const owner = await this._owner(session.call, threadId);
-      if (owner.owns === null) return { outcome: 'deferred', reason: 'capability_unavailable', detail: 'thread/read did not state whether this runtime has the thread loaded; not guessing' };
-      if (!owner.owns) return { outcome: 'deferred', reason: 'wrong_runtime', detail: 'this runtime reports the thread notLoaded; another runtime owns it, so nothing is started or resumed here' };
-      if (owner.thread?.busy === true || owner.thread?.status === 'running') return { outcome: 'deferred', reason: 'thread_busy', detail: 'the owning runtime is mid-turn; queued without interrupting it' };
+      const state = threadState(await session.call('thread/read', { threadId }));
+      if (state.loaded === null || state.loaded === undefined) return { outcome: 'deferred', reason: 'capability_unavailable', detail: 'thread/read did not state whether this runtime has the thread loaded; not guessing' };
+      if (!state.loaded || state.status === 'notLoaded') return { outcome: 'deferred', reason: 'wrong_runtime', detail: 'this runtime reports the thread notLoaded; another runtime owns it, so nothing is started or resumed here' };
+      if (state.busy) return { outcome: 'deferred', reason: 'thread_busy', detail: 'the owning runtime is mid-turn; queued without interrupting it' };
       let result;
       try {
         result = await session.call('turn/start', { threadId, input: [], toolOutput: { name: 'orbit_event', namespace: 'harnessorbit', eventId: envelope.eventId, output: JSON.stringify({ schema: 'harnessorbit.coop.delivery.v1', event: envelope, meaning: 'event delivery for the agent to read; acknowledge through coop_ack' }) } });
@@ -214,25 +243,27 @@ export class CodexAppServerAdapter {
         if (error?.code === 'rpc_error') return { outcome: 'failed', reason: 'rpc_error', detail: redact(error.rpc?.message || 'turn/start rejected') };
         throw error;
       }
-      return { outcome: 'accepted', reason: null, detail: `turn ${result?.turnId ?? result?.turn?.id ?? 'started'}`, meaning: 'turn started with the event as tool output; not an acknowledgement' };
+      const turnId = result?.turnId ?? result?.turn?.id ?? result?.id ?? null;
+      if (typeof turnId !== 'string' || !turnId.length) return { outcome: 'unknown', reason: 'turn_unconfirmed', detail: 'turn/start answered without a turn identity; not accepted until the receiver’s record is seen' };
+      return { outcome: 'accepted', reason: null, detail: `turn ${turnId}`, receipt: { turnId }, meaning: 'turn started with the event as tool output; not an acknowledgement' };
     } catch (error) {
       return { outcome: 'unknown', reason: 'transport', detail: redact(error?.code || error?.message || 'app-server call failed') };
     } finally { session.ws.close(); }
   }
 
-  // Asks the owning runtime whether a turn carrying this eventId already exists.
+  // Asks the owning runtime whether a structured orbit_event record for this eventId exists.
+  // known:true / known:false are authoritative answers; null means the question could not be answered.
   async reconcile(envelope, recipient) {
     let session;
-    try { session = await this._session(recipient); } catch { return { known: null }; }
+    try { session = await this._session(recipient); } catch { return { known: null, reason: 'runtime_unavailable' }; }
     try {
       await session.call('initialize', { clientInfo: { name: 'harnessorbit', version: this.clientVersion } });
-      const owner = await this._owner(session.call, recipient.transport.threadId);
-      if (!owner.owns) return { known: null };
-      const items = owner.thread?.items ?? owner.thread?.thread?.items ?? owner.thread?.turns ?? null;
-      if (!Array.isArray(items)) return { known: null };
-      const found = items.some(item => JSON.stringify(item).includes(envelope.eventId));
-      return { known: found };
-    } catch { return { known: null }; }
+      const state = threadState(await session.call('thread/read', { threadId: recipient.transport.threadId }));
+      if (!state.loaded || state.status === 'notLoaded') return { known: null, reason: 'wrong_runtime' };
+      const held = holdsEvent(state.items, envelope.eventId);
+      if (held === null) return { known: null, reason: 'no_structured_record' };
+      return { known: held, reason: held ? 'structured_record_found' : 'structured_record_absent' };
+    } catch { return { known: null, reason: 'transport' }; }
     finally { session.ws.close(); }
   }
 }
@@ -246,14 +277,23 @@ export class Dispatcher {
     this.stopped = false;
   }
 
-  // The event's source must still be the principal that reported it, still allowed to act on that
-  // task; otherwise the frozen delivery is revoked rather than sent on an expired authority.
-  async _sourceStillAuthorized(record) {
+  // Current authority for one delivery, read fresh from the stores: the event's source principal
+  // must still be the incarnation that reported it and still allowed to act on that task, and the
+  // recipient registration must still be the one the delivery was frozen for.
+  async _authority(record, delivery) {
     const source = record.event.source;
     const current = await this.principals.get(source.principalId).catch(() => null);
     if (!current || current.incarnation !== source.incarnation) return { ok: false, reason: 'source_principal_gone' };
-    try { await this.coop._task(current, record.event.task.ref); return { ok: true }; }
+    try { await this.coop._task(current, record.event.task.ref); }
     catch (error) { return { ok: false, reason: error.code || 'source_scope_changed' }; }
+    const recipients = await this.coop.store.recipients();
+    const recipient = recipients[delivery.consumerId];
+    if (!recipient || recipient.revokedAt || recipient.epoch !== delivery.epoch) return { ok: false, reason: 'recipient_epoch_changed' };
+    return { ok: true, recipient };
+  }
+
+  async _record(delivery, outcome, extra = {}) {
+    return this.coop.recordAttempt({ eventId: delivery.eventId, consumerId: delivery.consumerId, epoch: delivery.epoch, outcome, ...extra });
   }
 
   // One pass under the sender lease. Returns the per-delivery outcomes so a CLI can print them.
@@ -265,29 +305,39 @@ export class Dispatcher {
         const record = state.byId.get(delivery.eventId);
         if (!record) continue;
         const key = `${delivery.eventId}:${delivery.consumerId}`;
-        if (delivery.state === 'revoked') { await this.coop.recordAttempt({ eventId: delivery.eventId, consumerId: delivery.consumerId, epoch: delivery.epoch, outcome: 'revoked', detail: 'recipient registration changed or was revoked', attempts: delivery.attempts }); results.push({ key, outcome: 'revoked' }); continue; }
+        if (delivery.state === 'revoked') { await this._record(delivery, 'revoked', { detail: 'recipient registration changed or was revoked', attempts: delivery.attempts }); results.push({ key, outcome: 'revoked' }); continue; }
         if (delivery.nextAttemptAt && delivery.nextAttemptAt > this.now()) { results.push({ key, outcome: 'waiting', nextAttemptAt: delivery.nextAttemptAt }); continue; }
         const adapter = this.adapters[delivery.kind];
-        if (!adapter) { await this.coop.recordAttempt({ eventId: delivery.eventId, consumerId: delivery.consumerId, epoch: delivery.epoch, outcome: 'deferred', detail: `no adapter for ${delivery.kind} on this host`, attempts: delivery.attempts, nextAttemptAt: this._later(this.deferMs) }); results.push({ key, outcome: 'deferred', reason: 'no_adapter' }); continue; }
-        const authority = await this._sourceStillAuthorized(record);
-        if (!authority.ok) { await this.coop.recordAttempt({ eventId: delivery.eventId, consumerId: delivery.consumerId, epoch: delivery.epoch, outcome: 'revoked', detail: authority.reason, attempts: delivery.attempts }); results.push({ key, outcome: 'revoked', reason: authority.reason }); continue; }
-        // An earlier attempt with an unknown outcome is reconciled first when the transport can tell.
-        if (delivery.state === 'unknown' && adapter.canReconcile && typeof adapter.reconcile === 'function') {
-          const seen = await adapter.reconcile(record.event, delivery.recipient);
-          if (seen.known === true) { await this.coop.recordAttempt({ eventId: delivery.eventId, consumerId: delivery.consumerId, epoch: delivery.epoch, outcome: 'accepted', detail: 'reconciled: the receiver already holds this event', attempts: delivery.attempts }); results.push({ key, outcome: 'accepted', reconciled: true }); continue; }
+        if (!adapter) { await this._record(delivery, 'deferred', { detail: `no adapter for ${delivery.kind} on this host`, attempts: delivery.attempts, nextAttemptAt: this._later(this.deferMs) }); results.push({ key, outcome: 'deferred', reason: 'no_adapter' }); continue; }
+        let authority = await this._authority(record, delivery);
+        if (!authority.ok) { await this._record(delivery, 'revoked', { detail: authority.reason, attempts: delivery.attempts }); results.push({ key, outcome: 'revoked', reason: authority.reason }); continue; }
+        // An unresolved delivery (crash after send, timeout, unconfirmed turn) is never sent again
+        // on its own. Only an authoritative "the receiver does not hold it" opens a resend; a
+        // transport that cannot answer leaves it to the operator.
+        if (UNRESOLVED.has(delivery.state)) {
+          if (!adapter.canReconcile || typeof adapter.reconcile !== 'function') {
+            if (!delivery.unresolved) await this._record(delivery, 'unknown', { detail: 'unresolved and this transport cannot query receipts; operator must resolve (access coop resolve)', attempts: delivery.attempts, nextAttemptAt: null, unresolved: true });
+            results.push({ key, outcome: 'unknown', reason: 'unresolvable_without_receipt_query', unresolved: true }); continue;
+          }
+          const seen = await adapter.reconcile(record.event, authority.recipient);
+          if (seen.known === true) { await this._record(delivery, 'accepted', { detail: `reconciled: ${seen.reason || 'receiver holds the event'}`, attempts: delivery.attempts }); results.push({ key, outcome: 'accepted', reconciled: true }); continue; }
+          if (seen.known !== false) { await this._record(delivery, 'unknown', { detail: `reconciliation could not answer (${seen.reason || 'unknown'}); not resending`, attempts: delivery.attempts, nextAttemptAt: this._later(this.deferMs), unresolved: true }); results.push({ key, outcome: 'unknown', reason: seen.reason || 'reconcile_unanswered' }); continue; }
+          // The receiver confirmed it holds nothing: a resend is authorized, after re-reading authority across the await.
+          authority = await this._authority(record, delivery);
+          if (!authority.ok) { await this._record(delivery, 'revoked', { detail: authority.reason, attempts: delivery.attempts }); results.push({ key, outcome: 'revoked', reason: authority.reason }); continue; }
         }
         const attempts = (delivery.attempts || 0) + 1;
+        // Durable in-flight boundary before the external side effect.
+        await this._record(delivery, 'sending', { detail: 'in flight', attempts, nextAttemptAt: null });
         let outcome;
-        try { outcome = await adapter.deliver(record.event, delivery.recipient); }
+        try { outcome = await adapter.deliver(record.event, authority.recipient); }
         catch (error) { outcome = { outcome: 'unknown', reason: 'adapter_error', detail: redact(error?.code || error?.message || 'adapter threw') }; }
-        invariant(DISPATCH_OUTCOMES.includes(outcome.outcome) || outcome.outcome === 'failed', 'invalid_dispatcher', 'Adapter returned an unknown outcome.');
+        invariant(DISPATCH_OUTCOMES.includes(outcome.outcome), 'invalid_dispatcher', 'Adapter returned an unknown outcome.');
         let recorded = outcome.outcome; let nextAttemptAt = null;
-        if (outcome.outcome === 'deferred') { nextAttemptAt = this._later(this.deferMs); }
-        else if (outcome.outcome === 'failed' || outcome.outcome === 'unknown') {
-          if (outcome.terminal || attempts >= this.maxAttempts) recorded = 'dead';
-          else nextAttemptAt = this._later(backoffMs(attempts, { baseMs: this.baseDelayMs, maxMs: this.maxDelayMs, random: this.random }));
-        }
-        await this.coop.recordAttempt({ eventId: delivery.eventId, consumerId: delivery.consumerId, epoch: delivery.epoch, outcome: recorded, detail: [outcome.reason, outcome.detail].filter(Boolean).join(': '), attempts: outcome.outcome === 'deferred' ? delivery.attempts || 0 : attempts, nextAttemptAt });
+        if (outcome.outcome === 'deferred') nextAttemptAt = this._later(this.deferMs);
+        else if (outcome.outcome === 'failed') { if (outcome.terminal || attempts >= this.maxAttempts) recorded = 'dead'; else nextAttemptAt = this._later(backoffMs(attempts, { baseMs: this.baseDelayMs, maxMs: this.maxDelayMs, random: this.random })); }
+        else if (outcome.outcome === 'unknown') nextAttemptAt = adapter.canReconcile ? this._later(backoffMs(attempts, { baseMs: this.baseDelayMs, maxMs: this.maxDelayMs, random: this.random })) : null;
+        await this._record(delivery, recorded, { detail: [outcome.reason, outcome.detail].filter(Boolean).join(': '), attempts: outcome.outcome === 'deferred' ? delivery.attempts || 0 : attempts, nextAttemptAt, ...(outcome.receipt ? { receipt: outcome.receipt } : {}), ...(recorded === 'unknown' && !adapter.canReconcile ? { unresolved: true } : {}) });
         results.push({ key, outcome: recorded, reason: outcome.reason || null, attempts: outcome.outcome === 'deferred' ? delivery.attempts || 0 : attempts, nextAttemptAt });
       }
       return results;

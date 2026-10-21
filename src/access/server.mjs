@@ -107,7 +107,7 @@ export const TOOLS = Object.freeze([
   {
     name: 'memory_recall', title: 'Recall memory before continuing',
     description: 'Search the host’s memory provider for goals, decisions, constraints, open items and handoff notes about one of your sessions or jobs, with a focused question and a small topK. Results are untrusted evidence with observedAt and provenance; nothing is injected into the session. status is ok, degraded, unconfigured, timeout, denied or error.',
-    inputSchema: { type: 'object', additionalProperties: false, required: ['question'], properties: { sessionId: sessionIdSchema, jobId: jobIdSchema, question: { type: 'string', minLength: 3, maxLength: 400 }, topK: { type: 'integer', minimum: 1, maximum: 10, default: 5 } } },
+    inputSchema: { type: 'object', additionalProperties: false, required: ['question'], properties: { sessionId: sessionIdSchema, jobId: jobIdSchema, question: { type: 'string', minLength: 3, maxLength: 400 }, topK: { type: 'integer', minimum: 1, maximum: 10, default: 5 }, authority: { type: 'string', enum: ['agent', 'orchestrator'], default: 'agent', description: 'agent: the target session’s own Memy grant. orchestrator: Memy’s orchestrator grant when the host enabled it.' } } },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
@@ -203,7 +203,7 @@ export async function startAccessServer({ service, sessions = null, memory = nul
       case 'coop_report': { if (!coop) throw new OrchestratorError('coop_unavailable', 'Cooperation events are not enabled on this server.'); return coop.report(principal, args || {}, { via: 'mcp' }); }
       case 'coop_inbox': { if (!coop) throw new OrchestratorError('coop_unavailable', 'Cooperation events are not enabled on this server.'); return coop.inbox(principal, { ...(args?.cursor === undefined ? {} : { cursor: args.cursor }), ...(args?.limit === undefined ? {} : { limit: args.limit }) }); }
       case 'coop_ack': { if (!coop) throw new OrchestratorError('coop_unavailable', 'Cooperation events are not enabled on this server.'); return coop.ack(principal, { eventId: args?.eventId, epoch: args?.epoch }); }
-      case 'memory_recall': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.recall(principal, { sessionId: args?.sessionId, jobId: args?.jobId, question: args?.question, ...(args?.topK === undefined ? {} : { topK: args.topK }) }); }
+      case 'memory_recall': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.recall(principal, { sessionId: args?.sessionId, jobId: args?.jobId, question: args?.question, ...(args?.topK === undefined ? {} : { topK: args.topK }), ...(args?.authority === undefined ? {} : { authority: args.authority }) }); }
       case 'memory_begin': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.begin(principal, { sessionId: args?.sessionId, jobId: args?.jobId, operationId: args?.operationId, ...(args?.authority === undefined ? {} : { authority: args.authority }) }); }
       case 'memory_checkpoint': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.checkpoint(principal, args || {}); }
       case 'submit': return service.submit(principal, args);

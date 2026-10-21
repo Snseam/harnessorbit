@@ -536,11 +536,18 @@ test('memory authority is fixed at begin: the orchestrator carrier needs the hos
   const saved = await enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc', ...body(), attestationEventId: mine.event.eventId });
   assert.equal(saved.status, 'saved');
   const sent = provider.calls.filter(c => c.tool === 'save').at(-1).input;
-  assert.equal(sent.agent, 'orchestrator');
-  assert.equal(sent.document.session.agent, 'orchestrator');
-  assert.equal(sent.document.attested_by, `principal:grok@${principal.incarnation}`);
-  assert.equal(sent.document.attestation_ref, `harnessorbit:event/${mine.event.eventId}`);
+  assert.equal(sent.agent, 'orchestrator', 'the CLI carrier is the orchestrator grant');
+  assert.equal(sent.document.session.agent, 'claude_code', 'the work source stays the real actor');
+  assert.equal(sent.document.attested_by, undefined, 'no attestation fields at the top level');
+  assert.equal(sent.document.session.attested_by, `principal:grok@${principal.incarnation}`);
+  assert.equal(sent.document.session.attestation_ref, `harnessorbit:event/${mine.event.eventId}`);
   assert.equal(sent.document.participants[0].kind, 'grok');
+  // Recall can use the orchestrator carrier only through the same host flag, never a borrowed grant.
+  assert.equal((await memory.recall(principal, { jobId: submitted.job.id, question: 'what was decided?', authority: 'orchestrator' })).reason, 'orchestrator_carrier_unavailable');
+  const recalled = await enabled.recall(principal, { jobId: submitted.job.id, question: 'what was decided?', authority: 'orchestrator' });
+  assert.equal(recalled.status, 'ok'); assert.equal(recalled.authority, 'orchestrator');
+  assert.equal(provider.calls.filter(c => c.tool === 'recall').at(-1).input.agent, 'orchestrator');
+  assert.equal((await enabled.recall(principal, { jobId: submitted.job.id, question: 'what was decided?' })).authority, 'agent');
   // Turning the host flag off afterwards does not rewrite the admission: a retry still goes through the orchestrator carrier, never the agent grant.
   const later = new MemoryService({ root: stateRoot, provider, principals, jobs: access.jobs, orchestrator, coop, orchestratorCarrier: false, timeoutMs: 600 });
   const replay = await later.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc' });
@@ -550,7 +557,7 @@ test('memory authority is fixed at begin: the orchestrator carrier needs the hos
   assert.equal((await enabled.begin(principal, { jobId: submitted.job.id, operationId: 'ag' })).authority, 'agent');
   assert.equal((await enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'ag', ...body() })).status, 'saved');
   assert.equal(provider.calls.filter(c => c.tool === 'save').at(-1).input.agent, 'claude');
-  assert.equal(provider.calls.filter(c => c.tool === 'save').at(-1).input.document.attested_by, undefined);
+  assert.equal(provider.calls.filter(c => c.tool === 'save').at(-1).input.document.session.attested_by, undefined);
 });
 
 test('the fake memy CLI exposes the orchestrator carrier only when the host enabled it', async t => {
@@ -562,4 +569,51 @@ test('the fake memy CLI exposes the orchestrator carrier only when the host enab
   assert.equal((await cli({ FAKE_MEMY_ORCHESTRATOR: '1' }).begin({ project, agent: 'orchestrator', operationId: 'o' })).status, 'admitted');
   const log = (await fs.readFile(env.FAKE_MEMY_LOG, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
   assert.ok(log.every(l => l.flags.agent === 'orchestrator'));
+});
+
+test('an attestation event must match the exact target instance frozen in the admission: not an earlier session binding, not an earlier job attempt', async t => {
+  const { principal, access, project, stateRoot, principals, provider } = await setup(t);
+  let revision = 1;
+  const fakeOrchestrator = { inspect: async () => ({ attempt: { id: `a${revision}`, number: revision, status: 'running' } }) };
+  const sessions = new SessionStore({ root: stateRoot });
+  const coop = new CoopService({ root: stateRoot, principals, jobs: access.jobs, sessions, orchestrator: fakeOrchestrator });
+  const memory = new MemoryService({ root: stateRoot, provider, principals, jobs: access.jobs, sessions, orchestrator: fakeOrchestrator, coop, orchestratorCarrier: true, timeoutMs: 600 });
+  // Session: event under binding b-1, then the same session id re-bound as b-2.
+  await sessions.create(sessionRecord(project, principal, { bindingId: 'b-1' }));
+  const old = await coop.report(principal, { idempotencyKey: 'old-binding', type: 'handoff.offered', task: { ref: 'harnessorbit:session/ses-1' }, payload: {} });
+  assert.equal(old.event.source.binding, 'b-1');
+  await sessions.remove('ses-1'); await sessions.create(sessionRecord(project, principal, { bindingId: 'b-2', paneId: '%10' }));
+  assert.equal((await memory.begin(principal, { sessionId: 'ses-1', operationId: 'new-binding', authority: 'orchestrator' })).status, 'admitted');
+  await assert.rejects(memory.checkpoint(principal, { sessionId: 'ses-1', operationId: 'new-binding', ...body(), attestationEventId: old.event.eventId }), e => e.code === 'attestation_invalid');
+  assert.equal(provider.calls.filter(c => c.tool === 'save').length, 0);
+  const fresh = await coop.report(principal, { idempotencyKey: 'new-binding-event', type: 'handoff.offered', task: { ref: 'harnessorbit:session/ses-1' }, payload: {} });
+  assert.equal((await memory.checkpoint(principal, { sessionId: 'ses-1', operationId: 'new-binding', ...body(), attestationEventId: fresh.event.eventId })).status, 'saved');
+  // Job: event at attempt 1, then the job moves to attempt 2.
+  const submitted = await access.submit(principal, job(project));
+  const first = await coop.report(principal, { idempotencyKey: 'rev1', type: 'work.reported', task: { ref: `harnessorbit:job/${submitted.job.id}` }, payload: {} });
+  assert.equal(first.event.task.intentRevision, 1);
+  revision = 2;
+  assert.equal((await memory.begin(principal, { jobId: submitted.job.id, operationId: 'new-intent', authority: 'orchestrator' })).status, 'admitted');
+  await assert.rejects(memory.checkpoint(principal, { jobId: submitted.job.id, operationId: 'new-intent', ...body(), attestationEventId: first.event.eventId }), e => e.code === 'attestation_invalid');
+  const current = await coop.report(principal, { idempotencyKey: 'rev2', type: 'work.reported', task: { ref: `harnessorbit:job/${submitted.job.id}` }, payload: {} });
+  assert.equal(current.event.task.intentRevision, 2);
+  assert.equal((await memory.checkpoint(principal, { jobId: submitted.job.id, operationId: 'new-intent', ...body(), attestationEventId: current.event.eventId })).status, 'saved');
+  // The job moving on after admission makes the operation itself stale.
+  await memory.begin(principal, { jobId: submitted.job.id, operationId: 'stale-op' });
+  revision = 3;
+  await assert.rejects(memory.checkpoint(principal, { jobId: submitted.job.id, operationId: 'stale-op', ...body() }), e => e.code === 'operation_conflict');
+});
+
+test('the fake memy CLI applies the strict checkpoint shape: top-level attestation or a carrier actor is invalid, attestation inside session under the orchestrator carrier is accepted', async t => {
+  const f = await fixture(); t.after(f.remove);
+  const project = await fs.realpath(f.project);
+  const env = { ...process.env, FAKE_MEMY_LOG: path.join(f.base, 'memy.log'), FAKE_MEMY_STATE: path.join(f.base, 'memy-state.json'), FAKE_MEMY_ORCHESTRATOR: '1' };
+  const cli = new MemyHandoffCliProvider({ argv: [process.execPath, FAKE_MEMY], timeoutMs: 1500, command: (argv, opts) => import('../src/process.mjs').then(m => m.runCommand(argv, { ...opts, env })) });
+  const base = { schema: 'memy.handoff.checkpoint.v1', observed_at: '2026-10-21T10:00:00.000Z', summary: 's', goals: [], decisions: [], constraints: [], open_questions: [], task: { id: 't' }, participants: [], orchestrator: { name: 'harnessorbit', version: '0.4.0' }, evidence: [] };
+  const save = async (operationId, document) => cli.save({ project, agent: 'orchestrator', operationId, canonical: JSON.stringify(document), document });
+  assert.equal((await cli.begin({ project, agent: 'orchestrator', operationId: 'x' })).status, 'admitted');
+  assert.equal((await save('x', { ...base, session: { id: 's', agent: 'claude_code' }, attested_by: 'principal:grok@1', attestation_ref: 'harnessorbit:event/e' })).reason, 'invalid_checkpoint', 'top-level attestation fields are unknown fields');
+  assert.equal((await save('x', { ...base, session: { id: 's', agent: 'orchestrator', attested_by: 'principal:grok@1', attestation_ref: 'harnessorbit:event/e' } })).reason, 'invalid_checkpoint', 'the carrier is not an actor');
+  assert.equal((await save('x', { ...base, session: { id: 's', agent: 'claude_code' } })).reason, 'invalid_checkpoint', 'an orchestrator-carried save needs its attestation');
+  assert.equal((await save('x', { ...base, session: { id: 's', agent: 'claude_code', attested_by: 'principal:grok@1', attestation_ref: 'harnessorbit:event/e' } })).status, 'saved');
 });

@@ -196,9 +196,9 @@ test('operator registration fixes destinations: webhooks need an exact https end
   assert.equal((await coop.report(grok, report(jobId))).deliveries.find(d => d.consumerId === 'grok-hook').state, 'accepted');
 });
 
-test('the observer emits agent.turn_finished only on an observed working → ready transition, once per transition, across restarts and rebinds, and never for an initial idle snapshot', async t => {
+test('the observer emits session.ready only on an observed working → ready transition, once per transition, across restarts and rebinds, and never for an initial idle snapshot', async t => {
   const { coop, grok, codex, sessions, project, stateRoot, principals } = await setup(t);
-  await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex', types: ['agent.turn_finished'] });
+  await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex', types: ['session.ready'] });
   await sessions.create(bound(project, grok));
   const proc = { pid: 101, ppid: 1, pgid: 101, tpgid: 101, stat: 'S+', startedAt: 'x', comm: 'claude', args: 'claude' };
   const pane = { paneId: '%9', target: 'live:0.0', panePid: 1, dead: false, currentCommand: 'claude', currentPath: project, historySize: 0 };
@@ -207,7 +207,7 @@ test('the observer emits agent.turn_finished only on an observed working → rea
   const live = new SessionService({ root: stateRoot, principals, sessions, tmux, processes, settleMs: 0 });
   const observer = new SessionObserver({ root: stateRoot, sessions: live, coop, intervalMs: 1000 });
   let results = await observer.tick();
-  assert.deepEqual(results, [{ sessionId: 'ses-1', state: 'idle', emitted: null }], 'an initial idle snapshot is not a transition');
+  assert.deepEqual(results, [{ sessionId: 'ses-1', state: 'idle', native: 'unavailable', emitted: null }], 'an initial idle snapshot is not a transition');
   tmux.screen = ['> fix it', '✻ Working… (esc to interrupt)'];
   results = await observer.tick();
   assert.equal(results[0].state, 'busy');
@@ -215,15 +215,15 @@ test('the observer emits agent.turn_finished only on an observed working → rea
   tmux.screen = ['⏺ done', '❯ '];
   results = await observer.tick();
   assert.equal(results[0].state, 'idle');
-  assert.ok(results[0].emitted?.eventId, 'working → ready emits once');
-  const first = results[0].emitted;
+  assert.ok(results[0].emitted?.[0]?.eventId, 'working → ready emits once');
+  const first = results[0].emitted[0];
   assert.equal((await observer.tick())[0].emitted, null, 'staying idle emits nothing');
   const restarted = new SessionObserver({ root: stateRoot, sessions: live, coop, intervalMs: 1000 });
   assert.equal((await restarted.tick())[0].emitted, null, 'a restarted observer does not re-emit the persisted transition');
   const inbox = await coop.inbox(codex, {});
   assert.equal(inbox.events.length, 1);
   const event = inbox.events[0];
-  assert.equal(event.type, 'agent.turn_finished');
+  assert.equal(event.type, 'session.ready');
   assert.equal(event.source.via, 'observer');
   assert.equal(event.source.principalId, 'grok', 'attributed to the binding’s principal as an observation about its session');
   assert.equal(event.source.binding, 'b-1');
@@ -232,7 +232,7 @@ test('the observer emits agent.turn_finished only on an observed working → rea
   assert.equal(JSON.stringify(event).includes('fix it'), false, 'no screen text leaves the host');
   // A second cycle is a new transition; a replay of the same transition identity is deduplicated.
   tmux.screen = ['✻ Working…']; await observer.tick();
-  tmux.screen = ['❯ ']; const second = (await observer.tick())[0].emitted;
+  tmux.screen = ['❯ ']; const second = (await observer.tick())[0].emitted[0];
   assert.notEqual(second.eventId, first.eventId);
   assert.equal((await coop.observe({ sessionId: 'ses-1', bindingId: 'b-1', transitionId: second.transitionId, observedAt: 'x', fromState: 'busy', toState: 'idle' })).reused, true);
   await assert.rejects(coop.observe({ sessionId: 'ses-1', bindingId: 'b-1', transitionId: 'ab'.repeat(8), observedAt: 'x', fromState: 'idle', toState: 'idle' }), e => e.code === 'invalid_event');
@@ -243,7 +243,7 @@ test('the observer emits agent.turn_finished only on an observed working → rea
   // Revoking the binding principal's sessions permission stops observations from being recorded.
   await principals.update('grok', { permissions: { sessions: false } });
   tmux.screen = ['❯ '];
-  assert.equal((await observer.tick())[0].emitted?.error, 'permission_denied');
+  assert.equal((await observer.tick())[0].emitted?.[0]?.error, 'permission_denied');
   assert.equal((await coop.inbox(codex, {})).events.length, 2);
 });
 
@@ -291,7 +291,7 @@ test('CLI parses the recipient, coop and observe subcommands', () => {
 
 test('crash regressions: a torn journal tail is truncated before the next append, and the observer neither loses a signal on a transient failure nor repeats it after a crash between event and state save', async t => {
   const { coop, grok, codex, jobId, stateRoot, sessions, project, principals } = await setup(t);
-  await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex', types: ['work.reported', 'agent.turn_finished'] });
+  await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex', types: ['work.reported', 'session.ready'] });
   // 1. valid → torn tail → append → append: every record intact, no corruption, no silent drop.
   await coop.report(grok, report(jobId, { idempotencyKey: 'one' }));
   const journal = path.join(stateRoot, 'access', 'coop', 'journal.jsonl');
@@ -316,14 +316,14 @@ test('crash regressions: a torn journal tail is truncated before the next append
   let failures = 0;
   coop.observe = async input => { if (failures++ === 0) { const e = new Error('lock busy'); e.code = 'lock_timeout'; throw e; } return observe(input); };
   tmux.screen = ['❯ '];
-  const failed = (await observer.tick())[0].emitted;
+  const failed = (await observer.tick())[0].emitted[0];
   assert.equal(failed.error, 'lock_timeout');
   assert.equal(failed.retry, true);
-  const retried = (await observer.tick())[0].emitted;   // still idle; the pending transition is retried, not lost
+  const retried = (await observer.tick())[0].emitted[0];   // still idle; the pending transition is retried, not lost
   assert.equal(retried.transitionId, failed.transitionId);
   assert.equal(retried.reused, false);
   assert.equal((await observer.tick())[0].emitted, null, 'once confirmed, nothing more is emitted for this transition');
-  const turnEvents = (await coop.inbox(codex, {})).events.filter(e => e.type === 'agent.turn_finished');
+  const turnEvents = (await coop.inbox(codex, {})).events.filter(e => e.type === 'session.ready');
   assert.equal(turnEvents.length, 1);
   coop.observe = observe;
   // 3. Crash after the event was journaled but before the observation state was saved: the restart re-derives the same identity and the store answers reused.
@@ -333,10 +333,10 @@ test('crash regressions: a torn journal tail is truncated before the next append
   const direct = await coop.observe({ sessionId: 'ses-1', bindingId: 'b-1', transitionId: expected, observedAt: 'crashed-before-save', fromState: 'busy', toState: 'idle' });
   assert.equal(direct.reused, false, 'simulates the event the crashed process had already journaled');
   tmux.screen = ['❯ '];
-  const after = (await new SessionObserver({ root: stateRoot, sessions: live, coop, intervalMs: 1000 }).tick())[0].emitted;
+  const after = (await new SessionObserver({ root: stateRoot, sessions: live, coop, intervalMs: 1000 }).tick())[0].emitted[0];
   assert.equal(after.transitionId, expected);
   assert.equal(after.reused, true, 'the restarted observer re-derives the same transition and does not create a second event');
-  assert.equal((await coop.inbox(codex, {})).events.filter(e => e.type === 'agent.turn_finished').length, 2);
+  assert.equal((await coop.inbox(codex, {})).events.filter(e => e.type === 'session.ready').length, 2);
 });
 
 test('crash regression: a complete checksummed record without its final newline is kept and given its delimiter, never truncated', async t => {

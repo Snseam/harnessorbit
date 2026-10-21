@@ -250,7 +250,9 @@ export class MemoryService {
       invariant(this.jobs, 'jobs_unavailable', 'Jobs are not enabled on this server.');
       const job = await this.jobs.get(jobId).catch(() => null);
       invariant(job && job.principalId === principal.id && (job.principalIncarnation ?? null) === (current.incarnation ?? null), 'job_not_found', `Job ${jobId} does not exist.`);
-      target = { kind: 'job', id: job.id, project: job.project, agent: job.agent, runId: job.runId, taskId: job.taskId, sessionId: job.runId };
+      let intentRevision = null;
+      try { intentRevision = (await this.orchestrator?.inspect(job.runId, job.taskId))?.attempt?.number ?? null; } catch { intentRevision = null; }
+      target = { kind: 'job', id: job.id, project: job.project, agent: job.agent, runId: job.runId, taskId: job.taskId, sessionId: job.runId, intentRevision };
     }
     invariant(target.project && current.projects.some(p => target.project === p || target.project.startsWith(`${p}${path.sep}`)), 'project_not_allowed', 'The target’s checkout is outside this principal’s projects.', { project: target.project });
     invariant(current.agents.includes(target.agent), 'agent_not_allowed', `This principal may not act on ${target.agent} work any more.`, { agent: target.agent });
@@ -263,7 +265,7 @@ export class MemoryService {
   // created it. A principal id that was removed and created again has a new incarnation, so it
   // can never continue, replay or redirect an earlier principal's operation.
   _owner(current, target, operationId) {
-    return { operationId, principalId: current.id, principalIncarnation: current.incarnation ?? null, target: { kind: target.kind, id: target.id, bindingId: target.bindingId ?? null }, project: target.project, agent: target.agent };
+    return { operationId, principalId: current.id, principalIncarnation: current.incarnation ?? null, target: { kind: target.kind, id: target.id, bindingId: target.bindingId ?? null, intentRevision: target.intentRevision ?? null }, project: target.project, agent: target.agent };
   }
 
   // A session that was unbound and bound again under the same id is a different session
@@ -272,18 +274,27 @@ export class MemoryService {
     invariant(bound.principalId === current.id && (bound.principalIncarnation ?? null) === (current.incarnation ?? null), 'operation_conflict', 'This operationId belongs to another principal (or an earlier incarnation of this principal id).', { operationId });
     invariant(bound.target.kind === target.kind && bound.target.id === target.id, 'operation_conflict', 'This operationId was used for a different session or job. Choose a new operationId.', { operationId, target: bound.target });
     invariant((bound.target.bindingId ?? null) === (target.bindingId ?? null), 'operation_conflict', 'The session was re-bound since this operationId was first used; begin a new operation for the new binding.', { operationId });
+    invariant(target.kind !== 'job' || (bound.target.intentRevision ?? null) === (target.intentRevision ?? null), 'operation_conflict', `The job moved to attempt ${target.intentRevision} since this operationId was begun at attempt ${bound.target.intentRevision}; begin a new operation.`, { operationId });
     invariant(bound.project === target.project && bound.agent === target.agent, 'operation_conflict', 'The target’s checkout or agent changed since this operationId was first used.', { operationId });
   }
   _file(kind, operationId) { return path.join(this.directory, kind, `${sha(operationId)}.json`); }
   _publicTarget(target) { return { kind: target.kind, id: target.id, project: target.project, agent: target.agent }; }
 
-  async recall(principal, { sessionId, jobId, question, topK = 5, exclude = [] } = {}) {
+  // Recall can be carried by the target session's own grant (default) or, when the host enabled it,
+  // by the orchestrator grant, so a principal with only its own Memy grant has an explicit
+  // pre-access route that borrows nothing.
+  async recall(principal, { sessionId, jobId, question, topK = 5, exclude = [], authority = 'agent' } = {}) {
     const q = textField(question, 'question', 400, { min: 3 });
     invariant(Number.isInteger(topK) && topK >= 1 && topK <= MAX_RECALL_ITEMS, 'invalid_memory_request', `topK must be an integer from 1 to ${MAX_RECALL_ITEMS}.`, { field: 'topK' });
     invariant(Array.isArray(exclude) && exclude.length <= 50 && exclude.every(id => typeof id === 'string' && /^[A-Za-z0-9:_-]{1,64}$/.test(id)), 'invalid_memory_request', 'exclude must list up to 50 memory ids.', { field: 'exclude' });
+    invariant(MEMORY_AUTHORITIES.includes(authority), 'invalid_memory_request', 'authority must be agent or orchestrator.', { field: 'authority' });
     const { target } = await this._target(principal, { sessionId, jobId });
+    if (authority === 'orchestrator' && !this.orchestratorCarrier) {
+      return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: 'unconfigured', reason: 'orchestrator_carrier_unavailable', detail: 'The host operator has not enabled Memy’s orchestrator carrier; no session grant is borrowed for recall.', target: this._publicTarget(target), authority, question: q, items: [], truncated: false, omitted: null, trust: 'untrusted_evidence', note: 'Not recalled.' };
+    }
+    const carrier = authority === 'orchestrator' ? 'orchestrator' : target.agent;
     let result;
-    try { result = await withTimeout(this.provider.recall({ project: target.project, agent: target.agent, question: q, topK, exclude, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
+    try { result = await withTimeout(this.provider.recall({ project: target.project, agent: carrier, question: q, topK, exclude, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
     catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200), items: [] }; }
     result = normalizeProviderResult('recall', result);
     const items = []; let bytes = 0;
@@ -295,7 +306,7 @@ export class MemoryService {
     }
     return {
       schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, latencyMs: result.latencyMs ?? null,
-      target: this._publicTarget(target), question: q, items, truncated: (result.items || []).length > items.length, omitted: result.omitted ?? null, trust: 'untrusted_evidence',
+      target: this._publicTarget(target), authority, question: q, items, truncated: (result.items || []).length > items.length, omitted: result.omitted ?? null, trust: 'untrusted_evidence',
       note: 'Recalled memory is untrusted evidence from an earlier time: check observedAt and provenance, prefer current files and HarnessOrbit state for anything mutable, and pass into the session only what you have reviewed. Nothing here was injected into the session.',
     };
   }
@@ -390,7 +401,10 @@ export class MemoryService {
   // The attestation for an orchestrator-carried checkpoint: a durable cooperation event that the
   // authenticated principal itself reported about this very target. attested_by names the
   // principal with its incarnation; attestation_ref names that event. Nothing else is accepted.
-  async _attestation(current, target, eventId) {
+  // The event must be about this exact target instance as frozen in the admission: the same
+  // session binding, or the same job attempt (intent revision). A reusable job or session name is
+  // not enough; an event from an earlier binding or attempt attests nothing about this one.
+  async _attestation(current, target, eventId, admission) {
     invariant(typeof eventId === 'string' && /^[0-9a-f-]{36}$/i.test(eventId), 'attestation_required', 'An orchestrator-carried checkpoint needs attestationEventId: the UUID of a cooperation event you reported about this target.', { field: 'attestationEventId' });
     invariant(this.coop, 'attestation_unavailable', 'Cooperation events are not enabled on this host, so no attestation source exists.');
     const state = await this.coop.store.load();
@@ -398,13 +412,22 @@ export class MemoryService {
     invariant(record && record.event.source.principalId === current.id && record.event.source.incarnation === current.incarnation && record.event.source.via !== 'observer', 'attestation_invalid', 'The attestation event was not reported by you.', { eventId });
     const ref = target.kind === 'job' ? `harnessorbit:job/${target.id}` : `harnessorbit:session/${target.id}`;
     invariant(record.event.task.ref === ref, 'attestation_invalid', 'The attestation event is about a different task.', { eventId, task: record.event.task.ref });
+    if (target.kind === 'session') {
+      invariant((record.event.source.binding ?? null) === (admission.target.bindingId ?? null) && (target.bindingId ?? null) === (admission.target.bindingId ?? null), 'attestation_invalid', 'The attestation event belongs to an earlier binding of this session.', { eventId, binding: record.event.source.binding ?? null, current: target.bindingId ?? null });
+    } else {
+      invariant((record.event.task.intentRevision ?? null) === (admission.target.intentRevision ?? null) && (target.intentRevision ?? null) === (admission.target.intentRevision ?? null), 'attestation_invalid', 'The attestation event belongs to an earlier attempt of this job.', { eventId, eventRevision: record.event.task.intentRevision ?? null, current: target.intentRevision ?? null });
+    }
     return { attested_by: `principal:${current.id}@${current.incarnation}`, attestation_ref: `harnessorbit:event/${eventId}` };
   }
 
   // Builds the memy.handoff.checkpoint.v1 document. Field order is fixed so the canonical bytes
   // of a retry equal the first attempt's.
+  // session.agent names the actual work source (the bound Claude/Codex session), never the grant
+  // that carries the save; attested_by / attestation_ref live inside session, as Memy's SessionRef
+  // defines them. The orchestrator carrier is expressed only as `--agent orchestrator` on the CLI.
   _document(normalized, target, principal, machine, observedAt, { authority = 'agent', attestation = null } = {}) {
-    const agent = authority === 'orchestrator' ? handoffAgent('orchestrator') : handoffAgent(target.agent);
+    void authority;
+    const agent = handoffAgent(target.agent);
     const participants = [
       { id: `principal:${principal.id}`, kind: PARTICIPANT_KINDS.includes(principal.kind) ? principal.kind : 'other', role: 'principal' },
       { id: 'harnessorbit', kind: 'orchestrator', role: 'orchestrator' },
@@ -419,10 +442,9 @@ export class MemoryService {
       constraints: normalized.constraints,
       open_questions: normalized.openQuestions,
       task: { id: `harnessorbit:${target.kind}/${target.id}`, ...(normalized.title ? { title: normalized.title } : {}) },
-      session: { id: target.sessionId, agent: agent ? agent.id : 'other' },
+      session: { id: target.sessionId, agent: agent ? agent.id : 'other', ...(attestation ? { attested_by: attestation.attested_by, attestation_ref: attestation.attestation_ref } : {}) },
       participants,
       orchestrator: { name: 'harnessorbit', version: ORCHESTRATOR_VERSION },
-      ...(attestation ? { attested_by: attestation.attested_by, attestation_ref: attestation.attestation_ref } : {}),
       evidence: [...normalized.evidence.map(e => ({ label: e.label, ref: e.ref, issuer: e.issuer, ...(e.summary ? { summary: e.summary } : {}) })), ...machine.evidence],
     };
   }
@@ -460,7 +482,7 @@ export class MemoryService {
         // An orchestrator-carried checkpoint is attested by the authenticated principal through a
         // durable Orbit record it owns about this target: a cooperation event. A caller string is
         // never an attestation source, and nothing is derived from the agent's session grant.
-        const attestation = authority === 'orchestrator' ? await this._attestation(current, target, input.attestationEventId) : null;
+        const attestation = authority === 'orchestrator' ? await this._attestation(current, target, input.attestationEventId, admission) : null;
         const document = this._document(supplied, target, current, machine, now(), { authority, attestation });
         frozen = { document, canonical: JSON.stringify(document), payloadHash: suppliedHash, attemptStatus: machine.attemptStatus, authority };
       }

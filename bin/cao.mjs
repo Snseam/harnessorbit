@@ -148,13 +148,14 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access principal migrate --id ID      (operator, once: give a pre-identity principal its incarnation)
   access principal adopt-jobs --id ID   (operator: assign this principal's pre-identity jobs to its current incarnation)
   access session discover [--tmux-socket NAME]       (operator: which tmux panes run claude/codex)
-  access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT] [--tmux-socket NAME]
+  access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT] [--tmux-socket NAME] [--provider-session UUID]
   access session list --principal ID
   access session status --principal ID --session ID
   access session send --principal ID --session ID --key KEY (--text TEXT | --text-file FILE | --keys Enter)
   access session read --principal ID --session ID [--cursor CURSOR] [--max-lines 120]
   access session unbind --principal ID --session ID   (or --operator to drop any binding by id)
-  access memory recall --principal ID (--session ID | --job ID) --question TEXT [--top-k 5]
+  access memory recall --principal ID (--session ID | --job ID) --question TEXT [--top-k 5] [--authority agent|orchestrator]
+  access coop resolve --event UUID --consumer ID --as accepted|resend [--note TEXT]   (operator: settle an unresolved delivery)
   access memory begin --principal ID (--session ID | --job ID) --operation ID [--authority agent|orchestrator]
   access memory checkpoint --principal ID (--session ID | --job ID) --operation ID [--file CHECKPOINT.json] [--attestation EVENT-UUID]
   (orchestrator carrier needs HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER=1 on the host after "memy connection orchestrator enable")
@@ -232,12 +233,12 @@ const optionsByCommand = {
   'access principal update': ['id', 'allow-sessions', 'deny-sessions', 'allow-integrate', 'deny-integrate'],
   'access principal adopt-jobs': ['id'], 'access principal migrate': ['id'],
   'access session discover': ['tmux-socket'],
-  'access session bind': ['principal', 'pane', 'id', 'allow-keys', 'label', 'tmux-socket'],
+  'access session bind': ['principal', 'pane', 'id', 'allow-keys', 'label', 'tmux-socket', 'provider-session'],
   'access session list': ['principal', 'tmux-socket'], 'access session status': ['principal', 'session', 'tmux-socket'],
   'access session send': ['principal', 'session', 'key', 'text', 'text-file', 'keys', 'tmux-socket'],
   'access session read': ['principal', 'session', 'cursor', 'max-lines', 'tmux-socket'],
   'access session unbind': ['principal', 'session', 'operator', 'tmux-socket'],
-  'access memory recall': ['principal', 'session', 'job', 'question', 'top-k'],
+  'access memory recall': ['principal', 'session', 'job', 'question', 'top-k', 'authority'],
   'access memory begin': ['principal', 'session', 'job', 'operation', 'authority'],
   'access memory checkpoint': ['principal', 'session', 'job', 'operation', 'file', 'attestation'],
   'access memory pending': ['principal'],
@@ -246,6 +247,7 @@ const optionsByCommand = {
   'access coop report': ['principal', 'key', 'type', 'task', 'payload-file', 'evidence-file', 'conversation', 'correlation', 'causation'],
   'access coop inbox': ['principal', 'cursor', 'limit'], 'access coop ack': ['principal', 'event', 'epoch'], 'access coop deliveries': [],
   'access coop dispatch': ['once', 'interval-ms', 'allow-http-loopback'],
+  'access coop resolve': ['event', 'consumer', 'as', 'note'],
   'access observe': ['once', 'interval-ms', 'tmux-socket'],
 };
 const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop']);
@@ -390,7 +392,7 @@ export async function main(argv = process.argv.slice(2)) {
       const audit = new AccessAudit({ root: profiles.root });
       const tool = command.slice('access session '.length);
       if (tool === 'discover') return sessions.discover();
-      if (tool === 'bind') return sessions.bind({ principalId: required('principal'), pane: required('pane'), id: o.id || null, allowKeys: !!o['allow-keys'], label: o.label || null });
+      if (tool === 'bind') return sessions.bind({ principalId: required('principal'), pane: required('pane'), id: o.id || null, allowKeys: !!o['allow-keys'], label: o.label || null, providerSessionId: o['provider-session'] || null });
       if (tool === 'unbind' && o.operator) return { id: required('session'), removed: await sessions.unbindAsOperator(o.session) };
       const principal = await principals.get(required('principal'));
       if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
@@ -484,7 +486,7 @@ export async function main(argv = process.argv.slice(2)) {
       const target = { sessionId: o.session, jobId: o.job };
       try {
         const result = tool === 'recall'
-          ? await memory.recall(principal, { ...target, question: required('question'), ...(o['top-k'] === undefined ? {} : { topK: Number(o['top-k']) }) })
+          ? await memory.recall(principal, { ...target, question: required('question'), ...(o['top-k'] === undefined ? {} : { topK: Number(o['top-k']) }), ...(o.authority ? { authority: o.authority } : {}) })
           : tool === 'begin'
             ? await memory.begin(principal, { ...target, operationId: required('operation'), ...(o.authority ? { authority: o.authority } : {}) })
             : await memory.checkpoint(principal, { ...target, operationId: required('operation'), ...(o.file ? await readProfile(o.file) : {}), ...(o.attestation ? { attestationEventId: o.attestation } : {}) });
@@ -503,6 +505,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'access coop ack':
     case 'access coop deliveries':
     case 'access coop dispatch':
+    case 'access coop resolve':
     case 'access observe': {
       const principals = new PrincipalStore({ root: profiles.root });
       const sessionStore = new SessionStore({ root: profiles.root });
@@ -512,6 +515,7 @@ export async function main(argv = process.argv.slice(2)) {
       if (command === 'access recipient list') return coop.listRecipients();
       if (command === 'access recipient revoke') return coop.revokeRecipient(required('id'));
       if (command === 'access coop deliveries') return { deliveries: await coop.pendingDeliveries() };
+      if (command === 'access coop resolve') return coop.resolveDelivery({ eventId: required('event'), consumerId: required('consumer'), as: required('as'), note: o.note || null });
       if (command === 'access coop dispatch') {
         const dispatcher = new Dispatcher({ root: profiles.root, coop, principals, adapters: defaultAdapters({ grok: { allowHttpLoopback: !!o['allow-http-loopback'] } }) });
         if (o.once) return { results: await dispatcher.tick() };

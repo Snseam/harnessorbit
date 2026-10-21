@@ -48,8 +48,13 @@ else if (command === 'recall') {
   if (!state.admissions[op]) reply('denied', 'not_begun');
   let doc;
   try { doc = JSON.parse(stdin); } catch { reply('invalid', 'invalid_checkpoint'); }
-  if (doc.schema !== 'memy.handoff.checkpoint.v1' || !doc.summary || !doc.session || !doc.orchestrator || Object.keys(doc).some(k => ['project_id', 'tenant_id', 'namespace', 'receipt_agent', 'write_generation'].includes(k))) reply('invalid', 'invalid_checkpoint');
-  if (doc.session.agent !== flags.agent.replace('-', '_')) reply('denied', 'agent_mismatch');
+  // Mirror Memy's strict decoder: known top-level fields only, attestation lives inside session,
+  // session.agent is a real actor (never the orchestrator carrier), and an agent carrier must match it.
+  const TOP = ['schema', 'observed_at', 'summary', 'goals', 'decisions', 'constraints', 'open_questions', 'task', 'session', 'participants', 'orchestrator', 'evidence'];
+  const SESSION = ['id', 'agent', 'attested_by', 'attestation_ref'];
+  if (doc.schema !== 'memy.handoff.checkpoint.v1' || !doc.summary || !doc.session || !doc.orchestrator || Object.keys(doc).some(k => !TOP.includes(k)) || Object.keys(doc.session).some(k => !SESSION.includes(k)) || !['claude_code', 'codex', 'grok', 'other'].includes(doc.session.agent)) reply('invalid', 'invalid_checkpoint');
+  if (flags.agent !== 'orchestrator' && doc.session.agent !== flags.agent.replace('-', '_')) reply('denied', 'agent_mismatch');
+  if (flags.agent === 'orchestrator' && (typeof doc.session.attested_by !== 'string' || typeof doc.session.attestation_ref !== 'string')) reply('invalid', 'invalid_checkpoint');
   if (state.saved[op]) {
     if (state.saved[op].bytes !== stdin) reply('conflict', 'operation_conflict');
     reply('saved', null, { operation_id: op, project_id: '11111111-1111-4111-8111-111111111111', write_generation: 3, memory_ids: state.saved[op].memory_ids, deduplicated: true });

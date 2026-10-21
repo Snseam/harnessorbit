@@ -327,7 +327,22 @@ export class SessionService {
   // Operator-only. Binding is the authorization: it names the principal, one pane, the agent
   // process in it (pid + start time), and the checkout it works in, which must be in the
   // principal's project scope. Keys are off unless the operator allows them.
-  async bind({ principalId, pane, id = null, allowKeys = false, label = null } = {}) {
+  // The provider's own session identity, when it can be known without guessing: Claude Code
+  // launched as `claude --resume <uuid>` / `--session-id <uuid>`, or an id the operator states.
+  // It enables the native end-turn signal; without it the observer falls back to the screen.
+  static providerSessionFor(agent, providerSessionId = null) {
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (providerSessionId !== null) {
+      invariant(typeof providerSessionId === 'string' && UUID.test(providerSessionId), 'invalid_session', 'providerSessionId must be the provider’s session UUID.');
+      return agent.kind === 'claude' ? { kind: 'claude', sessionId: providerSessionId.toLowerCase(), source: 'operator', transcriptPath: null } : null;
+    }
+    if (agent.kind !== 'claude') return null;
+    const argv = typeof agent.args === 'string' ? agent.args.split(/\s+/) : [];
+    for (let i = 0; i < argv.length - 1; i++) if (['--resume', '-r', '--session-id'].includes(argv[i]) && UUID.test(argv[i + 1])) return { kind: 'claude', sessionId: argv[i + 1].toLowerCase(), source: 'process_args', transcriptPath: null };
+    return null;
+  }
+
+  async bind({ principalId, pane, id = null, allowKeys = false, label = null, providerSessionId = null } = {}) {
     const principal = await this.principals.get(principalId);
     invariant(principal, 'principal_not_found', 'Principal does not exist.');
     invariant(typeof principal.incarnation === 'string' && principal.incarnation.length > 0, 'legacy_migration_required', `Principal ${principalId} predates identity tracking. Run "access principal migrate --id ${principalId}" first.`);
@@ -352,6 +367,7 @@ export class SessionService {
       return this.sessions.create({
         id: sessionId, bindingId: crypto.randomBytes(8).toString('hex'), principalId, principalIncarnation: principal.incarnation ?? null, label, paneId: pane, target: target.target, panePid: target.panePid, tmuxSocket: this.tmux.socket,
         agent: { kind: agent.kind, pid: agent.pid, startedAt: agent.startedAt, comm: agent.comm }, project, allowKeys,
+        providerSession: SessionService.providerSessionFor(agent, providerSessionId),
       });
     }, { timeoutMs: 15000 }), { timeoutMs: 15000 });
     return this._public(record, { ok: true });
