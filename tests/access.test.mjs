@@ -281,7 +281,7 @@ test('the background driver returns inside the settle window and reports a faile
   for (let i = 0; i < 20 && !failed.attention.some(a => a.kind === 'operation_failed'); i++) { await new Promise(r => setTimeout(r, 250)); failed = await service.status(integrator, { jobId: submitted.job.id }); }
   assert.equal(failed.attention[0].kind, 'operation_failed');
   assert.equal(failed.attention[0].code, 'integration_conflict');
-  assert.equal(failed.next_action, 'retry');
+  assert.equal(failed.next_action, 'resubmit');
   assert.equal(failed.attempt.status, 'accepted');
 });
 
@@ -315,4 +315,106 @@ test('CLI parses the control subcommands', () => {
   assert.equal(parseArgs(['access', 'result', '--principal', 'grok', '--job', 'job-1', '--patch']).values.patch, true);
   assert.equal(parseArgs(['access', 'cancel', '--principal', 'grok', '--job', 'job-1', '--reason', 'x']).command, 'access cancel');
   assert.throws(() => parseArgs(['access', 'approve', '--principal', 'grok', '--job', 'job-1', '--kind', 'merge']), e => e.code === 'invalid_arguments');
+});
+
+test('retry starts the next attempt with feedback and dispatches again after a failed dispatch', async t => {
+  let calls = 0;
+  const runtime = new FakeHerdr(async prompt => { calls++; await writeResult(prompt, { fix: calls > 1 }); });
+  const { service, principal, project } = await setup(t, runtime);
+  const submitted = await service.submit(principal, job(project));
+  const rework = await service.status(principal, { jobId: submitted.job.id });
+  assert.equal(rework.attempt.status, 'rework');
+  assert.equal(rework.attention[0].kind, 'retry');
+  assert.equal(rework.attention[0].exhausted, false);
+  assert.equal(rework.next_action, 'retry');
+  const retried = await service.retry(principal, { jobId: submitted.job.id, feedback: 'The test expects add(3, 4) === 7; you left the subtraction in place.' });
+  assert.equal(retried.state, 'running');
+  assert.equal(retried.attempt.number, 2);
+  const promptFile = /Read "([^"]+)" completely/.exec(runtime.prompts[1])[1];
+  assert.match(await fs.readFile(promptFile, 'utf8'), /left the subtraction/, 'feedback reaches the next attempt through its prompt file');
+  const accepted = await service.status(principal, { jobId: submitted.job.id });
+  assert.equal(accepted.attempt.status, 'accepted');
+  await assert.rejects(service.retry(principal, { jobId: submitted.job.id }), e => e.code === 'retry_not_allowed');
+  assert.equal((await service.jobs.get(submitted.job.id)).retries.length, 1);
+
+  const ensure = runtime.ensureServer;
+  runtime.ensureServer = async () => { throw new Error('herdr unavailable'); };
+  const broken = await service.submit(principal, job(project, { idempotencyKey: 'req-2' }));
+  assert.equal(broken.next_action, 'retry');
+  assert.match(broken.attention[0].how, /Call retry/);
+  // The orchestrator may surface a launch failure as a thrown error or as a failed attempt; either way the job stays retryable.
+  const stillBroken = await service.retry(principal, { jobId: broken.job.id }).catch(error => error);
+  if (stillBroken instanceof Error) assert.match(stillBroken.message, /herdr unavailable/);
+  else assert.equal(stillBroken.attention[0].kind, 'retry');
+  assert.equal((await service.status(principal, { jobId: broken.job.id })).next_action, 'retry', 'a failed retry keeps the job retryable');
+  runtime.ensureServer = ensure;
+  const revived = await service.retry(principal, { jobId: broken.job.id, feedback: 'Herdr is back.' });
+  assert.equal(revived.state, 'running');
+  assert.equal((await service.jobs.get(broken.job.id)).dispatchError, null);
+  assert.equal((await service.status(principal, { jobId: broken.job.id })).attempt.status, 'accepted');
+});
+
+test('retry stops at the attempt limit and the view says to resubmit', async t => {
+  const { service, principal, project } = await setup(t, new FakeHerdr(p => writeResult(p, { fix: false })));
+  const submitted = await service.submit(principal, job(project, { maxAttempts: 1 }));
+  const view = await service.status(principal, { jobId: submitted.job.id });
+  assert.equal(view.attempt.status, 'rework');
+  assert.equal(view.attention[0].exhausted, true);
+  assert.equal(view.next_action, 'resubmit');
+  await assert.rejects(service.retry(principal, { jobId: submitted.job.id, feedback: 'again' }), e => e.code === 'attempt_limit');
+  assert.equal((await service.jobs.get(submitted.job.id)).retries, undefined, 'a refused retry is not recorded');
+});
+
+test('events lists job and run history in order with a cursor that neither loses nor repeats', async t => {
+  const { service, principal, project } = await setup(t);
+  const a = await service.submit(principal, job(project));
+  await service.status(principal, { jobId: a.job.id });
+  const b = await service.submit(principal, job(project, { idempotencyKey: 'req-2' }));
+  await service.cancel(principal, { jobId: b.job.id, reason: 'not needed' });
+  const all = await service.events(principal, {});
+  assert.equal(all.more, false);
+  assert.equal(all.jobs, 2);
+  assert.ok(['run.created', 'job.submitted'].includes(all.events[0].type));
+  assert.ok(all.events.some(e => e.type === 'attempt.state' && e.to === 'accepted' && e.job === a.job.id));
+  assert.ok(all.events.some(e => e.type === 'job.withdrawn' && e.job === b.job.id && e.reason === 'not needed'));
+  assert.ok(!all.events.some(e => e.type === 'performance.observed' || e.type === 'supervisor.started'));
+  const key = e => `${e.at}/${e.id}`;
+  for (let i = 1; i < all.events.length; i++) assert.ok(key(all.events[i - 1]) < key(all.events[i]), 'events are strictly ordered');
+  const seen = []; let since = null; let page;
+  do { page = await service.events(principal, { since, limit: 3 }); seen.push(...page.events); since = page.next_since; } while (page.more);
+  assert.deepEqual(seen.map(e => e.id), all.events.map(e => e.id));
+  const nothing = await service.events(principal, { since: all.next_since });
+  assert.equal(nothing.events.length, 0);
+  assert.equal(nothing.next_since, all.next_since);
+  const only = await service.events(principal, { jobId: b.job.id });
+  assert.ok(only.events.length > 0 && only.events.every(e => e.job === b.job.id));
+  assert.equal(only.events.at(-1).type, 'job.withdrawn');
+  await assert.rejects(service.events(principal, { jobId: 'job-missing' }), e => e.code === 'job_not_found');
+  await assert.rejects(service.events({ ...principal, id: 'dot' }, { jobId: b.job.id }), e => e.code === 'job_not_found');
+  await assert.rejects(service.events(principal, { since: 'yesterday' }), e => e.code === 'invalid_cursor');
+  await assert.rejects(service.events(principal, { limit: 0 }), e => e.code === 'invalid_job');
+});
+
+test('MCP server serves retry and events', async t => {
+  const { service, token, project } = await setup(t, new FakeHerdr(p => writeResult(p, { fix: false })));
+  const started = await startAccessServer({ service, toolTimeoutMs: 15000 });
+  t.after(started.close);
+  const call = (id, name, args) => rpc(started.endpoint, { jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }, { token });
+  const jobId = (await call(1, 'submit', job(project))).body.result.structuredContent.job.id;
+  assert.equal((await call(2, 'status', { jobId })).body.result.structuredContent.next_action, 'retry');
+  const retry = await call(3, 'retry', { jobId, feedback: 'Fix the sign.' });
+  assert.equal(retry.body.result.isError, false);
+  assert.equal(retry.body.result.structuredContent.attempt.number, 2);
+  const events = await call(4, 'events', { jobId, limit: 50 });
+  assert.equal(events.body.result.isError, false);
+  assert.ok(events.body.result.structuredContent.events.some(e => e.type === 'job.retried'));
+  assert.match(events.body.result.structuredContent.next_since, /Z\//);
+  assert.equal((await call(5, 'events', { since: 'nope' })).body.result.structuredContent.code, 'invalid_cursor');
+});
+
+test('CLI parses retry and events', () => {
+  assert.equal(parseArgs(['access', 'retry', '--principal', 'grok', '--job', 'job-1', '--feedback', 'x']).values.feedback, 'x');
+  const events = parseArgs(['access', 'events', '--principal', 'grok', '--since', '2026-01-01T00:00:00.000Z/a', '--limit', '5']);
+  assert.equal(events.command, 'access events');
+  assert.equal(events.values.limit, '5');
 });

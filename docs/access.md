@@ -2,7 +2,7 @@
 
 The access layer lets a remote personal agent (for example Grok Bot or Dot) drive the Codex and Claude CLIs that live on the HarnessOrbit host. The agent never gets a shell: it submits a job, HarnessOrbit dispatches it through the normal `dispatch → collect → verify` pipeline in an isolated Git worktree, and the agent polls for status until something needs a decision.
 
-It ships seven tools over the Model Context Protocol and the same seven as CLI subcommands: `describe`, `submit`, `status` to start and follow work, `approve`, `answer`, `cancel` to act on the attention items `status` reports, and `result` to read what the worker produced. Events (a doorbell from host to agent) come later.
+It ships nine tools over the Model Context Protocol and the same nine as CLI subcommands: `describe`, `submit`, `status` to start and follow work, `approve`, `answer`, `cancel`, `retry` to act on the attention items `status` reports, `result` to read what the worker produced, and `events` to read the ordered history of your jobs. A doorbell from host to agent comes later; until then `events` is how an agent catches up.
 
 ## Topology
 
@@ -33,8 +33,8 @@ The command prints the token once. HarnessOrbit stores only its SHA-256 in `<sta
 | --- | --- |
 | `projects` | Absolute directories (realpath) the principal may submit work for. Anything else is `project_not_allowed`. |
 | `agents` | Which local CLIs it may choose. The first one is the default. |
-| `permissions` | `submit` (also gates `answer`) and `cancel` default on; `integrate` default off (`--allow-integrate` to enable; it gates `approve`). |
-| `rateLimitPerMinute` | Token bucket for write tools (`submit`, `approve`, `answer`, `cancel`) on the MCP server. Default 60. |
+| `permissions` | `submit` (also gates `answer` and `retry`) and `cancel` default on; `integrate` default off (`--allow-integrate` to enable; it gates `approve`). |
+| `rateLimitPerMinute` | Token bucket for write tools (`submit`, `approve`, `answer`, `cancel`, `retry`) on the MCP server. Default 60. |
 
 `access principal list` and `access principal remove --id ID` manage them.
 
@@ -105,7 +105,7 @@ Input `{ jobId }`. Besides reading, it moves the job forward: a running worker i
 }
 ```
 
-States: `dispatching`, `running`, `attention`, `integrated`, `cancelled`. Attention kinds: `integrate`, `input`, `out_of_scope_write`, `retry`, `integration_recovery`, `operation_failed`. `next_action` is one of `status`, `approve`, `answer`, `retry`, `result`, `operator`, `none`. A caller polls only while `next_action` is `status`; `retry` means submit a new job with a new `idempotencyKey`; `operator` means only the host operator can continue.
+States: `dispatching`, `running`, `attention`, `integrated`, `cancelled`. Attention kinds: `integrate`, `input`, `out_of_scope_write`, `retry`, `integration_recovery`, `operation_failed`. `next_action` is one of `status`, `approve`, `answer`, `retry`, `resubmit`, `cancel`, `result`, `operator`, `none`. A caller polls only while `next_action` is `status`. `retry` means call the `retry` tool on this job; `resubmit` means the job cannot continue (attempt limit reached, or the project moved under an accepted candidate) and a new job with a new `idempotencyKey` is needed; `cancel` means cancel this job and then submit a wider one; `operator` means only the host operator can continue.
 
 ### `approve`
 
@@ -120,6 +120,21 @@ Input `{ jobId, text }` or `{ jobId, keys: ["Enter"] }`, exactly one of the two.
 ### `cancel`
 
 Input `{ jobId, reason? }`. Stops the worker and withdraws the job; nothing in the project checkout changes. A running worker is closed; an `accepted` candidate is withdrawn without integration and stops reporting the `integrate` attention; a job whose dispatch failed is closed. `already_integrated` once the patch is in the checkout, `integration_recovery_required` when integration stopped half-way. Afterwards `state` is `cancelled` and `next_action` is `none`.
+
+### `retry`
+
+Input `{ jobId, feedback? }`. Starts the next attempt of a job whose attempt ended in `rework`, `failed`, `interrupted`, or `cancelled`, through the orchestrator's `retry`: the previous worker is closed, and the feedback, the previous report, the failed check output, and the last error are handed to the new attempt in its prompt file. When the first dispatch never produced a worker (the `retry` attention after a dispatch failure), `retry` dispatches the original task again, with the feedback appended to the worker's native instructions.
+
+`retry_not_allowed` while an attempt is still active or accepted; `attempt_limit` when the job's `maxAttempts` is reached (the `retry` attention item then carries `exhausted: true` and `next_action` is `resubmit`); `scope_retry_forbidden` after an out-of-scope write, because a retry would reuse the worktree's leftover files. A refused retry is not recorded. A retry on a withdrawn job revives it.
+
+### `events`
+
+Input `{ jobId?, since?, limit? }`. Returns `{ events, more, next_since, jobs }`: the ordered history of one job, or of all the principal's jobs (the 50 most recent) when `jobId` is omitted. Two sources are merged:
+
+- the run's own event log (`run.created`, `attempt.reserved`, `attempt.state` with `from`/`to`/`errorCode`, `worker.input`, `task.collected`, `task.verified`, `task.integrated`, `task.attention`, …), reduced to the fields a caller can act on;
+- the access layer's own record: `job.submitted`, `job.dispatch_failed`, `job.answered`, `job.approved`, `job.retried`, `job.withdrawn`, `job.operation_failed`.
+
+Events are sorted oldest first by `at` and then by `id`. `next_since` is `<at>/<id>` of the last event returned; passing it back as `since` returns only later events, with no loss and no repeats even when several events share a millisecond. `limit` is 1 to 200 (default 100); `more: true` means another page is waiting. Periodic observations and supervisor bookkeeping are left out.
 
 ### `result`
 
@@ -137,9 +152,11 @@ node bin/harnessorbit.mjs access approve  --principal dot --job job-…
 node bin/harnessorbit.mjs access answer   --principal dot --job job-… --text "Two inputs only."   # or --text-file FILE, or --keys Enter,y
 node bin/harnessorbit.mjs access cancel   --principal dot --job job-… [--reason TEXT]
 node bin/harnessorbit.mjs access result   --principal dot --job job-… [--patch]
+node bin/harnessorbit.mjs access retry    --principal dot --job job-… [--feedback TEXT | --feedback-file FILE]
+node bin/harnessorbit.mjs access events   --principal dot [--job job-…] [--since CURSOR] [--limit 100]
 ```
 
-Each call returns the same JSON as the MCP tool. `status`, `approve`, and `answer` run their host stage inline, so they may take as long as the verification checks and surface a host failure as the command's error; pass `--no-advance` to `status` for a pure read.
+Each call returns the same JSON as the MCP tool. `status`, `approve`, `answer`, and `retry` run their host stage inline, so they may take as long as the verification checks and surface a host failure as the command's error; pass `--no-advance` to `status` for a pure read.
 
 ## Audit
 
@@ -147,7 +164,6 @@ Every call appends one line to `<state>/access/audit.jsonl`: time, principal, tr
 
 ## Not in this phase
 
-- A `retry` tool. A failed attempt is retried by submitting a new job; the orchestrator's `retry` with feedback stays a host-operator command for now.
-- An `events` tool and a doorbell webhook from the host to the agent.
+- A doorbell webhook from the host to the agent. `events` with `since` is the pull-side half; the push half needs a target the agent can receive on.
 - A headless runtime for hosts without Herdr.
 - OAuth. Fixed bearer headers are what Grok's custom connectors support today; OAuth is added only if a target platform requires it.

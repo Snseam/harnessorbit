@@ -136,6 +136,8 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access answer --principal ID --job ID (--text TEXT | --text-file FILE | --keys Enter,y)
   access cancel --principal ID --job ID [--reason TEXT]
   access result --principal ID --job ID [--patch]
+  access retry --principal ID --job ID [--feedback TEXT | --feedback-file FILE]
+  access events --principal ID [--job ID] [--since CURSOR] [--limit 100]
 
 Global: --state-dir PATH (outside project), --help, --json
 Results are JSON unless usage --table is selected. Keys can be comma-separated.
@@ -194,6 +196,7 @@ const optionsByCommand = {
   'access describe': ['principal'], 'access submit': ['principal', 'file'], 'access status': ['principal', 'job', 'no-advance'],
   'access approve': ['principal', 'job'], 'access answer': ['principal', 'job', 'text', 'text-file', 'keys'],
   'access cancel': ['principal', 'job', 'reason'], 'access result': ['principal', 'job', 'patch'],
+  'access retry': ['principal', 'job', 'feedback', 'feedback-file'], 'access events': ['principal', 'job', 'since', 'limit'],
 };
 const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal']);
 
@@ -330,7 +333,9 @@ export async function main(argv = process.argv.slice(2)) {
     case 'access approve':
     case 'access answer':
     case 'access cancel':
-    case 'access result': {
+    case 'access result':
+    case 'access retry':
+    case 'access events': {
       const principal = await new PrincipalStore({ root: profiles.root }).get(required('principal'));
       if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
       const service = new AccessService({ root: profiles.root, orchestrator, driver: 'inline' });
@@ -350,7 +355,9 @@ export async function main(argv = process.argv.slice(2)) {
               : tool === 'approve' ? await service.approve(principal, { jobId: required('job') })
                 : tool === 'answer' ? await service.answer(principal, { jobId: required('job'), ...(await answerInput()) })
                   : tool === 'cancel' ? await service.cancel(principal, { jobId: required('job'), reason: o.reason })
-                    : await service.result(principal, { jobId: required('job'), includePatch: !!o.patch });
+                    : tool === 'retry' ? await service.retry(principal, { jobId: required('job'), feedback: o['feedback-file'] ? await read(o['feedback-file']) : o.feedback })
+                      : tool === 'events' ? await service.events(principal, { jobId: o.job, since: o.since, ...(o.limit === undefined ? {} : { limit: Number(o.limit) }) })
+                        : await service.result(principal, { jobId: required('job'), includePatch: !!o.patch });
         await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.job?.id || o.job || null, ok: true, durationMs: Date.now() - startedAt });
         return result;
       } catch (error) {

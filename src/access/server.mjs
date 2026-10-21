@@ -6,7 +6,7 @@ import { ACCESS_VERSION, TOOL_TIMEOUT_MS, AccessAudit } from './service.mjs';
 // Grok Bot and other remote principals call it through a user-controlled tunnel or tailnet.
 export const MCP_PROTOCOL_VERSIONS = Object.freeze(['2025-06-18', '2025-03-26', '2024-11-05']);
 const MAX_BODY_BYTES = 262144;
-const WRITE_TOOLS = new Set(['submit', 'approve', 'answer', 'cancel']);
+const WRITE_TOOLS = new Set(['submit', 'approve', 'answer', 'cancel', 'retry']);
 const jobIdSchema = { type: 'string', minLength: 1, maxLength: 64, description: 'Job id returned by submit.' };
 
 export const TOOLS = Object.freeze([
@@ -60,6 +60,18 @@ export const TOOLS = Object.freeze([
     description: 'Stop the worker and withdraw the job. Nothing in the project checkout changes. An accepted candidate is withdrawn without integration.',
     inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, reason: { type: 'string', maxLength: 512 } } },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'retry', title: 'Retry a job',
+    description: 'Start the next attempt of a job whose attempt ended in rework, failed, interrupted, or cancelled, passing feedback to the worker; or dispatch again when the first dispatch failed. Bounded by the job’s maxAttempts (attempt_limit). Not allowed after an out-of-scope write: cancel and submit a wider job.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, feedback: { type: 'string', maxLength: 8000, description: 'What went wrong and what the next attempt must do differently.' } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'events', title: 'Job events',
+    description: 'List what happened to your jobs, oldest first: submissions, attempt state changes, verification, answers, approvals, retries, withdrawals, failed operations. Pass next_since from the previous call as since to get only new events. Omit jobId for all your jobs.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { jobId: jobIdSchema, since: { type: 'string', maxLength: 200, description: 'The next_since value from a previous events call.' }, limit: { type: 'integer', minimum: 1, maximum: 200, default: 100 } } },
+    annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
     name: 'result', title: 'Job result',
@@ -126,6 +138,8 @@ export async function startAccessServer({ service, principals = service?.princip
       case 'answer': return service.answer(principal, { jobId: args?.jobId, text: args?.text, keys: args?.keys });
       case 'cancel': return service.cancel(principal, { jobId: args?.jobId, reason: args?.reason });
       case 'result': return service.result(principal, { jobId: args?.jobId, includePatch: args?.includePatch ?? false });
+      case 'retry': return service.retry(principal, { jobId: args?.jobId, feedback: args?.feedback });
+      case 'events': return service.events(principal, { jobId: args?.jobId, since: args?.since, ...(args?.limit === undefined ? {} : { limit: args.limit }) });
       default: throw new OrchestratorError('unknown_tool', `Unknown tool: ${name}`);
     }
   }
