@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { Orchestrator } from '../src/orchestrator.mjs';
 import { PrincipalStore } from '../src/access/principals.mjs';
 import { AccessService } from '../src/access/service.mjs';
@@ -332,6 +333,85 @@ test('recipient replacement: the mutation intent rolls forward from the pre-imag
   assert.equal((await coop.store.inspect()).status, 'rolled_back');
   await fs.writeFile(files.recipients, good);
   assert.equal((await coop.store.inspect()).status, 'ok');
+});
+
+test('recipient cleanup window: an intent left behind after the boundary commit is removed on open with no write to any other file; a committed boundary with a non-post file stays fail-closed', async t => {
+  const { coop, grok, codex, jobId, files, control, stateRoot, project } = await setup(t);
+  await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex' });
+  const before = await control();
+  const hook = await coop.registerRecipient({ id: 'hook', kind: 'grok-native-webhook', endpoint: 'https://hooks.example.invalid/h', secretFile: '/nonexistent/secret' });
+  const after = await control();
+  const postBytes = await fs.readFile(files.recipients);
+  // 1. Exact state after the boundary commit and before the unlink: boundary == post, file == post, intent.pre == the previous boundary.
+  const intent = { schema: 'harnessorbit.coop.intent.v1', generation: after.generation, at: 'x', pre: { revision: before.boundary.recipientsRevision, sha: before.boundary.recipientsSha }, post: { revision: after.boundary.recipientsRevision, sha: after.boundary.recipientsSha, content: JSON.parse(postBytes.toString()) } };
+  await fs.writeFile(files.intent, JSON.stringify(intent));
+  const sizes = async () => [(await fs.stat(files.journal)).size, (await fs.stat(files.receipts)).size];
+  const [j0, r0] = await sizes();
+  assert.equal((await coop.store.inspect()).pendingRecovery.recipients, 'cleanup');
+  const inbox = await coop.inbox(codex, {});
+  assert.deepEqual(inbox.recovered.recipients, { cleanedUp: true, revision: after.boundary.recipientsRevision });
+  assert.equal(await fs.readFile(files.intent, 'utf8').catch(e => e.code), 'ENOENT', 'the matching intent is removed');
+  assert.deepEqual(await control(), after, 'store.json is untouched: no extra revision, no lastRecovery rewrite');
+  assert.ok(Buffer.compare(await fs.readFile(files.recipients), postBytes) === 0, 'the post-image is byte-identical');
+  assert.deepEqual(await sizes(), [j0, r0], 'no event, ack or attempt was written');
+  assert.equal((await coop.listRecipients()).recipients.find(r => r.id === 'hook').epoch, hook.epoch, 'epoch preserved');
+  assert.equal((await coop.inbox(codex, {})).recovered, null);
+  // 2. Boundary at post but the file is the pre-image (or foreign): fail-closed, nothing removed or written.
+  const preBytes = jsonFileBytes({ ...JSON.parse(postBytes.toString()), revision: before.boundary.recipientsRevision, recipients: Object.fromEntries(Object.entries(JSON.parse(postBytes.toString()).recipients).filter(([id]) => id !== 'hook')) });
+  assert.equal(sha(preBytes), before.boundary.recipientsSha, 'fixture reproduces the exact pre-image');
+  await fs.writeFile(files.intent, JSON.stringify(intent));
+  await fs.writeFile(files.recipients, preBytes);
+  await assert.rejects(coop.inbox(codex, {}), e => e.code === 'recipients_corrupt' && /although its replacement was committed/.test(e.message));
+  await assert.rejects(coop.report(grok, report(jobId, { idempotencyKey: 'blocked' })), e => e.code === 'recipients_corrupt');
+  assert.equal(JSON.parse(await fs.readFile(files.intent, 'utf8')).post.sha, intent.post.sha, 'the intent is kept for the operator');
+  assert.deepEqual(await control(), after);
+  await fs.writeFile(files.recipients, jsonFileBytes({ schemaVersion: 1, generation: after.generation, revision: after.boundary.recipientsRevision, recipients: {} }));
+  await assert.rejects(coop.inbox(codex, {}), e => e.code === 'recipients_corrupt');
+  await fs.writeFile(files.recipients, postBytes); await fs.unlink(files.intent);
+  // 3. The same window produced by a real child killed with SIGKILL right after its boundary commit.
+  const childRoot = path.join(stateRoot, '..', 'child-state');
+  const script = `
+    import fs from 'node:fs/promises';
+    import { PrincipalStore } from ${JSON.stringify(path.resolve('src/access/principals.mjs'))};
+    import { CoopService, jsonFileBytes } from ${JSON.stringify(path.resolve('src/access/coop.mjs'))};
+    import crypto from 'node:crypto';
+    const root = ${JSON.stringify(childRoot)};
+    const principals = new PrincipalStore({ root });
+    await principals.create({ id: 'codex', projects: [${JSON.stringify(project)}], agents: ['codex'], kind: 'codex' });
+    const coop = new CoopService({ root, principals });
+    await coop.store.init();
+    await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex' });
+    // Replay the protocol steps of replaceRecipients and die between the boundary commit and the unlink.
+    await coop.store.lock(async () => {
+      const state = await coop.store.open();
+      const b = state.control.boundary;
+      const recipients = { ...state.recipients, hook: { id: 'hook', kind: 'grok-native-webhook', epoch: 'feedfacefeedface', label: null, scope: { taskRefs: [], sources: [], types: [] }, createdAt: 'x', revokedAt: null, transport: { endpoint: 'https://h.example.invalid/x', secretFile: '/nonexistent' } } };
+      const content = { schemaVersion: 1, generation: state.generation, revision: b.recipientsRevision + 1, recipients };
+      const post = { revision: content.revision, sha: crypto.createHash('sha256').update(jsonFileBytes(content)).digest('hex'), content };
+      const { writeJsonAtomic } = await import(${JSON.stringify(path.resolve('src/state.mjs'))});
+      await writeJsonAtomic(coop.store.intentFile, { schema: 'harnessorbit.coop.intent.v1', generation: state.generation, at: 'x', pre: { revision: b.recipientsRevision, sha: b.recipientsSha }, post });
+      await writeJsonAtomic(coop.store.recipientsFile, content);
+      await coop.store._commit(state.control, { recipientsRevision: post.revision, recipientsSha: post.sha });
+      process.stdout.write('COMMITTED' + String.fromCharCode(10));
+      process.kill(process.pid, 'SIGKILL');
+    });
+  `;
+  const childResult = await new Promise(resolve => { const p = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] }); let out = '', err = ''; p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { err += d; }); p.on('exit', (code, signal) => resolve({ code, signal, out, err })); });
+  assert.equal(childResult.signal, 'SIGKILL', `child did not die by SIGKILL: ${childResult.err}`);
+  assert.match(childResult.out, /COMMITTED/);
+  const childDir = path.join(childRoot, 'access', 'coop');
+  const leftover = JSON.parse(await fs.readFile(path.join(childDir, 'recipients.intent.json'), 'utf8'));
+  const childControl = JSON.parse(await fs.readFile(path.join(childDir, 'store.json'), 'utf8'));
+  assert.equal(childControl.boundary.recipientsSha, leftover.post.sha, 'the crash landed after the boundary commit');
+  const lockDir = path.join(childRoot, 'locks', 'access-coop');
+  assert.ok(await fs.stat(lockDir).then(() => true, () => false), 'the killed child left its lock behind');
+  const childPrincipals = new PrincipalStore({ root: childRoot });
+  const restarted = new CoopService({ root: childRoot, principals: childPrincipals });
+  const listed = await restarted.listRecipients();   // recovers the dead lock, then opens
+  assert.deepEqual(listed.recipients.map(r => [r.id, r.epoch]).sort(), [['codex-inbox', leftover.post.content.recipients['codex-inbox'].epoch], ['hook', 'feedfacefeedface']]);
+  assert.equal(await fs.readFile(path.join(childDir, 'recipients.intent.json'), 'utf8').catch(e => e.code), 'ENOENT');
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(childDir, 'store.json'), 'utf8')), childControl, 'nothing else was written during cleanup');
+  assert.equal((await restarted.store.inspect()).status, 'ok');
 });
 
 test('rollback and loss inside the committed boundary fail closed for every file; nothing is truncated, resurrected or re-sent', async t => {

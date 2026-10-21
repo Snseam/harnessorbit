@@ -258,11 +258,18 @@ export class CoopStore {
     try { recipientsDoc = recipientsText === null ? null : JSON.parse(recipientsText); } catch { recipientsDoc = null; }
     const recipients = { sha: recipientsSha, doc: recipientsDoc, intent, action: null, problem: null };
     if (intent) {
-      const consistent = intent.schema === INTENT_SCHEMA && intent.generation === control.generation && intent.pre?.sha === b.recipientsSha && intent.pre?.revision === b.recipientsRevision && intent.post && typeof intent.post.sha === 'string' && intent.post.revision === b.recipientsRevision + 1 && intent.post.content && sha(jsonFileBytes(intent.post.content)) === intent.post.sha;
-      if (!consistent) recipients.problem = { kind: 'corrupt', detail: 'recipients.intent.json does not describe a replacement of the committed recipients file' };
-      else if (recipientsSha === intent.pre.sha) recipients.action = 'roll_forward';
-      else if (recipientsSha === intent.post.sha) recipients.action = 'complete';
-      else recipients.problem = { kind: 'corrupt', detail: 'recipients.json matches neither the pre-image nor the post-image of the pending replacement' };
+      // The intent must describe one replacement: a well-formed post-image whose revision follows its
+      // pre-image. The boundary then says how far that replacement got: still at pre (roll forward
+      // from pre, or commit from post), or already at post (committed; only the intent is left to
+      // remove). Every other combination is fail-closed.
+      const wellFormed = intent.schema === INTENT_SCHEMA && intent.generation === control.generation && intent.pre && typeof intent.pre.sha === 'string' && Number.isInteger(intent.pre.revision) && intent.post && typeof intent.post.sha === 'string' && intent.post.revision === intent.pre.revision + 1 && intent.post.content && sha(jsonFileBytes(intent.post.content)) === intent.post.sha && intent.post.content.revision === intent.post.revision && intent.post.content.generation === control.generation;
+      const boundaryAtPre = wellFormed && b.recipientsSha === intent.pre.sha && b.recipientsRevision === intent.pre.revision;
+      const boundaryAtPost = wellFormed && b.recipientsSha === intent.post.sha && b.recipientsRevision === intent.post.revision;
+      if (!wellFormed || !(boundaryAtPre || boundaryAtPost)) recipients.problem = { kind: 'corrupt', detail: 'recipients.intent.json does not describe a replacement of the committed recipients file' };
+      else if (boundaryAtPre && recipientsSha === intent.pre.sha) recipients.action = 'roll_forward';
+      else if (boundaryAtPre && recipientsSha === intent.post.sha) recipients.action = 'complete';
+      else if (boundaryAtPost && recipientsSha === intent.post.sha) recipients.action = 'cleanup';
+      else recipients.problem = { kind: 'corrupt', detail: boundaryAtPost ? 'recipients.json is not the committed post-image although its replacement was committed' : 'recipients.json matches neither the pre-image nor the post-image of the pending replacement' };
     } else if (recipientsSha !== b.recipientsSha) recipients.problem = { kind: 'rolled_back', detail: 'recipients.json differs from the committed boundary' };
     else if (!recipientsDoc || recipientsDoc.generation !== control.generation || recipientsDoc.revision !== b.recipientsRevision) recipients.problem = { kind: 'corrupt', detail: 'recipients.json does not carry the store generation and committed revision' };
     return { control, events, receipts, recipients };
@@ -291,16 +298,17 @@ export class CoopStore {
     if (examined.events.excess) { recovered.journal = { ...(recovered.journal || {}), adoptedLines: examined.events.excess }; Object.assign(patch, { eventSeq: examined.events.records.at(-1).seq, eventLines: examined.events.lines, eventBytes: examined.events.bytes, eventLastSha: examined.events.lastSha }); }
     if (examined.receipts.excess) { recovered.receipts = { ...(recovered.receipts || {}), adoptedLines: examined.receipts.excess }; Object.assign(patch, { receiptLines: examined.receipts.lines, receiptBytes: examined.receipts.bytes, receiptLastSha: examined.receipts.lastSha }); }
     let recipientsDoc = examined.recipients.doc;
-    if (examined.recipients.intent) {
-      const { intent } = examined.recipients;
-      if (examined.recipients.action === 'roll_forward') await writeJsonAtomic(this.recipientsFile, intent.post.content);
+    const { intent, action } = examined.recipients;
+    if (intent && action !== 'cleanup') {
+      if (action === 'roll_forward') await writeJsonAtomic(this.recipientsFile, intent.post.content);
       recipientsDoc = intent.post.content;
-      recovered.recipients = { [examined.recipients.action === 'roll_forward' ? 'rolledForward' : 'completed']: true, revision: intent.post.revision };
+      recovered.recipients = { [action === 'roll_forward' ? 'rolledForward' : 'completed']: true, revision: intent.post.revision };
       Object.assign(patch, { recipientsRevision: intent.post.revision, recipientsSha: intent.post.sha });
     }
-    const touched = Object.values(recovered).some(Boolean);
-    if (Object.keys(patch).length || touched) control = await this._commit(control, patch, { recovery: { at: now(), ...recovered } });
-    if (examined.recipients.intent) await fs.unlink(this.intentFile).catch(() => {});
+    if (Object.keys(patch).length || recovered.journal || recovered.receipts || recovered.recipients) control = await this._commit(control, patch, { recovery: { at: now(), ...recovered } });
+    // Cleanup window: the replacement was already committed; only the matching intent is removed.
+    // Nothing is written to store.json, the logs or the recipients file.
+    if (intent) { await fs.unlink(this.intentFile).catch(() => {}); if (action === 'cleanup') recovered.recipients = { cleanedUp: true, revision: intent.post.revision }; }
     const byId = new Map(); const byKey = new Map();
     for (const record of examined.events.records) { byId.set(record.event.eventId, record); byKey.set(`${record.idempotency.principalId}:${record.idempotency.incarnation}:${record.idempotency.keyHash}`, record); }
     const acks = new Map(); const attempts = new Map();
