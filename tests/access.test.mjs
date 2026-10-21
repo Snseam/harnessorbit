@@ -8,6 +8,7 @@ import { AccessService, ACCESS_TOOLS } from '../src/access/service.mjs';
 import { startAccessServer, TOOLS } from '../src/access/server.mjs';
 import { parseArgs } from '../bin/cao.mjs';
 import { fixture, FakeHerdr, writeResult } from './helpers.mjs';
+import { OrchestratorError } from '../src/errors.mjs';
 
 const checks = [{ name: 'math', argv: [process.execPath, '--test', 'tests/math.test.mjs'], timeoutMs: 10000 }];
 const job = (project, extra = {}) => ({
@@ -74,6 +75,7 @@ test('status advances collection and verification and reports an integrate atten
   assert.equal(status.state, 'attention');
   assert.equal(status.attempt.status, 'accepted');
   assert.equal(status.attempt.verification.checks[0].status, 'passed');
+  assert.equal(status.attempt.verification.status, 'passed');
   assert.deepEqual(status.attempt.changedPaths, ['src/math.mjs']);
   assert.equal(status.attention_pending, 1);
   assert.equal(status.attention[0].kind, 'integrate');
@@ -417,4 +419,31 @@ test('CLI parses retry and events', () => {
   const events = parseArgs(['access', 'events', '--principal', 'grok', '--since', '2026-01-01T00:00:00.000Z/a', '--limit', '5']);
   assert.equal(events.command, 'access events');
   assert.equal(events.values.limit, '5');
+});
+
+// Herdr reports a Codex worker that shows a startup prompt as blocked before any task prompt was sent.
+class StartupBlockedHerdr extends FakeHerdr {
+  async startAgent(session, name, kind, paneId) {
+    const started = await super.startAgent(session, name, kind, paneId);
+    if (!this.blockedOnce) { this.blockedOnce = true; throw new OrchestratorError('agent_not_ready', 'agent is blocked during startup and is not ready for prompts'); }
+    return started;
+  }
+}
+
+test('answer resumes a worker that blocked during startup instead of collecting it', async t => {
+  const runtime = new StartupBlockedHerdr();
+  const { service, principal, project } = await setup(t, runtime);
+  const submitted = await service.submit(principal, job(project));
+  assert.equal(submitted.state, 'attention');
+  assert.equal(submitted.attention[0].kind, 'input');
+  assert.equal(submitted.attempt.lastError.code, 'agent_not_ready');
+  assert.equal(runtime.prompts.length, 0, 'no task prompt reached the blocked worker');
+  const answered = await service.answer(principal, { jobId: submitted.job.id, keys: ['Enter'] });
+  assert.equal(answered.attention_pending, 0, 'the startup block is cleared, not reported as a failed operation');
+  assert.equal(answered.state, 'running');
+  assert.equal(runtime.prompts.length, 1, 'resume sent the task prompt after the reply');
+  const accepted = await service.status(principal, { jobId: submitted.job.id });
+  assert.equal(accepted.attempt.status, 'accepted');
+  assert.equal(accepted.attempt.verification.status, 'passed');
+  assert.equal((await service.jobs.get(submitted.job.id)).operationError, null);
 });

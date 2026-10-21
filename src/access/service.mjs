@@ -218,8 +218,15 @@ export class AccessService {
     invariant(!attempt.outsideScope?.length, 'scope_violation', 'The worker wrote outside allowedPaths. Cancel this job and submit a new one with a wider scope.', { outsideScope: attempt.outsideScope });
     await this.orchestrator.input(job.runId, job.taskId, answer ? { text: answer } : { keys });
     await this.jobs.update(job.id, j => { j.answers = [...(j.answers || []), { at: now(), attemptId: attempt.id, kind: answer ? 'text' : 'keys' }]; j.operationError = null; });
-    await this._run(job, 'answer', attempt, () => this.orchestrator.collect(job.runId, job.taskId, { waitMs: 0 }));
+    await this._run(job, 'answer', attempt, () => this._follow(job, attempt));
     return this._view(principal, await this.jobs.get(job.id));
+  }
+
+  // After a reply, observe the worker. A worker that blocked during startup never received its
+  // prompt, so the follow-up is resume (which sends it once the worker is ready), not collect.
+  _follow(job, attempt) {
+    if (!attempt.submissionStartedAt) return this.orchestrator.resume(job.runId, job.taskId);
+    return this.orchestrator.collect(job.runId, job.taskId, { waitMs: 0 });
   }
 
   // Stops the worker and withdraws the job. The orchestrator leaves accepted candidates alone,
@@ -400,6 +407,8 @@ export class AccessService {
     const answered = attempt.status === 'needs_input' && answeredSince(job, attempt);
     if (!ADVANCEABLE.has(attempt.status) && !answered) return;
     if (this.inflight.has(job.runId)) { if (this.driver === 'inline') await this.inflight.get(job.runId); return; }
+    // An answered startup block is resumed, not collected: the supervisor only collects.
+    if (answered && !attempt.submissionStartedAt) { await this._run(job, 'status', null, () => this._follow(job, attempt)).catch(() => {}); return; }
     // One supervisor step performs one stage (collect, then verify), so follow a submitted
     // candidate straight into verification instead of making the caller poll twice.
     await this._run(job, 'status', null, async () => {
@@ -431,7 +440,7 @@ export class AccessService {
       return { ...base, state: 'dispatching', attempt: null, attention: [], attention_pending: 0, next_action: 'status' };
     }
     const { attempt, task, retryAdvice } = inspected;
-    const verification = attempt.verification ? { status: attempt.verification.status || null, checks: (attempt.verification.checks || []).map(c => ({ name: c.name, status: c.status })) } : null;
+    const verification = attempt.verification ? { status: attempt.verification.passed ? 'passed' : 'failed', error: attempt.verification.error?.code || null, checks: (attempt.verification.checks || []).map(c => ({ name: c.name, status: c.status })) } : null;
     const summary = {
       id: attempt.id, number: attempt.number, status: attempt.status, createdAt: attempt.createdAt,
       lastError: attempt.lastError ? { code: attempt.lastError.code, message: String(attempt.lastError.message || '').slice(0, 512) } : null,
