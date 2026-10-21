@@ -352,13 +352,15 @@ export class CoopService {
   //  - agent.turn_finished: the provider's own native record says a turn ended (Claude Code end_turn).
   // Keyed by the caller's stable identity (screen transition or provider message id) so restarts and
   // repeated polls never emit the same signal twice.
-  async observe({ sessionId, transitionId, observedAt, fromState, toState, bindingId, via = 'observer', type = 'session.ready', signal = null } = {}) {
+  async observe({ sessionId, transitionId, observedAt, fromState, toState, bindingId, via = 'observer', type = 'session.ready', signal = null, legacy = false } = {}) {
     invariant(this.sessions, 'sessions_unavailable', 'Live sessions are not enabled on this server.');
     invariant(OBSERVER_TYPES.includes(type), 'invalid_event', 'Observer events are session.ready or agent.turn_finished.');
     const record = await this.sessions.get(sessionId).catch(() => null);
     invariant(record && record.bindingId === bindingId, 'session_not_found', `Session ${sessionId} is not bound (or was re-bound).`);
     const owner = await this.principals.get(record.principalId).catch(() => null);
     invariant(owner && owner.incarnation === record.principalIncarnation && owner.permissions.sessions === true, 'permission_denied', 'The binding’s principal is no longer current or lacks the sessions permission; not observing.');
+    // Fresh scope at emission: the bound checkout and agent must still be within the owner's current scope.
+    invariant(owner.projects.some(p => record.project === p || record.project.startsWith(`${p}${path.sep}`)) && owner.agents.includes(record.agent.kind), 'permission_denied', 'The bound session is outside its principal’s current project or agent scope; not observing.');
     invariant(typeof transitionId === 'string' && /^[0-9a-f]{16,64}$/.test(transitionId), 'invalid_event', 'transitionId must be a hex transition identity.');
     let payload;
     if (type === 'agent.turn_finished') {
@@ -372,6 +374,13 @@ export class CoopService {
     const bodyHash = sha(canonical(body));
     return this.store.lock(async () => {
       const state = await this.store.load();
+      // The first pilot keyed screen observations without a type. A migrated pending transition whose
+      // event that pilot already committed is found by that old identity and reused as it is: same
+      // UUID, same body, still a screen observation, never relabelled.
+      if (legacy && type === 'session.ready') {
+        const old = state.byKey.get(`${owner.id}:${owner.incarnation}:${sha(`observer:${record.bindingId}:${transitionId}`)}`);
+        if (old) return this._reported(old, state, { reused: true });
+      }
       const keyHash = sha(`observer:${type}:${record.bindingId}:${transitionId}`);
       const existing = state.byKey.get(`${owner.id}:${owner.incarnation}:${keyHash}`);
       if (existing) return this._reported(existing, state, { reused: true });

@@ -14,23 +14,46 @@ import { classifyScreen } from './sessions.mjs';
 //    model turn that ended with stop_reason end_turn, keyed by the provider message id (several
 //    content rows share one message id; they are one turn). A baseline is taken when observation
 //    starts, so history is never replayed; the read cursor stops at the last complete line, so a
-//    partial tail is simply read later; a shrunken file is recorded as a reset and emits nothing.
-//    Only identity and timing leave the file: never message bodies.
+//    partial tail is simply read later; a line larger than the read window is skipped as a whole
+//    with a recorded count so later turns still arrive; a shrunken file or a replaced file (new
+//    inode) is a recorded reset of the source generation, and rows older than the observation
+//    baseline are never emitted after it. Only identity and timing leave the file: never bodies.
 //
 //  - session.ready from the screen (working → ready), the fallback where no native source exists.
 //    It is labelled as a screen observation; the screen often shows "ready" between tool calls while
 //    the provider's turn is still running, so it is never presented as a turn boundary.
 //
-// In both grades the pending emission is persisted before the store is called, so a transient store
-// failure retries the same identity and a crash between event and state save re-derives it and is
-// deduplicated. Nothing here types into a session or edits any agent's hook configuration.
+// Observation state written by the first pilot (pendingTransition / lastEmittedTransitionId) is
+// migrated in place: its pending screen transition stays pending as screen-grade readiness, its
+// already committed event is found by the old identity and reused, and nothing from it ever
+// becomes native evidence. Pending emissions are persisted before the store is called, so a
+// transient failure retries the same identity and a crash between event and state save re-derives
+// it. Nothing here types into a session or edits any agent's hook configuration.
 
 const END_TURN = 'end_turn';
 const MAX_TAIL_BYTES = 8 * 1048576;
+const SCAN_CHUNK = 1048576;
+const OBSERVATION_VERSION = 2;
 
 export function claudeTranscriptPath(home, cwd, sessionId) {
   const encoded = path.resolve(cwd).replace(/[\\/]/g, '-');
   return path.join(home, 'projects', encoded, `${sessionId}.jsonl`);
+}
+
+// Brings a stored observation to the current shape without losing pending work.
+export function migrateObservation(previous, at) {
+  if (!previous) return null;
+  if (previous.version === OBSERVATION_VERSION && Array.isArray(previous.pending)) return previous;
+  const pending = [];
+  if (previous.pendingTransition?.transitionId) pending.push({ type: 'session.ready', transitionId: previous.pendingTransition.transitionId, observedAt: previous.pendingTransition.readyAt || at, legacy: true });
+  const lastEmitted = { ...(previous.lastEmitted || {}) };
+  if (previous.lastEmittedTransitionId) lastEmitted[previous.lastEmittedTransitionId] = previous.observedAt || at;
+  return {
+    version: OBSERVATION_VERSION, bindingId: previous.bindingId, lastState: previous.lastState ?? null, lastBusyAt: previous.lastBusyAt ?? null,
+    pending: Array.isArray(previous.pending) ? [...previous.pending, ...pending] : pending, lastEmitted,
+    nativeCursor: previous.nativeCursor ?? null, nativeIdentity: previous.nativeIdentity ?? null, nativeBaselineAt: previous.nativeBaselineAt ?? null, nativeResets: previous.nativeResets ?? 0, oversizedSkipped: previous.oversizedSkipped ?? 0,
+    observations: previous.observations ?? 0, emitFailures: previous.emitFailures ?? 0, migratedFrom: previous.version ?? 1,
+  };
 }
 
 export class SessionObserver {
@@ -48,10 +71,14 @@ export class SessionObserver {
   static transitionId(bindingId, busyAt) { return crypto.createHash('sha256').update(`${bindingId}:${busyAt}`).digest('hex').slice(0, 32); }
   static turnId(bindingId, providerMessageId) { return crypto.createHash('sha256').update(`${bindingId}:native:${providerMessageId}`).digest('hex').slice(0, 32); }
 
+  _fresh(record) {
+    return { version: OBSERVATION_VERSION, bindingId: record.bindingId, lastState: null, lastBusyAt: null, pending: [], lastEmitted: {}, nativeCursor: null, nativeIdentity: null, nativeBaselineAt: null, nativeResets: 0, oversizedSkipped: 0, observations: 0, emitFailures: 0 };
+  }
+
   // Emits (or re-emits) one persisted pending signal. The store deduplicates by identity.
   async _emit(record, observation, pending) {
     try {
-      const result = await this.coop.observe({ sessionId: record.id, bindingId: record.bindingId, transitionId: pending.transitionId, observedAt: pending.observedAt, type: pending.type, fromState: 'busy', toState: 'idle', signal: pending.signal || null });
+      const result = await this.coop.observe({ sessionId: record.id, bindingId: record.bindingId, transitionId: pending.transitionId, observedAt: pending.observedAt, type: pending.type, fromState: 'busy', toState: 'idle', signal: pending.signal || null, legacy: pending.legacy === true });
       observation.emitFailures = 0;
       return { eventId: result.event.eventId, reused: result.reused, transitionId: pending.transitionId, type: pending.type, done: true };
     } catch (error) {
@@ -61,36 +88,78 @@ export class SessionObserver {
     }
   }
 
+  // Finds the first newline at or after `from`, scanning in bounded chunks. Returns its absolute
+  // offset or -1 when the file ends first.
+  async _nextNewline(handle, from, size) {
+    let position = from;
+    const chunk = Buffer.alloc(SCAN_CHUNK);
+    while (position < size) {
+      const { bytesRead } = await handle.read(chunk, 0, Math.min(SCAN_CHUNK, size - position), position);
+      if (!bytesRead) return -1;
+      const index = chunk.subarray(0, bytesRead).indexOf(0x0a);
+      if (index >= 0) return position + index;
+      position += bytesRead;
+    }
+    return -1;
+  }
+
   // Reads new complete lines of the Claude transcript since the cursor. Returns end_turn message
-  // identities (deduplicated), the new cursor, and whether the file shrank or disappeared.
-  async _nativeTurns(record, observation) {
+  // identities (deduplicated), the new cursor, and what happened to the source.
+  async _nativeTurns(record, observation, at) {
     const provider = record.providerSession;
     const file = provider.transcriptPath || claudeTranscriptPath(this.claudeHome, record.project, provider.sessionId);
     let stat;
-    try { stat = await fs.stat(file); } catch { return { status: 'missing', turns: [], cursor: observation.nativeCursor ?? null }; }
-    if (observation.nativeCursor === null || observation.nativeCursor === undefined) return { status: 'baseline', turns: [], cursor: stat.size }; // no history replay
-    if (stat.size < observation.nativeCursor) return { status: 'reset', turns: [], cursor: stat.size };
-    if (stat.size === observation.nativeCursor) return { status: 'unchanged', turns: [], cursor: stat.size };
-    const length = Math.min(stat.size - observation.nativeCursor, MAX_TAIL_BYTES);
-    const handle = await fs.open(file, 'r');
-    let buffer;
-    try { buffer = Buffer.alloc(length); await handle.read(buffer, 0, length, observation.nativeCursor); } finally { await handle.close(); }
-    const text = buffer.toString('utf8');
-    const lastNewline = text.lastIndexOf('\n');
-    if (lastNewline < 0) return { status: 'partial', turns: [], cursor: observation.nativeCursor }; // a torn line is read next time
-    const complete = text.slice(0, lastNewline + 1);
-    const consumed = Buffer.byteLength(complete);
-    const turns = new Map();
-    for (const line of complete.split('\n')) {
-      if (!line) continue;
-      let row; try { row = JSON.parse(line); } catch { continue; }
-      if (row?.type !== 'assistant' || row.isSidechain || row?.message?.stop_reason !== END_TURN) continue;
-      if (typeof row.sessionId === 'string' && row.sessionId !== provider.sessionId) continue;
-      const messageId = row.message?.id;
-      if (typeof messageId !== 'string' || !messageId) continue;
-      if (!turns.has(messageId)) turns.set(messageId, { providerMessageId: messageId, providerTimestamp: typeof row.timestamp === 'string' ? row.timestamp : null });
+    try { stat = await fs.stat(file); } catch { return { status: 'missing', turns: [], cursor: observation.nativeCursor ?? null, identity: observation.nativeIdentity ?? null, baselineAt: observation.nativeBaselineAt ?? null }; }
+    const identity = { dev: stat.dev, ino: stat.ino };
+    const sameIdentity = !observation.nativeIdentity || (observation.nativeIdentity.dev === identity.dev && observation.nativeIdentity.ino === identity.ino);
+    if (observation.nativeCursor === null || observation.nativeCursor === undefined) return { status: 'baseline', turns: [], cursor: stat.size, identity, baselineAt: at }; // no history replay
+    const baselineAt = observation.nativeBaselineAt ?? at;
+    if (!sameIdentity) {
+      // A replaced file is a new source generation: read it from its start, but only rows written
+      // after observation began are candidates; older rows are history and are never emitted.
+      return { ...(await this._readRows(file, 0, stat.size, provider, baselineAt, observation)), status: 'reset', identity, baselineAt, reset: 'identity_changed' };
     }
-    return { status: 'read', turns: [...turns.values()], cursor: observation.nativeCursor + consumed };
+    if (stat.size < observation.nativeCursor) return { status: 'reset', turns: [], cursor: stat.size, identity, baselineAt, reset: 'shrunk' };
+    if (stat.size === observation.nativeCursor) return { status: 'unchanged', turns: [], cursor: stat.size, identity, baselineAt };
+    return { ...(await this._readRows(file, observation.nativeCursor, stat.size, provider, baselineAt, observation)), identity, baselineAt };
+  }
+
+  async _readRows(file, cursor, size, provider, baselineAt, observation) {
+    const length = Math.min(size - cursor, MAX_TAIL_BYTES);
+    const handle = await fs.open(file, 'r');
+    try {
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, cursor);
+      const text = buffer.toString('utf8');
+      let lastNewline = text.lastIndexOf('\n');
+      let skipped = 0;
+      if (lastNewline < 0) {
+        if (length < MAX_TAIL_BYTES) return { status: 'partial', turns: [], cursor }; // an ordinary torn line; read it next time
+        // One line is larger than the whole read window. Skip it as a unit, keeping the bound, and
+        // record that a line was skipped so the gap is explicit.
+        const newline = await this._nextNewline(handle, cursor + length, size);
+        if (newline < 0) return { status: 'partial', turns: [], cursor, oversized: true }; // still being written
+        observation.oversizedSkipped = (observation.oversizedSkipped || 0) + 1;
+        return { status: 'skipped_oversized', turns: [], cursor: newline + 1, skipped: 1 };
+      }
+      const complete = text.slice(0, lastNewline + 1);
+      const consumed = Buffer.byteLength(complete);
+      const turns = new Map();
+      for (const line of complete.split('\n')) {
+        if (!line) continue;
+        if (line.length > MAX_TAIL_BYTES) { skipped += 1; continue; }
+        let row; try { row = JSON.parse(line); } catch { continue; }
+        if (row?.type !== 'assistant' || row.isSidechain || row?.message?.stop_reason !== END_TURN) continue;
+        if (typeof row.sessionId === 'string' && row.sessionId !== provider.sessionId) continue;
+        const messageId = row.message?.id;
+        if (typeof messageId !== 'string' || !messageId) continue;
+        const timestamp = typeof row.timestamp === 'string' ? row.timestamp : null;
+        if (baselineAt && timestamp && timestamp < baselineAt) continue; // history relative to observation start
+        if (!turns.has(messageId)) turns.set(messageId, { providerMessageId: messageId, providerTimestamp: timestamp });
+      }
+      if (skipped) observation.oversizedSkipped = (observation.oversizedSkipped || 0) + skipped;
+      return { status: 'read', turns: [...turns.values()], cursor: cursor + consumed, skipped };
+    } finally { await handle.close(); }
   }
 
   // One pass over every binding. Returns what happened so a CLI one-shot can print it.
@@ -98,19 +167,21 @@ export class SessionObserver {
     const results = [];
     for (const record of await this.sessions.sessions.list()) {
       if (typeof record.bindingId !== 'string') { results.push({ sessionId: record.id, skipped: 'legacy_binding' }); continue; }
+      const at = new Date().toISOString();
       const previous = await readJson(this._file(record.id), { optional: true });
-      const observation = previous && previous.bindingId === record.bindingId ? previous : { bindingId: record.bindingId, lastState: null, lastBusyAt: null, pending: [], lastEmitted: {}, nativeCursor: null, nativeResets: 0, observations: 0, emitFailures: 0 };
+      const observation = previous && previous.bindingId === record.bindingId ? migrateObservation(previous, at) : this._fresh(record);
       let state;
       try { await this.sessions._identity(record); state = classifyScreen(record.agent.kind, await this.sessions.tmux.captureScreen(record.paneId)).state; }
       catch (error) { results.push({ sessionId: record.id, skipped: error.code || 'identity_failed' }); continue; }
-      const at = new Date().toISOString();
       const native = record.providerSession?.kind === 'claude' && typeof record.providerSession.sessionId === 'string';
       let nativeStatus = null;
       if (native) {
-        const read = await this._nativeTurns(record, observation);
+        const read = await this._nativeTurns(record, observation, at);
         nativeStatus = read.status;
         if (read.status === 'reset') observation.nativeResets += 1;
+        if (read.status === 'baseline') observation.nativeBaselineAt = read.baselineAt;
         observation.nativeCursor = read.cursor;
+        observation.nativeIdentity = read.identity ?? observation.nativeIdentity;
         for (const turn of read.turns) {
           const transitionId = SessionObserver.turnId(record.bindingId, turn.providerMessageId);
           if (observation.lastEmitted[transitionId] || observation.pending.some(p => p.transitionId === transitionId)) continue;
