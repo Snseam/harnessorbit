@@ -33,6 +33,9 @@ import { WorkflowRegistry } from '../src/workflows.mjs';
 import { runInternalBenchmark, createInternalBenchmarkPlan } from '../src/internal-benchmark.mjs';
 import { replayShadowTraces } from '../src/shadow-replay.mjs';
 import { DeterministicDecisionProvider, JevDecisionProvider } from '../src/decision-provider.mjs';
+import { PrincipalStore } from '../src/access/principals.mjs';
+import { AccessService, AccessAudit } from '../src/access/service.mjs';
+import { startAccessServer } from '../src/access/server.mjs';
 
 export const help = `HarnessOrbit 0.1.0
 
@@ -121,6 +124,15 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   gateway stop --id ID
   gateway list
 
+  access principal create --id ID --project PATH[,PATH] [--agents codex,claude]
+             [--allow-integrate] [--rate-limit 60] [--label TEXT]   (prints the token once)
+  access principal list
+  access principal remove --id ID
+  access serve [--port 0] [--host 127.0.0.1]   (foreground MCP server; Ctrl-C stops it)
+  access describe --principal ID
+  access submit --principal ID --file JOB.json
+  access status --principal ID --job ID [--no-advance]
+
 Global: --state-dir PATH (outside project), --help, --json
 Results are JSON unless usage --table is selected. Keys can be comma-separated.
 dispatch submits once; collect waits without resubmitting.
@@ -172,8 +184,12 @@ const optionsByCommand = {
   'monitor start': ['project', 'run', 'all', 'open', 'id', 'port', 'coordinator', 'codex-home', 'claude-home'],
   'monitor status': ['id'], 'monitor stop': ['id'],
   'monitor snapshot': ['project', 'run', 'all', 'coordinator', 'codex-home', 'claude-home'],
+  'access principal create': ['id', 'project', 'agents', 'allow-integrate', 'rate-limit', 'label'],
+  'access principal list': [], 'access principal remove': ['id'],
+  'access serve': ['port', 'host'],
+  'access describe': ['principal'], 'access submit': ['principal', 'file'], 'access status': ['principal', 'job', 'no-advance'],
 };
-const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness']);
+const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal']);
 
 export function parseArgs(argv) {
   const values = {};
@@ -187,7 +203,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -281,6 +297,46 @@ export async function main(argv = process.argv.slice(2)) {
     case 'monitor start': {
       const monitor = await new MonitorManager({ root: profiles.root }).start({ ...await monitorScope(), id: o.id || 'default', port: o.port === undefined ? 0 : Number(o.port) });
       return { ...monitor, browserOpened: o.open ? await openMonitor(monitor.url) : false };
+    }
+    case 'access principal create': {
+      const projects = required('project').split(',').map(value => path.resolve(value.trim())).filter(Boolean);
+      const rateLimit = o['rate-limit'] === undefined ? 60 : Number(o['rate-limit']);
+      const created = await new PrincipalStore({ root: profiles.root }).create({
+        id: required('id'), projects, agents: o.agents ? o.agents.split(',').map(value => value.trim()) : ['codex', 'claude'],
+        permissions: { integrate: !!o['allow-integrate'] }, rateLimitPerMinute: rateLimit, label: o.label || null,
+      });
+      return { ...created, note: 'Store this token now; HarnessOrbit keeps only its hash and cannot show it again.' };
+    }
+    case 'access principal list': return { principals: await new PrincipalStore({ root: profiles.root }).list() };
+    case 'access principal remove': return { id: required('id'), removed: await new PrincipalStore({ root: profiles.root }).remove(o.id) };
+    case 'access serve': {
+      const service = new AccessService({ root: profiles.root, orchestrator, driver: 'background' });
+      const port = o.port === undefined ? 0 : Number(o.port);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new OrchestratorError('invalid_arguments', '--port must be an integer from 0 to 65535.');
+      const started = await startAccessServer({ service, port, host: o.host || '127.0.0.1' });
+      process.stdout.write(`${JSON.stringify({ ok: true, data: { endpoint: started.endpoint, port: started.port, pid: process.pid, note: 'Serving. Expose the endpoint through your own tunnel or tailnet; callers need a principal token.' } })}\n`);
+      await new Promise(resolve => { const stop = () => { started.close(); resolve(); }; process.once('SIGINT', stop); process.once('SIGTERM', stop); });
+      return { stopped: true, endpoint: started.endpoint };
+    }
+    case 'access describe':
+    case 'access submit':
+    case 'access status': {
+      const principal = await new PrincipalStore({ root: profiles.root }).get(required('principal'));
+      if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
+      const service = new AccessService({ root: profiles.root, orchestrator, driver: 'inline' });
+      const audit = new AccessAudit({ root: profiles.root });
+      const tool = command.slice('access '.length);
+      const startedAt = Date.now();
+      try {
+        const result = tool === 'describe' ? service.describe(principal)
+          : tool === 'submit' ? await service.submit(principal, await readProfile(required('file')))
+            : await service.status(principal, { jobId: required('job'), advance: !o['no-advance'] });
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.job?.id || o.job || null, ok: true, durationMs: Date.now() - startedAt });
+        return result;
+      } catch (error) {
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: o.job || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
+        throw error;
+      }
     }
     case 'monitor status': return new MonitorManager({ root: profiles.root }).status(o.id || 'default');
     case 'monitor stop': return new MonitorManager({ root: profiles.root }).stop(o.id || 'default');
