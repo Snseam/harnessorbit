@@ -12,7 +12,7 @@ import { JobStore, JOB_TASK_ID } from './jobs.mjs';
 export const ACCESS_SCHEMA_VERSION = 1;
 export const ACCESS_VERSION = '0.4.0';
 export const TOOL_TIMEOUT_MS = 20000;
-export const ACCESS_TOOLS = Object.freeze(['describe', 'submit', 'status', 'approve', 'answer', 'cancel', 'retry', 'events', 'sessions', 'session_status', 'session_send', 'session_read', 'session_unbind', 'memory_recall', 'memory_begin', 'memory_checkpoint', 'result']);
+export const ACCESS_TOOLS = Object.freeze(['describe', 'submit', 'status', 'approve', 'answer', 'cancel', 'retry', 'events', 'sessions', 'session_status', 'session_send', 'session_read', 'session_unbind', 'memory_recall', 'memory_begin', 'memory_checkpoint', 'coop_report', 'coop_inbox', 'coop_ack', 'result']);
 export const MAX_EVENTS = 200;
 const MAX_EVENT_JOBS = 50;
 // Run events a principal has no use for: periodic observations and supervisor bookkeeping.

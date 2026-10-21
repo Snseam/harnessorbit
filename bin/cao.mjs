@@ -39,6 +39,8 @@ import { startAccessServer } from '../src/access/server.mjs';
 import { SessionService, SessionStore, Tmux } from '../src/access/sessions.mjs';
 import { MemoryService, memoryProviderFromEnv } from '../src/access/memory.mjs';
 import { JobStore } from '../src/access/jobs.mjs';
+import { CoopService } from '../src/access/coop.mjs';
+import { SessionObserver } from '../src/access/observer.mjs';
 
 export const help = `HarnessOrbit 0.1.0
 
@@ -155,6 +157,15 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access memory begin --principal ID (--session ID | --job ID) --operation ID
   access memory checkpoint --principal ID (--session ID | --job ID) --operation ID [--file CHECKPOINT.json]
   access memory pending [--principal ID]
+  access recipient register --id ID --kind inbox --principal ID [--task-refs harnessorbit:job/,…] [--sources ID,…] [--types work.reported,…] [--label TEXT]
+  access recipient register --id ID --kind grok-native-webhook --endpoint https://… --secret-file FILE [scopes…]
+  access recipient register --id ID --kind codex-app-server --socket PATH --thread ID [scopes…]
+  access recipient list | access recipient revoke --id ID
+  access coop report --principal ID --key KEY --type TYPE --task REF [--payload-file FILE] [--evidence-file FILE] [--correlation ID] [--causation EVENT-UUID]
+  access coop inbox --principal ID [--cursor N] [--limit 50]
+  access coop ack --principal ID --event UUID --epoch EPOCH
+  access coop deliveries                            (operator: pending non-inbox deliveries)
+  access observe [--once] [--interval-ms 5000] [--tmux-socket NAME]   (emit agent.turn_finished on observed working → ready)
   (memory provider: HARNESSORBIT_MEMORY_PROVIDER=memy-handoff-cli [HARNESSORBIT_MEMY_BIN=memy]; unset = unconfigured)
 
 Global: --state-dir PATH (outside project), --help, --json
@@ -227,8 +238,13 @@ const optionsByCommand = {
   'access memory begin': ['principal', 'session', 'job', 'operation'],
   'access memory checkpoint': ['principal', 'session', 'job', 'operation', 'file'],
   'access memory pending': ['principal'],
+  'access recipient register': ['id', 'kind', 'principal', 'endpoint', 'secret-file', 'socket', 'thread', 'task-refs', 'sources', 'types', 'label'],
+  'access recipient list': [], 'access recipient revoke': ['id'],
+  'access coop report': ['principal', 'key', 'type', 'task', 'payload-file', 'evidence-file', 'conversation', 'correlation', 'causation'],
+  'access coop inbox': ['principal', 'cursor', 'limit'], 'access coop ack': ['principal', 'event', 'epoch'], 'access coop deliveries': [],
+  'access observe': ['once', 'interval-ms', 'tmux-socket'],
 };
-const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory']);
+const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop']);
 
 export function parseArgs(argv) {
   const values = {};
@@ -242,7 +258,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -401,9 +417,10 @@ export async function main(argv = process.argv.slice(2)) {
       const sessions = new SessionService({ root: profiles.root, principals: service.principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
       const provider = memoryProviderFromEnv();
       const memory = new MemoryService({ root: profiles.root, provider, principals: service.principals, sessions: sessions.sessions, jobs: service.jobs, orchestrator });
+      const coop = new CoopService({ root: profiles.root, principals: service.principals, jobs: service.jobs, sessions: sessions.sessions, orchestrator });
       const port = o.port === undefined ? 0 : Number(o.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new OrchestratorError('invalid_arguments', '--port must be an integer from 0 to 65535.');
-      const started = await startAccessServer({ service, sessions, memory, port, host: o.host || '127.0.0.1' });
+      const started = await startAccessServer({ service, sessions, memory, coop, port, host: o.host || '127.0.0.1' });
       process.stdout.write(`${JSON.stringify({ ok: true, data: { endpoint: started.endpoint, port: started.port, pid: process.pid, memoryProvider: provider.name, note: 'Serving. Expose the endpoint through your own tunnel or tailnet; callers need a principal token.' } })}\n`);
       await new Promise(resolve => { const stop = () => { started.close(); resolve(); }; process.once('SIGINT', stop); process.once('SIGTERM', stop); });
       return { stopped: true, endpoint: started.endpoint };
@@ -469,6 +486,47 @@ export async function main(argv = process.argv.slice(2)) {
         return result;
       } catch (error) {
         await audit.record({ principalId: principal.id, transport: 'cli', tool: `memory_${tool}`, jobId: o.job || null, sessionId: o.session || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
+        throw error;
+      }
+    }
+    case 'access recipient register':
+    case 'access recipient list':
+    case 'access recipient revoke':
+    case 'access coop report':
+    case 'access coop inbox':
+    case 'access coop ack':
+    case 'access coop deliveries':
+    case 'access observe': {
+      const principals = new PrincipalStore({ root: profiles.root });
+      const sessionStore = new SessionStore({ root: profiles.root });
+      const coop = new CoopService({ root: profiles.root, principals, jobs: new JobStore({ root: profiles.root }), sessions: sessionStore, orchestrator });
+      const split = value => (value === undefined ? [] : String(value).split(',').map(v => v.trim()).filter(Boolean));
+      if (command === 'access recipient register') return coop.registerRecipient({ id: required('id'), kind: required('kind'), principalId: o.principal || null, endpoint: o.endpoint || null, secretFile: o['secret-file'] ? path.resolve(o['secret-file']) : null, socketPath: o.socket ? path.resolve(o.socket) : null, threadId: o.thread || null, taskRefs: split(o['task-refs']), sources: split(o.sources), types: split(o.types), label: o.label || null });
+      if (command === 'access recipient list') return coop.listRecipients();
+      if (command === 'access recipient revoke') return coop.revokeRecipient(required('id'));
+      if (command === 'access coop deliveries') return { deliveries: await coop.pendingDeliveries() };
+      if (command === 'access observe') {
+        const sessions = new SessionService({ root: profiles.root, principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
+        const observer = new SessionObserver({ root: profiles.root, sessions, coop, intervalMs: o['interval-ms'] === undefined ? 5000 : Number(o['interval-ms']), log: entry => process.stderr.write(`${JSON.stringify(entry)}\n`) });
+        if (o.once) return { results: await observer.tick() };
+        process.once('SIGINT', () => observer.stop()); process.once('SIGTERM', () => observer.stop());
+        await observer.run();
+        return { stopped: true };
+      }
+      const principal = await principals.get(required('principal'));
+      if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
+      const audit = new AccessAudit({ root: profiles.root });
+      const tool = `coop_${command.slice('access coop '.length)}`;
+      const startedAt = Date.now();
+      try {
+        let result;
+        if (tool === 'coop_report') result = await coop.report(principal, { idempotencyKey: required('key'), type: required('type'), task: { ref: required('task') }, ...(o['payload-file'] ? { payload: await readProfile(o['payload-file']) } : {}), ...(o['evidence-file'] ? { evidenceRefs: await readProfile(o['evidence-file']) } : {}), conversationRef: o.conversation, correlationId: o.correlation, causationId: o.causation }, { via: 'cli' });
+        else if (tool === 'coop_inbox') result = await coop.inbox(principal, { ...(o.cursor === undefined ? {} : { cursor: Number(o.cursor) }), ...(o.limit === undefined ? {} : { limit: Number(o.limit) }) });
+        else result = await coop.ack(principal, { eventId: required('event'), epoch: required('epoch') });
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.event?.eventId || o.event || null, ok: true, durationMs: Date.now() - startedAt });
+        return result;
+      } catch (error) {
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: o.event || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
         throw error;
       }
     }

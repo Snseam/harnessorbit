@@ -2,7 +2,7 @@
 
 The access layer lets a remote personal agent (for example Grok Bot or Dot) drive the Codex and Claude CLIs that live on the HarnessOrbit host. The agent never gets a shell: it submits a job, HarnessOrbit dispatches it through the normal `dispatch → collect → verify` pipeline in an isolated Git worktree, and the agent polls for status until something needs a decision.
 
-It ships sixteen tools over the Model Context Protocol and the same as CLI subcommands. Jobs: `describe`, `submit`, `status` to start and follow work, `approve`, `answer`, `cancel`, `retry` to act on the attention items `status` reports, `result` to read what the worker produced, and `events` to read the ordered history. Live sessions: `sessions`, `session_status`, `session_send`, `session_read`, `session_unbind` to continue an existing Claude Code or Codex CLI session the operator bound (see [Live sessions](#live-sessions)). Memory: `memory_recall` and `memory_checkpoint` (see [Memory](#memory)). A doorbell from host to agent comes later; until then `events` is how an agent catches up.
+It ships twenty tools over the Model Context Protocol and the same as CLI subcommands. Jobs: `describe`, `submit`, `status` to start and follow work, `approve`, `answer`, `cancel`, `retry` to act on the attention items `status` reports, `result` to read what the worker produced, and `events` to read the ordered history. Live sessions: `sessions`, `session_status`, `session_send`, `session_read`, `session_unbind` to continue an existing Claude Code or Codex CLI session the operator bound (see [Live sessions](#live-sessions)). Memory: `memory_recall`, `memory_begin`, `memory_checkpoint` (see [Memory](#memory)). Cooperation events: `coop_report`, `coop_inbox`, `coop_ack` (see [Cooperation events](#cooperation-events)).
 
 ## Topology
 
@@ -198,6 +198,59 @@ The target checkout and agent come from the binding or job record, never from th
 - Evidence you supply is attributed to you (`issuer: principal:<id>`) and never upgraded. `verified` and `integrated` labels are accepted only when HarnessOrbit's own job state agrees; live sessions can only carry `planned` or `reported`. HarnessOrbit adds its own machine evidence for jobs (`harnessorbit:attempt/<id>` with checks and patch sha256, `harnessorbit:integration/<id>`); it records a patch hash, not a commit.
 - Provider receipts are validated per command (UUID operation id, UUID project id, write generation, UUID memory ids); a blank or mismatched success envelope is a protocol error, never a save.
 - `access memory pending` lists pending operations for the operator.
+
+## Cooperation events
+
+Cooperation events let a bound agent say what happened to a task it owns, and let other registered agents read and acknowledge that durably. They complement polling: a coordinator drains its inbox on its heartbeat (or, where a transport adapter exists, is woken) instead of asking for status. Events are claims by their source; the bus transports them and upgrades nothing.
+
+### Envelope (`harnessorbit.coop.event.v1`)
+
+```json
+{
+  "schema": "harnessorbit.coop.event.v1",
+  "eventId": "<server UUID>", "seq": 12, "createdAt": "…",
+  "type": "work.reported",
+  "source": { "principalId": "grok", "incarnation": "…", "kind": "grok", "via": "mcp", "binding": null },
+  "task": { "ref": "harnessorbit:job/job-…", "kind": "job", "id": "job-…", "intentRevision": 1 },
+  "conversationRef": "room-7", "correlationId": "thread-41", "causationId": "<eventId or null>", "hop": 0,
+  "payload": { "summary": "…", "changed": ["src/math.mjs"] },
+  "evidenceRefs": [{ "label": "reported", "ref": "worker:output", "issuer": "principal:grok" }]
+}
+```
+
+- `source` is the authenticated principal (id, incarnation, kind) and how it reported; callers cannot set it. `task.ref` must be a job the principal owns or a session bound to it, re-checked against its current scope. `intentRevision` is the job's attempt number.
+- Reportable types: `work.reported`, `task.blocked`, `verification.requested`, `question.asked`, `handoff.offered`. `agent.turn_finished` / `session.ready` come only from the observer; `verification.passed`, `verification.failed`, `task.integrated` only from a verifier (`authority_denied` otherwise). Evidence refs from callers may be `planned` or `reported` and are issued as `principal:<id>`.
+- `payload` is plain JSON: depth ≤ 3, strings ≤ 2000 characters, ≤ 8 KiB. `causationId` must name a recorded event; chains are bounded to 8 hops.
+
+### Storage and commit boundary
+
+`<state>/access/coop/journal.jsonl` is append-only; one line is one commit holding the envelope, the idempotency record (principal incarnation + key hash + body hash) and the deliveries frozen with each recipient's registration epoch, with a per-line sha256. A crash while appending leaves at most one torn tail line, which is reported on load and truncated under the store lock before the next append; nothing earlier is ever rewritten. `receipts.jsonl` records acks and dispatch attempts the same way. Sequence numbers come from the journal, never from wall-clock time; a restart replays the same UUIDs, order and payloads.
+
+### Tools
+
+- `coop_report({ idempotencyKey, type, task: { ref }, payload?, evidenceRefs?, conversationRef?, correlationId?, causationId? })`: same key and body → the same event (`reused: true`); same key, different body → `event_conflict`. Permission and scope are read from the store again inside the lock.
+- `coop_inbox({ cursor?, limit? })`: events delivered to the inbox the operator registered for your current incarnation, oldest first after `cursor` (a sequence). Reading never acknowledges; `nextCursor`, `more`, `retentionFloor` and an explicit `gap` are returned. Each event carries `delivery.epoch` and whether that epoch is still your current registration.
+- `coop_ack({ eventId, epoch })`: idempotent receipt for an event delivered to you under that epoch. It is not verification, approval or integration. Another consumer's event, an unknown event or another epoch is refused.
+
+### Recipients (operator only)
+
+```sh
+node bin/harnessorbit.mjs access recipient register --id codex-inbox --kind inbox --principal codex --types work.reported,task.blocked,agent.turn_finished
+node bin/harnessorbit.mjs access recipient register --id grok-hook --kind grok-native-webhook --endpoint https://… --secret-file /path/0600 --types work.reported
+node bin/harnessorbit.mjs access recipient register --id codex-desktop --kind codex-app-server --socket /path/control.sock --thread <thread-id>
+node bin/harnessorbit.mjs access recipient list | revoke --id ID
+node bin/harnessorbit.mjs access coop deliveries
+```
+
+A registration fixes kind, destination, allowed sources, task-ref prefixes and types, and gets an epoch. Re-registering an id (after revoking it) yields a new epoch; deliveries frozen under the old epoch are reported `revoked`, never redirected. An inbox is bound to a principal incarnation; a recreated principal id has no inbox until the operator registers one. Non-inbox kinds are recorded as pending deliveries for a dispatcher; dispatch outcomes are `accepted`, `unknown` (the transport may have delivered; reconcile by `eventId` before any repeated side effect), `failed`, `revoked`, `dead`. The webhook and app-server transports themselves are the next milestone; until then those deliveries stay pending.
+
+### Automatic end-turn signal
+
+`access observe [--once] [--interval-ms 5000]` watches every bound session's screen (never typing, never editing agent hook configuration). When a session it saw working becomes ready again, it records one `agent.turn_finished` event attributed to the binding's principal with `source.via: "observer"`. The transition identity is derived from the binding id and the moment the working stretch began, persisted before the event is emitted, so a crash between event and state save, a transient store failure or a repeated poll cannot emit it twice or lose it (a pending transition is retried until the store confirms it). An initial idle snapshot is never a transition. The payload names the observation and says explicitly that it is not task completion and not verification; no screen text leaves the host.
+
+### Verification level
+
+Fixture: scripted clocks, a fake pane, fake Herdr; the acceptance matrix items covered are torn-tail recovery, restart replay with equal timestamps, same key with a different body, independent consumers, epoch changes, principal recreation, revocation while waiting for the lock, unknown dispatch outcomes, caller authority limits, observer dedup across transient failure and crash. Not covered: a real Grok webhook, a real Codex runtime, a model-driven session.
 
 ## Identity and migration
 

@@ -22,7 +22,13 @@ Verification level of stage 1: fixture and real-tmux tests (see "Verification le
 
 ## Stage 2: durable cooperation events and wakeup
 
-Coordinator contract: `events-phase2-contract.md` in the collaboration workspace (outside this repository). Summary of what it asks for, so this document stays self-contained:
+Coordinator contract: `events-phase2-contract.md` in the collaboration workspace (outside this repository).
+
+Milestone A (this branch, after the stage-1 commit): the durable store (`src/access/coop.mjs`), `coop_report` / `coop_inbox` / `coop_ack` over MCP and CLI, operator recipient registration for `inbox`, `grok-native-webhook` and `codex-app-server` kinds (destinations fixed by the operator, epoch per registration, pending-delivery listing and durable attempt outcomes), and the session observer (`src/access/observer.mjs`) that records `agent.turn_finished` on an observed working → ready transition with a persisted transition identity. Fixture evidence: `tests/access-coop.test.mjs`, including the coordinator's two crash classes (torn journal tail before append; observer transient failure and crash between event and state save).
+
+Milestone B (next): transport adapters and a dispatcher for pending non-inbox deliveries. Grok: exact operator-registered HTTPS endpoint with `Authorization: Bearer` from a 0600 secret file, no redirects, bounded response, HTTP acceptance recorded as `accepted` but never as an ack. Codex: the owning app-server runtime over WebSocket-on-Unix-socket with `turn/start` carrying `toolOutput { name: "orbit_event", namespace: "harnessorbit" }`; the default managed daemon's `notLoaded` desktop thread answers `wrong_runtime` and the delivery stays pending for heartbeat draining; never `turn/start` or resume on that daemon. Both adapters are tested against fake receivers first and reported as fixtures until a real probe is observed.
+
+Summary of the contract, so this document stays self-contained:
 
 - **Envelope**: schema version, server-generated UUID `eventId`, monotonic sequence, `createdAt`, type, authenticated source identity (principal incarnation / participant binding), `taskId`, task `intentRevision`, `conversationRef`, `correlationId`, `causationId`, bounded typed payload, `evidenceRefs`. No caller-controlled source or verification authority.
 - **report(idempotencyKey, target, type, payload)**: one commit boundary for envelope + idempotency record + recipient deliveries (or a write-ahead protocol with a tested crash point). Same key and body → same UUID; changed body → conflict.
