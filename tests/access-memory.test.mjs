@@ -513,6 +513,7 @@ test('gate regressions: memory operations re-check the current agent scope and s
 test('memory authority is fixed at begin: the orchestrator carrier needs the host flag and an event-based attestation, never a borrowed agent grant', async t => {
   const { memory, principal, access, project, stateRoot, principals, orchestrator, provider } = await setup(t);
   const coop = new CoopService({ root: stateRoot, principals, jobs: access.jobs, orchestrator });
+  await coop.store.init();
   const submitted = await access.submit(principal, job(project));
   const otherJob = await access.submit(principal, job(project, { idempotencyKey: 'req-2' }));
   // Without the host flag the orchestrator carrier is explicitly unavailable; the provider is not asked and no agent grant stands in.
@@ -577,6 +578,7 @@ test('an attestation event must match the exact target instance frozen in the ad
   const fakeOrchestrator = { inspect: async () => ({ attempt: { id: `a${revision}`, number: revision, status: 'running' } }) };
   const sessions = new SessionStore({ root: stateRoot });
   const coop = new CoopService({ root: stateRoot, principals, jobs: access.jobs, sessions, orchestrator: fakeOrchestrator });
+  await coop.store.init();
   const memory = new MemoryService({ root: stateRoot, provider, principals, jobs: access.jobs, sessions, orchestrator: fakeOrchestrator, coop, orchestratorCarrier: true, timeoutMs: 600 });
   // Session: event under binding b-1, then the same session id re-bound as b-2.
   await sessions.create(sessionRecord(project, principal, { bindingId: 'b-1' }));

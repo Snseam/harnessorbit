@@ -89,6 +89,7 @@ test('SessionObserver.run({ ticks: 2 }) completes both ticks in a standalone pro
     const tmux = { socket: null, pane: async () => pane, listPanes: async () => [pane], captureScreen: async () => { ticks++; return ticks === 1 ? ['✻ Working…'] : ['❯ ']; }, captureHistory: async () => [], sendText: async () => { throw new Error('never'); }, sendKeys: async () => { throw new Error('never'); } };
     const live = new SessionService({ root, principals, sessions, tmux, processes: { table: async () => new Map([[1, proc]]), agentUnder: async () => ({ ...proc, kind: 'claude' }), cwd: async () => project }, settleMs: 0 });
     const coop = new CoopService({ root, principals, sessions });
+    await coop.store.init();
     const observer = new SessionObserver({ root, sessions: live, coop, intervalMs: 1000 });
     await observer.run({ ticks: 2 });
     console.log('TICKS ' + ticks);

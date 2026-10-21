@@ -32,6 +32,7 @@ async function setup(t) {
   const access = new AccessService({ root: f.stateRoot, orchestrator, principals, driver: 'inline' });
   const sessions = new SessionStore({ root: f.stateRoot });
   const coop = new CoopService({ root: f.stateRoot, principals, jobs: access.jobs, sessions, orchestrator });
+  await coop.store.init();
   await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex', types: ['agent.turn_finished', 'session.ready'] });
   await sessions.create({ id: 'ses-1', bindingId: 'b-1', principalId: 'grok', principalIncarnation: grok.incarnation, label: null, paneId: '%9', target: 'live:0.0', panePid: 1, tmuxSocket: null, agent: { kind: 'claude', pid: 1, startedAt: 'x', comm: 'claude' }, project: f.project, allowKeys: false, messages: [], createdAt: 'x', updatedAt: 'x', providerSession: { kind: 'claude', sessionId, source: 'process_args', transcriptPath: null } });
   const proc = { pid: 1, ppid: 0, pgid: 1, tpgid: 1, stat: 'S+', startedAt: 'x', comm: 'claude', args: `claude --resume ${sessionId}` };
@@ -138,7 +139,7 @@ test('review regressions: first-pilot observation state migrates without losing 
   const oldKeyHash = crypto.createHash('sha256').update(`observer:b-1:${committedId}`).digest('hex');
   const oldEvent = { schema: 'harnessorbit.coop.event.v1', eventId: 'a63ffda5-3fd3-4a97-9eae-ad1854b46933', seq: 2, createdAt: '2026-10-21T00:01:00.000Z', type: 'agent.turn_finished', source: { principalId: 'grok', incarnation: grok.incarnation, kind: 'orchestrator', via: 'observer', binding: 'b-1', observer: 'harnessorbit' }, task: { ref: 'harnessorbit:session/ses-1', kind: 'session', id: 'ses-1', intentRevision: null }, conversationRef: null, correlationId: null, causationId: null, hop: 0, payload: { observation: 'working_to_ready' }, evidenceRefs: [] };
   const inboxEpoch = (await coop.store.recipients())['codex-inbox'].epoch;
-  await coop.store.lock(() => coop.store.journal.append({ v: 1, kind: 'event', seq: 2, event: oldEvent, idempotency: { principalId: 'grok', incarnation: grok.incarnation, keyHash: oldKeyHash, bodyHash: 'legacy' }, deliveries: [{ consumerId: 'codex-inbox', kind: 'inbox', epoch: inboxEpoch, principalId: 'codex', principalIncarnation: codex.incarnation, state: 'pending' }] }));
+  await coop.store.lock(async () => { const state = await coop.store.open(); await coop.store.appendEvent(state, { v: 1, kind: 'event', seq: 2, event: oldEvent, idempotency: { principalId: 'grok', incarnation: grok.incarnation, keyHash: oldKeyHash, bodyHash: 'legacy' }, deliveries: [{ consumerId: 'codex-inbox', kind: 'inbox', epoch: inboxEpoch, principalId: 'codex', principalIncarnation: codex.incarnation, state: 'pending' }] }); });
   await fs.writeFile(path.join(dir, 'ses-1.json'), JSON.stringify({ bindingId: 'b-1', lastState: 'idle', lastBusyAt: '2026-10-21T00:00:50.000Z', pendingTransition: { transitionId: committedId, busyAt: '2026-10-21T00:00:50.000Z', readyAt: '2026-10-21T00:01:00.000Z' }, lastEmittedTransitionId: pendingId, observations: 9 }));
   const before = (await coop.store.load()).records.length;
   results = await observer.tick();

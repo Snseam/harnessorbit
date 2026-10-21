@@ -33,6 +33,7 @@ async function setup(t) {
   const grok = (await principals.create({ id: 'grok', projects: [f.project], agents: ['claude', 'codex'], kind: 'grok' })).principal;
   const access = new AccessService({ root: f.stateRoot, orchestrator, principals, driver: 'inline' });
   const coop = new CoopService({ root: f.stateRoot, principals, jobs: access.jobs, sessions: new SessionStore({ root: f.stateRoot }), orchestrator, now: clock.now });
+  await coop.store.init();
   const jobId = (await access.submit(grok, job(f.project))).job.id;
   const secretFile = path.join(f.base, 'grok.secret');
   await fs.writeFile(secretFile, 'grok_native_secret_123\n', { mode: 0o600 });

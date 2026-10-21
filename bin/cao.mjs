@@ -165,7 +165,10 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access recipient register --id ID --kind codex-app-server --socket PATH --thread ID [scopes…]
   access recipient list | access recipient revoke --id ID
   access coop report --principal ID --key KEY --type TYPE --task REF [--payload-file FILE] [--evidence-file FILE] [--correlation ID] [--causation EVENT-UUID]
-  access coop inbox --principal ID [--cursor N] [--limit 50]
+  access coop inbox --principal ID [--cursor N | --cursor-v2 TOKEN] [--limit 50]
+  access coop store init                            (host: create an empty cooperation store with a fresh generation)
+  access coop store migrate --from-v1 [--resume]    (host, writers stopped: bring a pre-protocol store under the committed boundary)
+  access coop store inspect                         (host: read-only store status, boundary and pending recovery)
   access coop ack --principal ID --event UUID --epoch EPOCH
   access coop deliveries                            (operator: pending non-inbox deliveries)
   access coop dispatch [--once] [--interval-ms 5000] [--allow-http-loopback]   (operator: deliver pending events through registered transports)
@@ -245,12 +248,12 @@ const optionsByCommand = {
   'access recipient register': ['id', 'kind', 'principal', 'endpoint', 'secret-file', 'socket', 'thread', 'task-refs', 'sources', 'types', 'label'],
   'access recipient list': [], 'access recipient revoke': ['id'],
   'access coop report': ['principal', 'key', 'type', 'task', 'payload-file', 'evidence-file', 'conversation', 'correlation', 'causation'],
-  'access coop inbox': ['principal', 'cursor', 'limit'], 'access coop ack': ['principal', 'event', 'epoch'], 'access coop deliveries': [],
+  'access coop inbox': ['principal', 'cursor', 'cursor-v2', 'limit'], 'access coop store init': [], 'access coop store migrate': ['from-v1', 'resume'], 'access coop store inspect': [], 'access coop ack': ['principal', 'event', 'epoch'], 'access coop deliveries': [],
   'access coop dispatch': ['once', 'interval-ms', 'allow-http-loopback'],
   'access coop resolve': ['event', 'consumer', 'as', 'note'],
   'access observe': ['once', 'interval-ms', 'tmux-socket'],
 };
-const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop']);
+const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop', 'access coop store']);
 
 export function parseArgs(argv) {
   const values = {};
@@ -264,7 +267,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once', 'allow-http-loopback'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once', 'allow-http-loopback', 'from-v1', 'resume'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -506,6 +509,9 @@ export async function main(argv = process.argv.slice(2)) {
     case 'access coop deliveries':
     case 'access coop dispatch':
     case 'access coop resolve':
+    case 'access coop store init':
+    case 'access coop store migrate':
+    case 'access coop store inspect':
     case 'access observe': {
       const principals = new PrincipalStore({ root: profiles.root });
       const sessionStore = new SessionStore({ root: profiles.root });
@@ -514,6 +520,9 @@ export async function main(argv = process.argv.slice(2)) {
       if (command === 'access recipient register') return coop.registerRecipient({ id: required('id'), kind: required('kind'), principalId: o.principal || null, endpoint: o.endpoint || null, secretFile: o['secret-file'] ? path.resolve(o['secret-file']) : null, socketPath: o.socket ? path.resolve(o.socket) : null, threadId: o.thread || null, taskRefs: split(o['task-refs']), sources: split(o.sources), types: split(o.types), label: o.label || null });
       if (command === 'access recipient list') return coop.listRecipients();
       if (command === 'access recipient revoke') return coop.revokeRecipient(required('id'));
+      if (command === 'access coop store init') return coop.store.init();
+      if (command === 'access coop store migrate') return coop.store.migrate({ fromV1: !!o['from-v1'], resume: !!o.resume });
+      if (command === 'access coop store inspect') return coop.store.inspect();
       if (command === 'access coop deliveries') return { deliveries: await coop.pendingDeliveries() };
       if (command === 'access coop resolve') return coop.resolveDelivery({ eventId: required('event'), consumerId: required('consumer'), as: required('as'), note: o.note || null });
       if (command === 'access coop dispatch') {
@@ -539,7 +548,7 @@ export async function main(argv = process.argv.slice(2)) {
       try {
         let result;
         if (tool === 'coop_report') result = await coop.report(principal, { idempotencyKey: required('key'), type: required('type'), task: { ref: required('task') }, ...(o['payload-file'] ? { payload: await readProfile(o['payload-file']) } : {}), ...(o['evidence-file'] ? { evidenceRefs: await readProfile(o['evidence-file']) } : {}), conversationRef: o.conversation, correlationId: o.correlation, causationId: o.causation }, { via: 'cli' });
-        else if (tool === 'coop_inbox') result = await coop.inbox(principal, { ...(o.cursor === undefined ? {} : { cursor: Number(o.cursor) }), ...(o.limit === undefined ? {} : { limit: Number(o.limit) }) });
+        else if (tool === 'coop_inbox') result = await coop.inbox(principal, { ...(o.cursor === undefined ? {} : { cursor: Number(o.cursor) }), ...(o['cursor-v2'] === undefined ? {} : { cursorV2: o['cursor-v2'] }), ...(o.limit === undefined ? {} : { limit: Number(o.limit) }) });
         else result = await coop.ack(principal, { eventId: required('event'), epoch: required('epoch') });
         await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.event?.eventId || o.event || null, ok: true, durationMs: Date.now() - startedAt });
         return result;

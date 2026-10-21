@@ -31,6 +31,7 @@ async function setup(t, { clock } = {}) {
   const access = new AccessService({ root: f.stateRoot, orchestrator, principals, driver: 'inline' });
   const sessions = new SessionStore({ root: f.stateRoot });
   const coop = new CoopService({ root: f.stateRoot, principals, jobs: access.jobs, sessions, orchestrator, ...(clock ? { now: clock } : {}) });
+  await coop.store.init();
   const submitted = await access.submit(grok.principal, job(f.project));
   return { ...f, orchestrator, principals, grok: grok.principal, grokToken: grok.token, codex: codex.principal, codexToken: codex.token, access, sessions, coop, jobId: submitted.job.id };
 }
@@ -104,7 +105,8 @@ test('the journal is the commit boundary: a torn tail is dropped on load, the ne
   assert.deepEqual(loaded.recovered.journal, { droppedTornTail: true, line: 3 });
   const inbox = await coop.inbox(codex, {});
   assert.deepEqual(inbox.events.map(e => e.eventId), [a.event.eventId, b.event.eventId]);
-  assert.ok(inbox.recovered.journal.droppedTornTail, 'recovery is reported, not hidden');
+  assert.equal(inbox.recovered, null, 'the earlier load already repaired it under the lock');
+  assert.ok(inbox.lastRecovery.journal.droppedTornTail, 'recovery is reported durably, not hidden');
   const c = await coop.report(grok, report(jobId, { idempotencyKey: 'c', type: 'question.asked', payload: { question: 'which branch?' } }));
   assert.equal(c.event.seq, 3, 'the torn line never became an event; the sequence continues from the last intact one');
   const after = await store.load();
@@ -344,19 +346,24 @@ test('crash regression: a complete checksummed record without its final newline 
   await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex' });
   const one = await coop.report(grok, report(jobId, { idempotencyKey: 'one' }));
   const journal = path.join(stateRoot, 'access', 'coop', 'journal.jsonl');
-  const text = await fs.readFile(journal, 'utf8');
-  assert.ok(text.endsWith('\n'));
-  await fs.writeFile(journal, text.slice(0, -1)); // the newline never reached disk
+  // The crash window: a second event's line was appended (chained to the committed line) but the
+  // process died before its newline and before the boundary commit.
+  const committed = JSON.parse(await fs.readFile(path.join(stateRoot, 'access', 'coop', 'store.json'), 'utf8')).boundary;
+  const body = { v: 1, kind: 'event', seq: 2, event: { ...one.event, eventId: '0b5a4b5a-5c7e-4f1e-9a1a-000000000002', seq: 2 }, idempotency: { principalId: 'grok', incarnation: grok.incarnation, keyHash: crypto.createHash('sha256').update('two').digest('hex'), bodyHash: 'x' }, deliveries: [], prev: committed.eventLastSha };
+  const line = JSON.stringify({ ...body, sha: crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex') });
+  await fs.appendFile(journal, line); // no trailing newline
+  const bytesBefore = (await fs.stat(journal)).size;
   const loaded = await new CoopStore({ root: stateRoot }).load();
-  assert.equal(loaded.records.length, 1, 'the record is complete and intact');
-  const two = await coop.report(grok, report(jobId, { idempotencyKey: 'two', payload: { n: 2 } }));
-  const three = await coop.report(grok, report(jobId, { idempotencyKey: 'three', payload: { n: 3 } }));
-  assert.deepEqual([one.event.seq, two.event.seq, three.event.seq], [1, 2, 3]);
-  const after = await new CoopStore({ root: stateRoot }).load();
-  assert.deepEqual(after.records.map(r => r.event.eventId), [one.event.eventId, two.event.eventId, three.event.eventId]);
-  assert.equal(after.recovered.journal, null);
-  assert.deepEqual((await coop.inbox(codex, {})).events.map(e => e.seq), [1, 2, 3]);
+  assert.equal(loaded.records.length, 2, 'the record is complete and intact, so it is adopted');
+  assert.deepEqual(loaded.recovered.journal, { addedDelimiter: true, adoptedLines: 1 });
+  assert.equal((await fs.stat(journal)).size, bytesBefore + 1, 'only the delimiter was added; no byte was rewritten');
   assert.ok((await fs.readFile(journal, 'utf8')).endsWith('\n'));
+  const three = await coop.report(grok, report(jobId, { idempotencyKey: 'three', payload: { n: 3 } }));
+  assert.deepEqual([one.event.seq, 2, three.event.seq], [1, 2, 3]);
+  const after = await new CoopStore({ root: stateRoot }).load();
+  assert.deepEqual(after.records.map(r => r.event.eventId), [one.event.eventId, '0b5a4b5a-5c7e-4f1e-9a1a-000000000002', three.event.eventId]);
+  assert.deepEqual(after.recovered, { journal: null, receipts: null, recipients: null });
+  assert.deepEqual((await coop.inbox(codex, {})).events.map(e => e.seq), [1, 3], 'the adopted event had no delivery for this inbox; nothing is invented');
 });
 
 test('review regressions: a recreated consumer inherits no old payloads, and ack and report re-check authority after waiting for the store lock', async t => {
@@ -384,7 +391,7 @@ test('review regressions: a recreated consumer inherits no old payloads, and ack
   const e2 = await coop.report(grok, report(jobId, { idempotencyKey: 'e2' }));
   let release2; const gate2 = new Promise(r => { release2 = r; });
   let third;
-  const holding2 = coop.store.lock(async () => { await gate2; const recipients = await coop.store.recipients(); third = { ...recipients['codex-inbox'], epoch: 'feedfacefeedface', createdAt: new Date().toISOString() }; recipients['codex-inbox'] = third; await coop.store.saveRecipients(recipients); });
+  const holding2 = coop.store.lock(async () => { await gate2; const state = await coop.store.open(); const recipients = { ...state.recipients }; third = { ...recipients['codex-inbox'], epoch: 'feedfacefeedface', createdAt: new Date().toISOString() }; recipients['codex-inbox'] = third; await coop.store.replaceRecipients(state, recipients); });
   await new Promise(r => setTimeout(r, 30));
   const waitingAck = coop.ack(reborn, { eventId: e2.event.eventId, epoch: second.epoch });
   await new Promise(r => setTimeout(r, 30));
