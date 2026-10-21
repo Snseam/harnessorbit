@@ -132,6 +132,10 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access describe --principal ID
   access submit --principal ID --file JOB.json
   access status --principal ID --job ID [--no-advance]
+  access approve --principal ID --job ID            (integrate; principal needs --allow-integrate)
+  access answer --principal ID --job ID (--text TEXT | --text-file FILE | --keys Enter,y)
+  access cancel --principal ID --job ID [--reason TEXT]
+  access result --principal ID --job ID [--patch]
 
 Global: --state-dir PATH (outside project), --help, --json
 Results are JSON unless usage --table is selected. Keys can be comma-separated.
@@ -188,6 +192,8 @@ const optionsByCommand = {
   'access principal list': [], 'access principal remove': ['id'],
   'access serve': ['port', 'host'],
   'access describe': ['principal'], 'access submit': ['principal', 'file'], 'access status': ['principal', 'job', 'no-advance'],
+  'access approve': ['principal', 'job'], 'access answer': ['principal', 'job', 'text', 'text-file', 'keys'],
+  'access cancel': ['principal', 'job', 'reason'], 'access result': ['principal', 'job', 'patch'],
 };
 const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal']);
 
@@ -203,7 +209,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -320,17 +326,31 @@ export async function main(argv = process.argv.slice(2)) {
     }
     case 'access describe':
     case 'access submit':
-    case 'access status': {
+    case 'access status':
+    case 'access approve':
+    case 'access answer':
+    case 'access cancel':
+    case 'access result': {
       const principal = await new PrincipalStore({ root: profiles.root }).get(required('principal'));
       if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
       const service = new AccessService({ root: profiles.root, orchestrator, driver: 'inline' });
       const audit = new AccessAudit({ root: profiles.root });
       const tool = command.slice('access '.length);
       const startedAt = Date.now();
+      const answerInput = async () => {
+        const sources = ['text', 'text-file', 'keys'].filter(key => o[key] !== undefined);
+        if (sources.length !== 1) throw new OrchestratorError('invalid_arguments', 'Supply exactly one of --text, --text-file, or --keys.');
+        if (o.keys !== undefined) return { keys: String(o.keys).split(',').map(value => value.trim()).filter(Boolean) };
+        return { text: o['text-file'] ? await read(o['text-file']) : o.text };
+      };
       try {
         const result = tool === 'describe' ? service.describe(principal)
           : tool === 'submit' ? await service.submit(principal, await readProfile(required('file')))
-            : await service.status(principal, { jobId: required('job'), advance: !o['no-advance'] });
+            : tool === 'status' ? await service.status(principal, { jobId: required('job'), advance: !o['no-advance'] })
+              : tool === 'approve' ? await service.approve(principal, { jobId: required('job') })
+                : tool === 'answer' ? await service.answer(principal, { jobId: required('job'), ...(await answerInput()) })
+                  : tool === 'cancel' ? await service.cancel(principal, { jobId: required('job'), reason: o.reason })
+                    : await service.result(principal, { jobId: required('job'), includePatch: !!o.patch });
         await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.job?.id || o.job || null, ok: true, durationMs: Date.now() - startedAt });
         return result;
       } catch (error) {

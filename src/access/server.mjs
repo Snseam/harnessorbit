@@ -6,7 +6,8 @@ import { ACCESS_VERSION, TOOL_TIMEOUT_MS, AccessAudit } from './service.mjs';
 // Grok Bot and other remote principals call it through a user-controlled tunnel or tailnet.
 export const MCP_PROTOCOL_VERSIONS = Object.freeze(['2025-06-18', '2025-03-26', '2024-11-05']);
 const MAX_BODY_BYTES = 262144;
-const WRITE_TOOLS = new Set(['submit']);
+const WRITE_TOOLS = new Set(['submit', 'approve', 'answer', 'cancel']);
+const jobIdSchema = { type: 'string', minLength: 1, maxLength: 64, description: 'Job id returned by submit.' };
 
 export const TOOLS = Object.freeze([
   {
@@ -39,7 +40,31 @@ export const TOOLS = Object.freeze([
   {
     name: 'status', title: 'Job status',
     description: 'Return the current state of a job: attempt status, verification results, attention items that need a decision, attention_pending, and next_action. Also moves collection and verification forward on the host.',
-    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: { type: 'string' } } },
+    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema } },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: 'approve', title: 'Approve integration',
+    description: 'Integrate an accepted candidate into the project checkout: the verified patch is applied and the checks rerun there. Requires the integrate permission (see describe). Call result first to review the patch.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, kind: { type: 'string', enum: ['integrate'], default: 'integrate' } } },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'answer', title: 'Answer a waiting worker',
+    description: 'Reply to a worker that stopped and needs input (attention kind input). Send text for a question, or keys such as ["Enter"] or ["y"] for a terminal prompt. Exactly one of text or keys.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, text: { type: 'string', minLength: 1, maxLength: 8000 }, keys: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', pattern: '^[A-Za-z0-9+_-]{1,32}$' } } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'cancel', title: 'Cancel a job',
+    description: 'Stop the worker and withdraw the job. Nothing in the project checkout changes. An accepted candidate is withdrawn without integration.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, reason: { type: 'string', maxLength: 512 } } },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'result', title: 'Job result',
+    description: 'Return the worker report, verification evidence (per check: status, exit code, stdout and stderr tails), changed paths, and with includePatch the verified unified diff (up to 256 KiB). Available once the attempt was collected.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, includePatch: { type: 'boolean', default: false } } },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
 ]);
@@ -97,6 +122,10 @@ export async function startAccessServer({ service, principals = service?.princip
       case 'describe': return service.describe(principal);
       case 'submit': return service.submit(principal, args);
       case 'status': return service.status(principal, { jobId: args?.jobId });
+      case 'approve': return service.approve(principal, { jobId: args?.jobId, ...(args?.kind === undefined ? {} : { kind: args.kind }) });
+      case 'answer': return service.answer(principal, { jobId: args?.jobId, text: args?.text, keys: args?.keys });
+      case 'cancel': return service.cancel(principal, { jobId: args?.jobId, reason: args?.reason });
+      case 'result': return service.result(principal, { jobId: args?.jobId, includePatch: args?.includePatch ?? false });
       default: throw new OrchestratorError('unknown_tool', `Unknown tool: ${name}`);
     }
   }
@@ -113,7 +142,7 @@ export async function startAccessServer({ service, principals = service?.princip
         protocolVersion: MCP_PROTOCOL_VERSIONS.includes(requested) ? requested : MCP_PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'harnessorbit-access', version: ACCESS_VERSION },
-        instructions: instructions || 'HarnessOrbit runs coding agents on its host. Call describe first, then submit with a unique idempotencyKey, then poll status until attention_pending is 0 and state is integrated or next_action tells you what to do. Every call returns within 20 seconds; nothing here waits for an agent to finish.',
+        instructions: instructions || 'HarnessOrbit runs coding agents on its host. Call describe first, then submit with a unique idempotencyKey, then poll status while next_action is status. When next_action is answer, call answer; when it is approve, call result to review the patch and then approve (if your principal may integrate); when it is result, call result. cancel withdraws a job. Every call returns within 20 seconds; nothing here waits for an agent to finish.',
       });
     }
     if (method === 'ping') return rpcResult(id, {});

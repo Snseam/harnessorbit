@@ -4,10 +4,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Orchestrator } from '../src/orchestrator.mjs';
 import { PrincipalStore } from '../src/access/principals.mjs';
-import { AccessService } from '../src/access/service.mjs';
+import { AccessService, ACCESS_TOOLS } from '../src/access/service.mjs';
 import { startAccessServer, TOOLS } from '../src/access/server.mjs';
 import { parseArgs } from '../bin/cao.mjs';
-import { fixture, FakeHerdr } from './helpers.mjs';
+import { fixture, FakeHerdr, writeResult } from './helpers.mjs';
 
 const checks = [{ name: 'math', argv: [process.execPath, '--test', 'tests/math.test.mjs'], timeoutMs: 10000 }];
 const job = (project, extra = {}) => ({
@@ -129,7 +129,7 @@ test('MCP server authenticates principals and serves initialize, tools/list and 
   assert.equal((await rpc(started.endpoint, { jsonrpc: '2.0', method: 'notifications/initialized' }, { token })).status, 202);
 
   const list = await rpc(started.endpoint, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, { token });
-  assert.deepEqual(list.body.result.tools.map(tool => tool.name), ['describe', 'submit', 'status']);
+  assert.deepEqual(list.body.result.tools.map(tool => tool.name), [...ACCESS_TOOLS]);
   assert.equal(list.body.result.tools.length, TOOLS.length);
 
   const describe = await rpc(started.endpoint, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'describe', arguments: {} } }, { token });
@@ -165,4 +165,154 @@ test('CLI parses the three-level access principal commands', () => {
   assert.equal(parsed.values['allow-integrate'], true);
   assert.equal(parseArgs(['access', 'status', '--principal', 'grok', '--job', 'job-1', '--no-advance']).values['no-advance'], true);
   assert.throws(() => parseArgs(['access', 'serve', '--bogus']), e => e.code === 'invalid_arguments');
+});
+
+test('approve integrates an accepted candidate only for a principal with the integrate permission', async t => {
+  const { service, principal, principals, project } = await setup(t);
+  const submitted = await service.submit(principal, job(project));
+  await service.status(principal, { jobId: submitted.job.id });
+  await assert.rejects(service.approve(principal, { jobId: submitted.job.id }), e => e.code === 'permission_denied');
+  await assert.rejects(service.approve(principal, { jobId: submitted.job.id, kind: 'merge' }), e => e.code === 'invalid_approval');
+  const integrator = (await principals.create({ id: 'ops', projects: [project], agents: ['claude'], permissions: { integrate: true } })).principal;
+  await assert.rejects(service.approve(integrator, { jobId: submitted.job.id }), e => e.code === 'job_not_found', 'approval never crosses principals');
+  const own = await service.submit(integrator, job(project, { idempotencyKey: 'ops-1' }));
+  await assert.rejects(service.approve(integrator, { jobId: own.job.id }), e => e.code === 'not_accepted');
+  const ready = await service.status(integrator, { jobId: own.job.id });
+  assert.equal(ready.next_action, 'approve');
+  assert.match(ready.attention[0].how, /approve/);
+  const approved = await service.approve(integrator, { jobId: own.job.id });
+  assert.equal(approved.state, 'integrated');
+  assert.equal(approved.attempt.status, 'integrated');
+  assert.equal(approved.next_action, 'result');
+  assert.equal(approved.attention_pending, 0);
+  assert.match(await fs.readFile(path.join(project, 'src/math.mjs'), 'utf8'), /a \+ b/);
+  await assert.rejects(service.approve(integrator, { jobId: own.job.id }), e => e.code === 'not_accepted');
+  await assert.rejects(service.cancel(integrator, { jobId: own.job.id }), e => e.code === 'already_integrated');
+  assert.equal((await service.jobs.get(own.job.id)).approvals.length, 1);
+});
+
+test('answer replies to a worker that needs input and status follows it through to acceptance', async t => {
+  let first = null;
+  const runtime = new FakeHerdr(async prompt => {
+    if (!first) { first = prompt; await writeResult(prompt, { fix: false, overrides: { status: 'needs_input', unresolved: ['Should add() accept more than two inputs?'] } }); return; }
+    await writeResult(first);
+  });
+  const { service, principal, project } = await setup(t, runtime);
+  const submitted = await service.submit(principal, job(project));
+  const waiting = await service.status(principal, { jobId: submitted.job.id });
+  assert.equal(waiting.state, 'attention');
+  assert.equal(waiting.attention[0].kind, 'input');
+  assert.equal(waiting.attempt.lastError.code, 'worker_blocked');
+  assert.equal(waiting.next_action, 'answer');
+  await assert.rejects(service.answer(principal, { jobId: submitted.job.id }), e => e.code === 'invalid_answer');
+  await assert.rejects(service.answer(principal, { jobId: submitted.job.id, text: 'x', keys: ['Enter'] }), e => e.code === 'invalid_answer');
+  await assert.rejects(service.answer(principal, { jobId: submitted.job.id, keys: ['rm -rf /'] }), e => e.code === 'invalid_answer');
+  const answered = await service.answer(principal, { jobId: submitted.job.id, text: 'No. Two inputs only; keep the signature.' });
+  assert.equal(runtime.prompts.length, 2);
+  assert.match(runtime.prompts[1], /Two inputs only/);
+  assert.equal(answered.state, 'running', 'the reply was delivered and the worker is being observed');
+  assert.equal(answered.next_action, 'status');
+  const accepted = await service.status(principal, { jobId: submitted.job.id });
+  assert.equal(accepted.attempt.status, 'accepted');
+  assert.equal(accepted.next_action, 'approve');
+  await assert.rejects(service.answer(principal, { jobId: submitted.job.id, text: 'again' }), e => e.code === 'answer_not_allowed');
+  assert.equal((await service.jobs.get(submitted.job.id)).answers.length, 1);
+});
+
+test('cancel stops a running worker, withdraws accepted work, and closes dispatch failures', async t => {
+  const { service, principal, project, runtime } = await setup(t);
+  const running = await service.submit(principal, job(project));
+  await assert.rejects(service.cancel({ ...principal, permissions: { ...principal.permissions, cancel: false } }, { jobId: running.job.id }), e => e.code === 'permission_denied');
+  const cancelled = await service.cancel(principal, { jobId: running.job.id, reason: 'User changed their mind' });
+  assert.equal(cancelled.state, 'cancelled');
+  assert.equal(cancelled.attempt.status, 'cancelled');
+  assert.equal(cancelled.next_action, 'none');
+  assert.ok(runtime.closed.length >= 1, 'the worker pane is closed');
+  await assert.rejects(service.answer(principal, { jobId: running.job.id, text: 'hello' }), e => e.code === 'answer_not_allowed');
+  const second = await service.submit(principal, job(project, { idempotencyKey: 'req-2' }));
+  assert.equal((await service.status(principal, { jobId: second.job.id })).attempt.status, 'accepted');
+  const withdrawn = await service.cancel(principal, { jobId: second.job.id });
+  assert.equal(withdrawn.state, 'cancelled');
+  assert.equal(withdrawn.attention_pending, 0);
+  assert.ok(withdrawn.job.withdrawnAt);
+  assert.equal((await service.status(principal, { jobId: second.job.id })).state, 'cancelled');
+  assert.match(await fs.readFile(path.join(project, 'src/math.mjs'), 'utf8'), /a - b/, 'withdrawing never touches the checkout');
+  runtime.ensureServer = async () => { throw new Error('herdr unavailable'); };
+  const broken = await service.submit(principal, job(project, { idempotencyKey: 'req-3' }));
+  assert.equal(broken.next_action, 'retry');
+  assert.equal((await service.cancel(principal, { jobId: broken.job.id })).state, 'cancelled');
+  assert.equal((await service.status(principal, { jobId: broken.job.id })).next_action, 'none');
+});
+
+test('result returns the report, verification evidence, and the verified patch on request', async t => {
+  const { service, principal, project } = await setup(t);
+  const submitted = await service.submit(principal, job(project));
+  await assert.rejects(service.result(principal, { jobId: submitted.job.id }), e => e.code === 'result_not_ready');
+  await service.status(principal, { jobId: submitted.job.id });
+  const plain = await service.result(principal, { jobId: submitted.job.id });
+  assert.equal(plain.state, 'attention');
+  assert.equal(plain.next_action, 'approve');
+  assert.equal(plain.result.report.summary, 'Prepared candidate');
+  assert.equal(plain.result.verification.passed, true);
+  assert.equal(plain.result.verification.checks[0].name, 'math');
+  assert.equal(plain.result.verification.checks[0].code, 0);
+  assert.match(plain.result.verification.checks[0].stdout, /pass 1/);
+  assert.deepEqual(plain.result.changedPaths, ['src/math.mjs']);
+  assert.equal(plain.result.patch, null);
+  const withPatch = await service.result(principal, { jobId: submitted.job.id, includePatch: true });
+  assert.match(withPatch.result.patch.text, /\+export const add = \(a, b\) => a \+ b;/);
+  assert.ok(withPatch.result.patch.bytes > 0);
+  await assert.rejects(service.result(principal, { jobId: submitted.job.id, includePatch: 'yes' }), e => e.code === 'invalid_job');
+});
+
+test('the background driver returns inside the settle window and reports a failed host operation on the next status', async t => {
+  const f = await setup(t);
+  const integrator = (await f.principals.create({ id: 'ops', projects: [f.project], agents: ['claude'], permissions: { integrate: true } })).principal;
+  const service = new AccessService({ root: f.stateRoot, orchestrator: f.orchestrator, principals: f.principals, driver: 'background', settleMs: 6000 });
+  const submitted = await service.submit(integrator, job(f.project));
+  const startedAt = Date.now();
+  let view = await service.status(integrator, { jobId: submitted.job.id });
+  assert.ok(Date.now() - startedAt < 8000);
+  for (let i = 0; i < 20 && view.attempt.status !== 'accepted'; i++) { await new Promise(r => setTimeout(r, 250)); view = await service.status(integrator, { jobId: submitted.job.id }); }
+  assert.equal(view.attempt.status, 'accepted');
+  await fs.writeFile(path.join(f.project, 'src/math.mjs'), 'export const add = (a, b) => a * b;\n'); // the project moved under the candidate
+  await service.approve(integrator, { jobId: submitted.job.id });
+  let failed = await service.status(integrator, { jobId: submitted.job.id });
+  for (let i = 0; i < 20 && !failed.attention.some(a => a.kind === 'operation_failed'); i++) { await new Promise(r => setTimeout(r, 250)); failed = await service.status(integrator, { jobId: submitted.job.id }); }
+  assert.equal(failed.attention[0].kind, 'operation_failed');
+  assert.equal(failed.attention[0].code, 'integration_conflict');
+  assert.equal(failed.next_action, 'retry');
+  assert.equal(failed.attempt.status, 'accepted');
+});
+
+test('MCP server exposes approve, answer, cancel and result with the same error contract', async t => {
+  const { service, token, project } = await setup(t);
+  const started = await startAccessServer({ service, toolTimeoutMs: 15000 });
+  t.after(started.close);
+  const call = (id, name, args) => rpc(started.endpoint, { jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }, { token });
+  const submit = await call(1, 'submit', job(project));
+  const jobId = submit.body.result.structuredContent.job.id;
+  const status = await call(2, 'status', { jobId });
+  assert.equal(status.body.result.structuredContent.attempt.status, 'accepted');
+  const approve = await call(3, 'approve', { jobId });
+  assert.equal(approve.body.result.isError, true);
+  assert.equal(approve.body.result.structuredContent.code, 'permission_denied');
+  const answer = await call(4, 'answer', { jobId, text: 'hello' });
+  assert.equal(answer.body.result.structuredContent.code, 'answer_not_allowed');
+  const result = await call(5, 'result', { jobId, includePatch: true });
+  assert.equal(result.body.result.isError, false);
+  assert.match(result.body.result.structuredContent.result.patch.text, /a \+ b/);
+  const cancel = await call(6, 'cancel', { jobId, reason: 'done reviewing' });
+  assert.equal(cancel.body.result.isError, false);
+  assert.equal(cancel.body.result.structuredContent.state, 'cancelled');
+  const audit = (await fs.readFile(path.join(service.root, 'access', 'audit.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(audit.map(entry => entry.tool), ['submit', 'status', 'approve', 'answer', 'result', 'cancel']);
+  assert.equal(audit.find(entry => entry.tool === 'approve').code, 'permission_denied');
+});
+
+test('CLI parses the control subcommands', () => {
+  assert.equal(parseArgs(['access', 'answer', '--principal', 'grok', '--job', 'job-1', '--keys', 'Enter']).values.keys, 'Enter');
+  assert.equal(parseArgs(['access', 'result', '--principal', 'grok', '--job', 'job-1', '--patch']).values.patch, true);
+  assert.equal(parseArgs(['access', 'cancel', '--principal', 'grok', '--job', 'job-1', '--reason', 'x']).command, 'access cancel');
+  assert.throws(() => parseArgs(['access', 'approve', '--principal', 'grok', '--job', 'job-1', '--kind', 'merge']), e => e.code === 'invalid_arguments');
 });
