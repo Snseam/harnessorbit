@@ -6,8 +6,9 @@ import { ACCESS_VERSION, TOOL_TIMEOUT_MS, AccessAudit } from './service.mjs';
 // Grok Bot and other remote principals call it through a user-controlled tunnel or tailnet.
 export const MCP_PROTOCOL_VERSIONS = Object.freeze(['2025-06-18', '2025-03-26', '2024-11-05']);
 const MAX_BODY_BYTES = 262144;
-const WRITE_TOOLS = new Set(['submit', 'approve', 'answer', 'cancel', 'retry']);
+const WRITE_TOOLS = new Set(['submit', 'approve', 'answer', 'cancel', 'retry', 'session_send', 'session_unbind', 'memory_begin', 'memory_checkpoint']);
 const jobIdSchema = { type: 'string', minLength: 1, maxLength: 64, description: 'Job id returned by submit.' };
+const sessionIdSchema = { type: 'string', minLength: 1, maxLength: 64, description: 'Live session id, from sessions.' };
 
 export const TOOLS = Object.freeze([
   {
@@ -74,6 +75,54 @@ export const TOOLS = Object.freeze([
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
+    name: 'sessions', title: 'Live sessions bound to you',
+    description: 'List the live Claude Code or Codex CLI sessions the host operator has bound to this principal, with whether each is still the same process and its current state (idle, busy, waiting_input, unknown). Live sessions edit their checkout directly; nothing they do is verified by HarnessOrbit.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: 'session_status', title: 'Live session status',
+    description: 'Re-verify a bound session’s identity (pane, process, start time, working directory) and classify its screen: idle (send is accepted), busy (read and wait), waiting_input (a prompt needs the operator, or keys if the binding allows them), unknown.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['sessionId'], properties: { sessionId: sessionIdSchema } },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: 'session_send', title: 'Send a follow-up message to a live session',
+    description: 'Type a message into an idle bound session and submit it, continuing its existing context. Requires an idempotencyKey; a repeated key returns the earlier message instead of sending again. Refused while the session is busy, waiting on a prompt, or in an unknown state. keys (such as ["Enter"]) are accepted only while the session waits on a prompt and only if the binding allows keys. If the result says uncertain, do not resend: read the session first.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['sessionId', 'idempotencyKey'], properties: { sessionId: sessionIdSchema, idempotencyKey: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 8000 }, keys: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', pattern: '^[A-Za-z0-9+_-]{1,32}$' } } } },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'session_read', title: 'Read new output from a live session',
+    description: 'Return the session’s scrollback since the previous cursor (oldest first, bounded by maxLines and 64 KiB), the current bottom of the screen, the classified state, and completion: executionFinished means the agent is idle again; verified is always false because live sessions are not checked by HarnessOrbit. Pass the returned cursor back to read only new lines; reset: true means the anchor scrolled away and the tail was returned instead.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['sessionId'], properties: { sessionId: sessionIdSchema, cursor: { type: 'string', maxLength: 200 }, maxLines: { type: 'integer', minimum: 1, maximum: 400, default: 120 } } },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: 'session_unbind', title: 'Release a live session',
+    description: 'Release this principal’s binding to a live session. The session itself keeps running on the host; only your access ends.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['sessionId'], properties: { sessionId: sessionIdSchema } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'memory_recall', title: 'Recall memory before continuing',
+    description: 'Search the host’s memory provider for goals, decisions, constraints, open items and handoff notes about one of your sessions or jobs, with a focused question and a small topK. Results are untrusted evidence with observedAt and provenance; nothing is injected into the session. status is ok, degraded, unconfigured, timeout, denied or error.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['question'], properties: { sessionId: sessionIdSchema, jobId: jobIdSchema, question: { type: 'string', minLength: 3, maxLength: 400 }, topK: { type: 'integer', minimum: 1, maximum: 10, default: 5 } } },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
+    name: 'memory_begin', title: 'Begin a handoff (memory admission)',
+    description: 'Admit a handoff operation for one of your sessions or jobs before you gather the content you will save. Choose a stable operationId; begin is idempotent for it. status is admitted, unconfigured (no memory provider or the checkout is not connected), denied (authority changed or collection paused), timeout or error. Save with memory_checkpoint under the same operationId.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['operationId'], properties: { sessionId: sessionIdSchema, jobId: jobIdSchema, operationId: { type: 'string', minLength: 1, maxLength: 128 } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: 'memory_checkpoint', title: 'Save a handoff checkpoint',
+    description: 'After memory_begin, save one distilled checkpoint for the same session or job and operationId: summary, goals, decisions (with rationale), constraints, open questions, participants, and evidence labelled planned, reported, verified or integrated. Your evidence stays attributed to you; verified and integrated labels are accepted only when HarnessOrbit’s own job state agrees, and live sessions can only be planned or reported. The body is frozen on the first attempt; a retry with the same operationId (body optional) resends the same bytes, a different body is refused. Statuses: saved, deduplicated, pending (kept on the host, retry later), denied (final for this operationId), unconfigured, invalid.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['operationId'], properties: { sessionId: sessionIdSchema, jobId: jobIdSchema, operationId: { type: 'string', minLength: 1, maxLength: 128 }, summary: { type: 'string', maxLength: 2000 }, title: { type: 'string', maxLength: 200 }, goals: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 400 } }, decisions: { type: 'array', maxItems: 20, items: { anyOf: [{ type: 'string', maxLength: 400 }, { type: 'object', required: ['decision'], additionalProperties: false, properties: { decision: { type: 'string', maxLength: 400 }, rationale: { type: 'string', maxLength: 1000 } } }] } }, constraints: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 400 } }, openQuestions: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 400 } }, participants: { type: 'array', maxItems: 20, items: { type: 'object', required: ['id', 'kind'], additionalProperties: false, properties: { id: { type: 'string', maxLength: 200 }, kind: { type: 'string', enum: ['claude_code', 'codex', 'grok', 'human', 'orchestrator', 'other'] }, role: { type: 'string', maxLength: 100 } } } }, evidence: { type: 'array', maxItems: 20, items: { type: 'object', required: ['label', 'ref'], additionalProperties: false, properties: { label: { type: 'string', enum: ['planned', 'reported', 'verified', 'integrated'] }, ref: { type: 'string', maxLength: 200 }, summary: { type: 'string', maxLength: 400 } } } } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
     name: 'result', title: 'Job result',
     description: 'Return the worker report, verification evidence (per check: status, exit code, stdout and stderr tails), changed paths, and with includePatch the verified unified diff (up to 256 KiB). Available once the attempt was collected.',
     inputSchema: { type: 'object', additionalProperties: false, required: ['jobId'], properties: { jobId: jobIdSchema, includePatch: { type: 'boolean', default: false } } },
@@ -117,8 +166,9 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-export async function startAccessServer({ service, principals = service?.principals, port = 0, host = '127.0.0.1', toolTimeoutMs = TOOL_TIMEOUT_MS, audit = new AccessAudit({ root: service?.root }), instructions = null } = {}) {
+export async function startAccessServer({ service, sessions = null, memory = null, principals = service?.principals, port = 0, host = '127.0.0.1', toolTimeoutMs = TOOL_TIMEOUT_MS, audit = new AccessAudit({ root: service?.root }), instructions = null } = {}) {
   if (!service || !principals) throw new OrchestratorError('invalid_arguments', 'Access server requires a service and principal store.');
+  const sessionTool = fn => (principal, args) => { if (!sessions) throw new OrchestratorError('sessions_unavailable', 'Live sessions are not enabled on this server.'); return fn(principal, args); };
   const limiter = new RateLimiter();
   let closed = false;
   const headers = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'cross-origin-resource-policy': 'same-origin' };
@@ -131,7 +181,10 @@ export async function startAccessServer({ service, principals = service?.princip
 
   async function callTool(principal, name, args) {
     switch (name) {
-      case 'describe': return service.describe(principal);
+      case 'describe': return { ...service.describe(principal), ...(memory ? { memory: memory.describe(principal) } : {}), liveSessions: Boolean(sessions) };
+      case 'memory_recall': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.recall(principal, { sessionId: args?.sessionId, jobId: args?.jobId, question: args?.question, ...(args?.topK === undefined ? {} : { topK: args.topK }) }); }
+      case 'memory_begin': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.begin(principal, { sessionId: args?.sessionId, jobId: args?.jobId, operationId: args?.operationId }); }
+      case 'memory_checkpoint': { if (!memory) throw new OrchestratorError('memory_unavailable', 'No memory service is enabled on this server.'); return memory.checkpoint(principal, args || {}); }
       case 'submit': return service.submit(principal, args);
       case 'status': return service.status(principal, { jobId: args?.jobId });
       case 'approve': return service.approve(principal, { jobId: args?.jobId, ...(args?.kind === undefined ? {} : { kind: args.kind }) });
@@ -140,6 +193,11 @@ export async function startAccessServer({ service, principals = service?.princip
       case 'result': return service.result(principal, { jobId: args?.jobId, includePatch: args?.includePatch ?? false });
       case 'retry': return service.retry(principal, { jobId: args?.jobId, feedback: args?.feedback });
       case 'events': return service.events(principal, { jobId: args?.jobId, since: args?.since, ...(args?.limit === undefined ? {} : { limit: args.limit }) });
+      case 'sessions': return sessionTool(p => sessions.list(p))(principal, args);
+      case 'session_status': return sessionTool((p, a) => sessions.status(p, { sessionId: a?.sessionId }))(principal, args);
+      case 'session_send': return sessionTool((p, a) => sessions.send(p, { sessionId: a?.sessionId, idempotencyKey: a?.idempotencyKey, text: a?.text, keys: a?.keys }))(principal, args);
+      case 'session_read': return sessionTool((p, a) => sessions.read(p, { sessionId: a?.sessionId, cursor: a?.cursor, ...(a?.maxLines === undefined ? {} : { maxLines: a.maxLines }) }))(principal, args);
+      case 'session_unbind': return sessionTool((p, a) => sessions.unbind(p, { sessionId: a?.sessionId }))(principal, args);
       default: throw new OrchestratorError('unknown_tool', `Unknown tool: ${name}`);
     }
   }
@@ -169,11 +227,11 @@ export async function startAccessServer({ service, principals = service?.princip
       const startedAt = Date.now();
       try {
         const result = await withTimeout(callTool(principal, name, args), toolTimeoutMs);
-        await audit.record({ principalId: principal.id, transport: 'mcp', tool: name, jobId: result?.job?.id || args?.jobId || null, ok: true, durationMs: Date.now() - startedAt });
+        await audit.record({ principalId: principal.id, transport: 'mcp', tool: name, jobId: result?.job?.id || args?.jobId || null, sessionId: result?.session?.id || args?.sessionId || null, ok: true, durationMs: Date.now() - startedAt });
         return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result, isError: false });
       } catch (error) {
         const failure = error instanceof OrchestratorError ? { code: error.code, message: error.message, details: error.details || {} } : { code: 'internal_error', message: 'Tool failed.' };
-        await audit.record({ principalId: principal.id, transport: 'mcp', tool: name, jobId: args?.jobId || null, ok: false, code: failure.code, durationMs: Date.now() - startedAt });
+        await audit.record({ principalId: principal.id, transport: 'mcp', tool: name, jobId: args?.jobId || null, sessionId: args?.sessionId || null, ok: false, code: failure.code, durationMs: Date.now() - startedAt });
         return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(failure) }], structuredContent: failure, isError: true });
       }
     }

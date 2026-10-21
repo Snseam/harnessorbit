@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { Orchestrator } from '../src/orchestrator.mjs';
 import { PrincipalStore } from '../src/access/principals.mjs';
 import { AccessService, ACCESS_TOOLS } from '../src/access/service.mjs';
@@ -88,7 +89,7 @@ test('status advances collection and verification and reports an integrate atten
 });
 
 test('submit enforces principal scope and the request contract', async t => {
-  const { service, principal, project, base } = await setup(t);
+  const { service, principal, principals, project, base } = await setup(t);
   const other = path.join(base, 'elsewhere'); await fs.mkdir(other);
   await assert.rejects(service.submit(principal, job(other)), e => e.code === 'project_not_allowed');
   await assert.rejects(service.submit(principal, job(project, { agent: 'pi' })), e => e.code === 'agent_not_allowed');
@@ -98,9 +99,10 @@ test('submit enforces principal scope and the request contract', async t => {
   assert.equal((await service.jobs.list({ principalId: principal.id })).length, 0, 'rejected requests create no job');
   await assert.rejects(service.submit(principal, job(project, { extra: true })), e => e.code === 'invalid_job');
   await assert.rejects(service.status(principal, { jobId: 'job-missing' }), e => e.code === 'job_not_found');
-  const stranger = { ...principal, id: 'dot' };
+  const stranger = (await principals.create({ id: 'dot', projects: [project] })).principal;
   const mine = await service.submit(principal, job(project));
   await assert.rejects(service.status(stranger, { jobId: mine.job.id }), e => e.code === 'job_not_found');
+  await assert.rejects(service.status({ ...principal, id: 'ghost' }, { jobId: mine.job.id }), e => e.code === 'permission_denied', 'an unknown principal identity is refused before any lookup');
 });
 
 test('a dispatch failure after submission is reported as a retry attention item, not lost', async t => {
@@ -222,9 +224,11 @@ test('answer replies to a worker that needs input and status follows it through 
 });
 
 test('cancel stops a running worker, withdraws accepted work, and closes dispatch failures', async t => {
-  const { service, principal, project, runtime } = await setup(t);
+  const { service, principal, principals, project, runtime } = await setup(t);
   const running = await service.submit(principal, job(project));
-  await assert.rejects(service.cancel({ ...principal, permissions: { ...principal.permissions, cancel: false } }, { jobId: running.job.id }), e => e.code === 'permission_denied');
+  await principals.update(principal.id, { permissions: { cancel: false } });
+  await assert.rejects(service.cancel(principal, { jobId: running.job.id }), e => e.code === 'permission_denied', 'permission is read from the store, not the token snapshot');
+  await principals.update(principal.id, { permissions: { cancel: true } });
   const cancelled = await service.cancel(principal, { jobId: running.job.id, reason: 'User changed their mind' });
   assert.equal(cancelled.state, 'cancelled');
   assert.equal(cancelled.attempt.status, 'cancelled');
@@ -392,7 +396,7 @@ test('events lists job and run history in order with a cursor that neither loses
   assert.ok(only.events.length > 0 && only.events.every(e => e.job === b.job.id));
   assert.equal(only.events.at(-1).type, 'job.withdrawn');
   await assert.rejects(service.events(principal, { jobId: 'job-missing' }), e => e.code === 'job_not_found');
-  await assert.rejects(service.events({ ...principal, id: 'dot' }, { jobId: b.job.id }), e => e.code === 'job_not_found');
+  await assert.rejects(service.events({ ...principal, id: 'dot' }, { jobId: b.job.id }), e => e.code === 'permission_denied');
   await assert.rejects(service.events(principal, { since: 'yesterday' }), e => e.code === 'invalid_cursor');
   await assert.rejects(service.events(principal, { limit: 0 }), e => e.code === 'invalid_job');
 });
@@ -446,4 +450,71 @@ test('answer resumes a worker that blocked during startup instead of collecting 
   assert.equal(accepted.attempt.status, 'accepted');
   assert.equal(accepted.attempt.verification.status, 'passed');
   assert.equal((await service.jobs.get(submitted.job.id)).operationError, null);
+});
+
+test('jobs recorded before principal identity tracking are kept, reported as legacy, and served only after the operator adopts them', async t => {
+  const { service, principal, principals, project, stateRoot } = await setup(t);
+  const submitted = await service.submit(principal, job(project));
+  const file = path.join(stateRoot, 'access', 'jobs', `${submitted.job.id}.json`);
+  const record = JSON.parse(await fs.readFile(file, 'utf8'));
+  delete record.principalIncarnation;
+  await fs.writeFile(file, JSON.stringify(record));
+  await assert.rejects(service.status(principal, { jobId: submitted.job.id }), e => e.code === 'legacy_migration_required');
+  const listed = await service.events(principal, {});
+  assert.equal(listed.jobs, 0);
+  assert.equal(listed.legacyJobs, 1);
+  await principals.remove(principal.id);
+  const reborn = (await principals.create({ id: principal.id, projects: [project], agents: ['claude', 'codex'] })).principal;
+  await assert.rejects(service.status(reborn, { jobId: submitted.job.id }), e => e.code === 'legacy_migration_required', 'a recreated id does not inherit the job by itself');
+  const adopted = await service.adoptLegacyJobs(reborn.id);
+  assert.deepEqual(adopted.adopted, [submitted.job.id]);
+  assert.equal(adopted.incarnation, reborn.incarnation);
+  assert.equal((await service.status(reborn, { jobId: submitted.job.id, advance: false })).job.id, submitted.job.id);
+  assert.equal((await service.events(reborn, {})).legacyJobs, undefined);
+  assert.equal(parseArgs(['access', 'principal', 'adopt-jobs', '--id', 'grok']).command, 'access principal adopt-jobs');
+});
+
+test('a principal recorded before identity tracking answers legacy_migration_required until the operator migrates it once', async t => {
+  const { service, principal, principals, project, stateRoot } = await setup(t);
+  const file = path.join(stateRoot, 'access', 'principals.json');
+  const store = JSON.parse(await fs.readFile(file, 'utf8'));
+  delete store.principals[principal.id].incarnation;
+  await fs.writeFile(file, JSON.stringify(store));
+  const legacy = await principals.get(principal.id);
+  assert.equal(legacy.incarnation, undefined);
+  await assert.rejects(service.submit(legacy, job(project)), e => e.code === 'legacy_migration_required');
+  await assert.rejects(service.events(legacy, {}), e => e.code === 'legacy_migration_required');
+  const migrated = await principals.migrate(principal.id);
+  assert.equal(migrated.migrated, true);
+  assert.equal(typeof migrated.principal.incarnation, 'string');
+  assert.equal((await principals.migrate(principal.id)).migrated, false, 'migration is a one-time, idempotent operator step');
+  const ready = await principals.get(principal.id);
+  assert.equal((await service.submit(ready, job(project))).state, 'running');
+  await assert.rejects(service.submit(legacy, job(project, { idempotencyKey: 'stale' })), e => e.code === 'permission_denied', 'a request still carrying the pre-migration identity is refused');
+  assert.equal(parseArgs(['access', 'principal', 'migrate', '--id', 'grok']).command, 'access principal migrate');
+});
+
+test('gate regressions: an idempotency key never resurfaces another incarnation’s job, and a request authenticated before the principal was recreated cannot submit or read events', async t => {
+  const { service, principal, principals, project, base } = await setup(t);
+  const other = path.join(base, 'B'); await fs.mkdir(other);
+  execFileSync('git', ['-C', other, 'init', '-q', '-b', 'main'], { stdio: 'pipe' });
+  await fs.writeFile(path.join(other, 'note.txt'), 'b\n');
+  execFileSync('git', ['-C', other, 'add', '.'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', other, '-c', 'user.name=CAO Test', '-c', 'user.email=cao@example.invalid', '-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'Establish project B'], { stdio: 'pipe' });
+  const projectB = await fs.realpath(other);
+  const old = await service.submit(principal, job(project));
+  await principals.remove(principal.id);
+  const fresh = (await principals.create({ id: principal.id, projects: [projectB], agents: ['codex'] })).principal;
+  // Same key, new incarnation: a new job is created for the new scope; the old one is not revealed.
+  const replay = await service.submit(fresh, { ...job(projectB), agent: 'codex', context: 'new context', checks: [{ name: 'noop', argv: [process.execPath, '-e', '0'], timeoutMs: 5000 }] });
+  assert.notEqual(replay.job.id, old.job.id);
+  assert.equal(replay.job.reused, false);
+  assert.equal(replay.job.project, projectB);
+  await assert.rejects(service.status(fresh, { jobId: old.job.id, advance: false }), e => e.code === 'job_not_found');
+  // The old request snapshot (authenticated before the recreation) is refused everywhere.
+  await assert.rejects(service.submit(principal, job(project, { idempotencyKey: 'stale-new-job' })), e => e.code === 'permission_denied');
+  await assert.rejects(service.events(principal, {}), e => e.code === 'permission_denied');
+  await assert.rejects(service.status(principal, { jobId: old.job.id, advance: false }), e => e.code === 'permission_denied');
+  const listed = await service.events(fresh, {});
+  assert.ok(!listed.events.some(e => e.job === old.job.id), 'the new incarnation sees none of the old job’s events');
 });

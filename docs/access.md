@@ -2,7 +2,7 @@
 
 The access layer lets a remote personal agent (for example Grok Bot or Dot) drive the Codex and Claude CLIs that live on the HarnessOrbit host. The agent never gets a shell: it submits a job, HarnessOrbit dispatches it through the normal `dispatch → collect → verify` pipeline in an isolated Git worktree, and the agent polls for status until something needs a decision.
 
-It ships nine tools over the Model Context Protocol and the same nine as CLI subcommands: `describe`, `submit`, `status` to start and follow work, `approve`, `answer`, `cancel`, `retry` to act on the attention items `status` reports, `result` to read what the worker produced, and `events` to read the ordered history of your jobs. A doorbell from host to agent comes later; until then `events` is how an agent catches up.
+It ships sixteen tools over the Model Context Protocol and the same as CLI subcommands. Jobs: `describe`, `submit`, `status` to start and follow work, `approve`, `answer`, `cancel`, `retry` to act on the attention items `status` reports, `result` to read what the worker produced, and `events` to read the ordered history. Live sessions: `sessions`, `session_status`, `session_send`, `session_read`, `session_unbind` to continue an existing Claude Code or Codex CLI session the operator bound (see [Live sessions](#live-sessions)). Memory: `memory_recall` and `memory_checkpoint` (see [Memory](#memory)). A doorbell from host to agent comes later; until then `events` is how an agent catches up.
 
 ## Topology
 
@@ -140,6 +140,84 @@ Events are sorted oldest first by `at` and then by `id`. `next_since` is `<at>/<
 
 Input `{ jobId, includePatch? }`. Returns the `status` view plus a `result` object: the worker report (`status`, `summary`, `changedFiles`, `unresolved`), the verification (`passed`, per check: `status`, exit `code`, `argv`, `stdout` and `stderr` tails of 4000 characters, `error`), `changedPaths`, `outsideScope`, and `integrated`. With `includePatch: true` it adds the verified unified diff (`patch.text`, up to 256 KiB; `patch_too_large` above that, `patch_unavailable` before verification passed). `result_not_ready` until the attempt has been collected.
 
+## Live sessions
+
+A live session is an existing Claude Code or Codex CLI process in a tmux pane on the host. A principal can continue it, reusing all of its context, through five tools: `sessions`, `session_status`, `session_send`, `session_read`, `session_unbind`. This is a different capability from jobs: the session edits its own checkout directly, nothing it does runs through verification, and HarnessOrbit never treats what the agent prints as proof that work is done.
+
+### Authorization
+
+- The principal needs the `sessions` permission (`access principal update --id ID --allow-sessions`). `submit` does not imply it.
+- The host operator binds one pane to one principal: `access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT]`. Binding records the pane, its pane process, the agent process (pid, start time, executable), and the checkout the agent runs in, which must lie within the principal's `projects`; the agent kind must be in its `agents`. `access session discover` lists panes and which hold an agent. One pane holds at most one binding.
+- Every call re-reads the principal from the store: permission bit, current `projects`, current `agents`, and the principal's identity (see [Identity and migration](#identity-and-migration)). A binding that fell out of scope is listed by id only and refuses every other call until the scope is restored.
+- `allowKeys` is off by default. Without it a principal can only send text; approval prompts are answered by the operator.
+
+### Identity checks
+
+Before anything is read from or typed into a pane, the bound identity is re-verified: the pane exists with the same pane process, the bound agent process is alive with the same start time and executable, it still runs under that pane, it is the foreground process of its terminal (not suspended, not backgrounded), and its working directory is still the bound checkout. If the working directory cannot be read the call fails closed (`session_unverified`). Codes: `session_gone`, `session_replaced`, `session_exited`, `session_suspended`, `session_background`, `session_moved`.
+
+### State
+
+The bottom of the screen is classified as `idle` (an empty input box; only the exact placeholder each TUI shows counts as empty), `draft` (the box holds unsent text typed by someone else), `busy` (a spinner row such as `✽ Working… (esc to interrupt)`), `waiting_input` (a permission or trust dialog), or `unknown`. `unknown` and `draft` are never treated as idle. `idle` means the prompt accepts input; `completion.executionFinished` is always `unknown` and `verified` always `false`, because the screen cannot show whether the task is done.
+
+### Tools
+
+- `session_send({ sessionId, idempotencyKey, text | keys })`: types a message and submits it. Accepted only when the session is `idle` (`session_busy`, `session_waiting_input`, `session_draft`, `session_state_unknown` otherwise). `keys` such as `["Enter"]` are accepted only while a prompt is waiting and only if the binding allows keys; nothing is ever pressed automatically. The same `idempotencyKey` returns the earlier message; the same key with a different body is `idempotency_conflict`. Delivery is confirmed by one more transcript echo than before or a busy marker; otherwise the outcome is `uncertain` and the caller must read, never resend. Message bodies are not stored, only hashes and lengths. A binding remembers up to 5000 messages; beyond that the operator re-binds.
+- `session_read({ sessionId, cursor?, maxLines? })`: returns the scrollback plus the transcript part of the screen since the cursor (oldest first, at most 400 lines and 64 KiB per call), the current bottom rows, the state, and `completion`. Rows the TUI rewrites in place (spinners, dialogs, the empty input box) are excluded so the cursor survives redraws. `reset: true` means the anchor scrolled away and the tail was returned.
+- `sessions`, `session_status`, `session_unbind`: list, re-verify and classify, release your binding. The session keeps running on the host.
+
+All mutations of one pane (bind, send, operator unbind) serialize on a per-pane lock, and permission, scope and the binding itself are re-read inside the lock, so a revoked permission or an unbind that raced in takes effect before anything is typed. A send never writes into a binding other than the one it loaded.
+
+### Operator commands
+
+```sh
+node bin/harnessorbit.mjs access session discover
+node bin/harnessorbit.mjs access session bind --principal grok --pane %3 --id claude-main
+node bin/harnessorbit.mjs access session unbind --session claude-main --operator
+```
+
+## Memory
+
+Memory lets an agent recall what is known about a session or job before continuing it, and save a distilled handoff checkpoint afterwards. HarnessOrbit owns identity, permissions, busy/idle, idempotent sending and verification state; the memory provider stores goals, decisions, constraints, open questions and sourced handoff notes. Recalled memory is untrusted evidence: it grants no permission, is not a lock or a command, and is never injected into a session by HarnessOrbit. The caller decides what to forward.
+
+### Provider
+
+The production provider is Memy's own `memy handoff` CLI (contract `memy.handoff.v1`, AgentMemory issue 1429, PR 1430). HarnessOrbit spawns it with the bound checkout as working directory; Memy resolves checkout → connection → Project OAuth grant itself. HarnessOrbit passes no token, project id, tenant or namespace, and never maps a path to a namespace. Enable it with `HARNESSORBIT_MEMORY_PROVIDER=memy-handoff-cli` (and `HARNESSORBIT_MEMY_BIN` if `memy` is not on PATH). Without it the provider is `none` and every memory call answers `unconfigured` with the reason. Only `claude` and `codex` sessions are integrated agents on the Memy side; others answer `unconfigured/agent_unsupported`.
+
+### Flow
+
+1. `memory_recall({ sessionId | jobId, question, topK ≤ 10, exclude? })`: bounded items with `observedAt` and whitelisted provenance; statuses `ok`, `degraded`, `unconfigured`, `denied`, `timeout`, `invalid`, `error`.
+2. `memory_begin({ sessionId | jobId, operationId })`: admission before you gather handoff content. Idempotent per `operationId`; the provider re-checks that the original admission is still current.
+3. `memory_checkpoint({ sessionId | jobId, operationId, summary, goals, decisions, constraints, openQuestions, participants, evidence })`: saves the `memy.handoff.checkpoint.v1` document under the same `operationId`. Without a prior `begin`: `not_begun`.
+
+The target checkout and agent come from the binding or job record, never from the request. An `operationId` stays bound to the principal incarnation, target, session bindingId, checkout and agent that first used it; anything else is `operation_conflict`.
+
+### Checkpoint semantics
+
+- The document is rendered once, written durably to `<state>/access/memory/pending/` before the provider is called, and every retry sends the very same bytes (same `observed_at`). A retry may omit the body; a different body under the same `operationId` is `checkpoint_conflict`.
+- Statuses: `saved`, `deduplicated` (the provider confirmed a replay), `pending` (provider offline, timed out or answered pending: the frozen document stays on the host, retry later), `denied` (final for this `operationId`; begin a new one), `unconfigured`, `invalid`. A replay always goes back to the provider; the local receipt never answers for it.
+- Evidence you supply is attributed to you (`issuer: principal:<id>`) and never upgraded. `verified` and `integrated` labels are accepted only when HarnessOrbit's own job state agrees; live sessions can only carry `planned` or `reported`. HarnessOrbit adds its own machine evidence for jobs (`harnessorbit:attempt/<id>` with checks and patch sha256, `harnessorbit:integration/<id>`); it records a patch hash, not a commit.
+- Provider receipts are validated per command (UUID operation id, UUID project id, write generation, UUID memory ids); a blank or mismatched success envelope is a protocol error, never a save.
+- `access memory pending` lists pending operations for the operator.
+
+## Identity and migration
+
+Every principal carries an `incarnation`, set when it is created. Jobs, session bindings and memory operations record the incarnation that created them, and every call compares the authenticated request's incarnation with the store's current record. Removing a principal id and creating it again produces a new incarnation that cannot see or continue the old one's jobs, bindings or operations, and a request authenticated before the recreation is refused.
+
+Principals and jobs recorded before this existed (access layer 0.3.0 on a host) answer `legacy_migration_required` until the operator migrates them explicitly:
+
+```sh
+node bin/harnessorbit.mjs access principal migrate --id grok      # once: persists a derived incarnation
+node bin/harnessorbit.mjs access principal adopt-jobs --id grok   # assigns that principal's pre-identity jobs to it
+```
+
+Both steps are reviewable and idempotent; nothing is adopted automatically. Session bindings without identity fields answer `session_rebind_required` and are re-bound by the operator.
+
+## Verification levels
+
+- **Fixture**: `tests/access.test.mjs`, `tests/access-memory.test.mjs` and `tests/access-sessions.test.mjs` run against a fake Herdr, a scripted memory provider, a fake `memy handoff` CLI that speaks `memy.handoff.v1`, and fake Claude/Codex agents in a private tmux server (`-L cao-test-…`, never the operator's). They are regression evidence for the contracts above.
+- **Real tmux**: the fake agents run in real tmux panes, so pane identity, foreground-process checks, bracketed paste and capture work for real.
+- **Not covered here**: a real Claude Code or Codex session driven by a model, a real Memy server or connected checkout (this host has no Memy credential), and Grok Bot end to end. Those need live acceptance on a prepared host and are reported as such, not inferred from fixtures.
+
 ## CLI path (same-host agents)
 
 An agent that lives on the same machine as HarnessOrbit, such as Dot inside its own sandbox, needs no network: it runs the subcommands directly, scoped to a principal by id.
@@ -162,8 +240,23 @@ Each call returns the same JSON as the MCP tool. `status`, `approve`, `answer`, 
 
 Every call appends one line to `<state>/access/audit.jsonl`: time, principal, transport (`mcp` or `cli`), tool, job id, outcome, duration. Request bodies and tokens are never written. This file is how the host operator sees what a remote agent asked for.
 
+## Example: Grok continuing a bound session with memory
+
+```text
+1. sessions                          → one binding "claude-main", identity ok, state idle
+2. memory_recall  { sessionId: "claude-main", question: "open decisions on the access layer?" , topK: 5 }
+   → status ok, 3 items with observedAt and provenance; review them, forward only what matters
+3. session_send   { sessionId: "claude-main", idempotencyKey: "room-7/msg-41", text: "<message>" }
+   → outcome sent; state busy
+4. session_read   { sessionId: "claude-main", cursor: <from previous read> } … repeat while state is busy
+   → lines; completion.promptReady true when idle again (not proof the task is finished)
+5. memory_begin   { sessionId: "claude-main", operationId: "room-7/msg-41/handoff" }
+6. memory_checkpoint { sessionId, operationId, summary, decisions, openQuestions, evidence: [{ label: "reported", ref: "session:claude-main" }] }
+   → saved | pending (retry same operationId) | denied (new operation)
+```
+
 ## Not in this phase
 
-- A doorbell webhook from the host to the agent. `events` with `since` is the pull-side half; the push half needs a target the agent can receive on.
+- Durable cooperation events (report / inbox / ack), recipient registration and transport adapters for Grok and Codex: see [the roadmap](access-roadmap.md). `events` with `since` remains the pull-side history of jobs.
 - A headless runtime for hosts without Herdr.
 - OAuth. Fixed bearer headers are what Grok's custom connectors support today; OAuth is added only if a target platform requires it.

@@ -36,8 +36,9 @@ function commandEnv(env) {
   return next;
 }
 
-export async function runCommand(argv, { cwd, env, timeoutMs = 30000, maxBytes = 1048576, signal, onStdout } = {}) {
+export async function runCommand(argv, { cwd, env, timeoutMs = 30000, maxBytes = 1048576, signal, onStdout, input } = {}) {
   validateArgv(argv);
+  if (input !== undefined && typeof input !== 'string' && !Buffer.isBuffer(input)) throw new OrchestratorError('invalid_input', 'input must be a string or Buffer.');
   if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
     throw new OrchestratorError('invalid_timeout', 'timeoutMs must be a non-negative integer', { timeoutMs });
   }
@@ -65,13 +66,17 @@ export async function runCommand(argv, { cwd, env, timeoutMs = 30000, maxBytes =
       env: commandEnv(env),
       shell: false,
       detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
   } catch (cause) {
     throw new OrchestratorError('command_spawn_failed', `failed to spawn ${argv[0]}: ${cause.message}`, {
       argv,
       cause: cause.message,
     });
+  }
+  if (input !== undefined) {
+    child.stdin.on('error', () => { /* the child may exit before reading; the exit code tells the story */ });
+    child.stdin.end(input);
   }
 
   return await new Promise((resolve, reject) => {

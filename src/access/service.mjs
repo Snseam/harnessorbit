@@ -10,9 +10,9 @@ import { PrincipalStore } from './principals.mjs';
 import { JobStore, JOB_TASK_ID } from './jobs.mjs';
 
 export const ACCESS_SCHEMA_VERSION = 1;
-export const ACCESS_VERSION = '0.3.0';
+export const ACCESS_VERSION = '0.4.0';
 export const TOOL_TIMEOUT_MS = 20000;
-export const ACCESS_TOOLS = Object.freeze(['describe', 'submit', 'status', 'approve', 'answer', 'cancel', 'retry', 'events', 'result']);
+export const ACCESS_TOOLS = Object.freeze(['describe', 'submit', 'status', 'approve', 'answer', 'cancel', 'retry', 'events', 'sessions', 'session_status', 'session_send', 'session_read', 'session_unbind', 'memory_recall', 'memory_begin', 'memory_checkpoint', 'result']);
 export const MAX_EVENTS = 200;
 const MAX_EVENT_JOBS = 50;
 // Run events a principal has no use for: periodic observations and supervisor bookkeeping.
@@ -74,7 +74,7 @@ export class AccessAudit {
   async record(entry) {
     const line = {
       at: new Date().toISOString(), principalId: entry.principalId || null, transport: entry.transport || 'cli',
-      tool: entry.tool || null, jobId: entry.jobId || null, ok: entry.ok !== false,
+      tool: entry.tool || null, jobId: entry.jobId || null, ...(entry.sessionId ? { sessionId: String(entry.sessionId).slice(0, 64) } : {}), ok: entry.ok !== false,
       ...(entry.code ? { code: String(entry.code).slice(0, 80) } : {}), durationMs: Number.isFinite(entry.durationMs) ? Math.round(entry.durationMs) : null,
     };
     try {
@@ -117,6 +117,7 @@ export class AccessService {
       result: { note: 'Returns the worker report, verification evidence tails, and, with includePatch, the verified patch.' },
       retry: { input: 'optional feedback', note: 'Starts the next attempt of a failed, reworked, interrupted, or cancelled job with your feedback, or dispatches again when the first dispatch failed. Bounded by the job’s maxAttempts.' },
       events: { input: 'optional jobId, since, limit', limit: MAX_EVENTS, note: 'Lists what happened to your jobs in order. Pass next_since from the previous call as since to read only new events.' },
+      sessions: { permission: 'sessions', allowed: principal.permissions.sessions === true, tools: ['sessions', 'session_status', 'session_send', 'session_read', 'session_unbind'], note: 'Continue a live Claude Code or Codex CLI session the host operator bound to you, reusing its context. Live sessions edit their checkout directly and nothing they do is verified by HarnessOrbit; use submit for verified work.' },
       lifecycle: lifecycle(),
     };
   }
@@ -161,16 +162,33 @@ export class AccessService {
     });
   }
 
+  // The authenticated request carries a principal snapshot; every decision is made against the
+  // store's current record instead. A principal without an incarnation is legacy, a request whose
+  // incarnation is not the current one belongs to a removed principal, and permission and scope
+  // are read fresh each time (and again after any lock wait).
+  async _current(principal) {
+    const current = await this.principals.get(principal?.id).catch(() => null);
+    invariant(!current || typeof current.incarnation === 'string', 'legacy_migration_required', `Principal ${current?.id} predates identity tracking. The host operator runs "access principal migrate --id ${current?.id}" (and then "access principal adopt-jobs") first.`);
+    invariant(typeof principal?.incarnation === 'string' && principal.incarnation.length > 0 && current && current.incarnation === principal.incarnation, 'permission_denied', 'This request’s principal identity is not current; authenticate again.');
+    return current;
+  }
+
   async submit(principal, input) {
-    invariant(principal?.permissions?.submit !== false, 'permission_denied', 'This principal may not submit work.');
-    const prepared = await this._validateSubmit(principal, input);
+    const current = await this._current(principal);
+    invariant(current.permissions.submit !== false, 'permission_denied', 'This principal may not submit work.');
+    const prepared = await this._validateSubmit(current, input);
     const job = await this.jobs.locked(principal.id, async () => {
+      // Re-read after waiting for the lock: the principal may have been revoked or recreated meanwhile.
+      const fresh = await this._current(principal);
+      invariant(fresh.permissions.submit !== false, 'permission_denied', 'This principal may not submit work.');
+      invariant(fresh.projects.includes(prepared.project) && fresh.agents.includes(prepared.agent), 'permission_denied', 'The principal’s scope changed while waiting; submit again.');
       const existing = await this.jobs.findByKey(principal.id, prepared.idempotencyKey);
-      if (existing) return { ...existing, reused: true };
+      // An idempotency key belongs to the incarnation that used it: a recreated principal id starts fresh.
+      if (existing && existing.principalId === fresh.id && existing.principalIncarnation === fresh.incarnation) return { ...existing, reused: true };
       const id = `job-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
       await this.orchestrator.init({ project: prepared.project, id, maxParallel: 1 });
       const created = await this.jobs.create({
-        id, principalId: principal.id, idempotencyKey: prepared.idempotencyKey, project: prepared.project, agent: prepared.agent,
+        id, principalId: principal.id, principalIncarnation: principal.incarnation ?? null, idempotencyKey: prepared.idempotencyKey, project: prepared.project, agent: prepared.agent,
         runId: id, taskId: JOB_TASK_ID, conversationKey: prepared.conversationKey, request: prepared.request, dispatchError: null,
       });
       try { await this.orchestrator.dispatch(id, prepared.task); }
@@ -190,7 +208,7 @@ export class AccessService {
   // gate here because this is the one call that changes files outside a worktree.
   async approve(principal, { jobId, kind = 'integrate' } = {}) {
     invariant(kind === 'integrate', 'invalid_approval', 'kind must be integrate.', { kind });
-    invariant(principal?.permissions?.integrate === true, 'permission_denied', 'This principal may not integrate. The host operator runs integrate on the host.');
+    invariant((await this._current(principal)).permissions.integrate === true, 'permission_denied', 'This principal may not integrate. The host operator runs integrate on the host.');
     const job = await this._owned(principal, jobId);
     invariant(!job.dispatchError && !job.withdrawnAt, 'not_accepted', 'This job has no accepted candidate.');
     await this._settled(job, 'approve');
@@ -203,7 +221,7 @@ export class AccessService {
 
   // Delivers a reply to a worker that stopped for input, then observes its reaction.
   async answer(principal, { jobId, text: reply, keys } = {}) {
-    invariant(principal?.permissions?.submit !== false, 'permission_denied', 'This principal may not drive work.');
+    invariant((await this._current(principal)).permissions.submit !== false, 'permission_denied', 'This principal may not drive work.');
     const answer = reply === undefined ? undefined : text(reply, 'text', 8000);
     if (keys !== undefined) {
       invariant(Array.isArray(keys) && keys.length > 0 && keys.length <= 8, 'invalid_answer', 'keys must be a list of 1 to 8 key names.', { field: 'keys' });
@@ -232,7 +250,7 @@ export class AccessService {
   // Stops the worker and withdraws the job. The orchestrator leaves accepted candidates alone,
   // so the job records the withdrawal itself and stops reporting the integrate attention.
   async cancel(principal, { jobId, reason } = {}) {
-    invariant(principal?.permissions?.cancel !== false, 'permission_denied', 'This principal may not cancel work.');
+    invariant((await this._current(principal)).permissions.cancel !== false, 'permission_denied', 'This principal may not cancel work.');
     const why = text(reason, 'reason', 512, { required: false }) ?? null;
     const job = await this._owned(principal, jobId);
     const withdraw = j => { j.withdrawnAt ||= now(); j.withdrawReason ??= why; j.operationError = null; };
@@ -283,7 +301,7 @@ export class AccessService {
   // dispatch never produced a worker. The orchestrator keeps the task definition and the
   // attempt limit; this only decides which of the two paths applies.
   async retry(principal, { jobId, feedback } = {}) {
-    invariant(principal?.permissions?.submit !== false, 'permission_denied', 'This principal may not drive work.');
+    invariant((await this._current(principal)).permissions.submit !== false, 'permission_denied', 'This principal may not drive work.');
     const note = text(feedback, 'feedback', 8000, { required: false }) ?? null;
     const job = await this._owned(principal, jobId);
     await this._settled(job, 'retry');
@@ -313,9 +331,13 @@ export class AccessService {
   // Lists what happened to the principal's jobs, oldest first, as one ordered stream. The cursor
   // is `<at>/<id>` of the last event returned, so equal timestamps never lose or repeat events.
   async events(principal, { jobId, since, limit = 100 } = {}) {
+    await this._current(principal);
     invariant(Number.isInteger(limit) && limit >= 1 && limit <= MAX_EVENTS, 'invalid_job', `limit must be an integer from 1 to ${MAX_EVENTS}.`, { field: 'limit' });
     invariant(since === undefined || since === null || (typeof since === 'string' && CURSOR_RE.test(since)), 'invalid_cursor', 'since must be a next_since value from a previous events call.', { field: 'since' });
-    const jobs = jobId === undefined || jobId === null ? (await this.jobs.list({ principalId: principal.id })).slice(-MAX_EVENT_JOBS) : [await this._owned(principal, jobId)];
+    let legacyJobs = 0;
+    const jobs = jobId === undefined || jobId === null
+      ? (await this.jobs.list({ principalId: principal.id })).filter(job => { if (typeof job.principalIncarnation !== 'string') { legacyJobs++; return false; } return job.principalIncarnation === principal.incarnation; }).slice(-MAX_EVENT_JOBS)
+      : [await this._owned(principal, jobId)];
     const all = [];
     for (const job of jobs) {
       for (const event of this._jobEvents(job)) all.push(event);
@@ -324,7 +346,7 @@ export class AccessService {
     const key = event => `${event.at}/${event.id}`;
     const fresh = all.filter(event => !since || key(event) > since).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
     const page = fresh.slice(0, limit);
-    return { schemaVersion: ACCESS_SCHEMA_VERSION, events: page, more: fresh.length > page.length, next_since: page.length ? key(page.at(-1)) : (since || null), jobs: jobs.length };
+    return { schemaVersion: ACCESS_SCHEMA_VERSION, events: page, more: fresh.length > page.length, next_since: page.length ? key(page.at(-1)) : (since || null), jobs: jobs.length, ...(legacyJobs ? { legacyJobs, note: `${legacyJobs} job(s) predate principal identity tracking and are not listed until the host operator adopts them (access principal adopt-jobs).` } : {}) };
   }
 
   // Events the access layer itself knows about, derived from the job record.
@@ -359,9 +381,29 @@ export class AccessService {
 
   async _owned(principal, jobId) {
     invariant(typeof jobId === 'string' && jobId.length > 0, 'invalid_job', 'jobId is required.');
+    await this._current(principal);
     const job = await this.jobs.get(jobId);
     invariant(job && job.principalId === principal.id, 'job_not_found', `Job ${jobId} does not exist.`);
+    // Jobs recorded before identity tracking are kept but not served until the host operator
+    // adopts them explicitly (access principal adopt-jobs); nothing is granted to a recreated id by itself.
+    invariant(typeof job.principalIncarnation === 'string', 'legacy_migration_required', `Job ${jobId} predates principal identity tracking. The host operator runs "access principal adopt-jobs --id ${principal.id}" to assign it to the current principal.`, { jobId });
+    invariant(job.principalIncarnation === principal.incarnation, 'job_not_found', `Job ${jobId} does not exist.`);
     return job;
+  }
+
+  // Operator-only: assign this principal's pre-identity jobs to its current incarnation.
+  async adoptLegacyJobs(principalId) {
+    const current = await this.principals.get(principalId);
+    invariant(current, 'principal_not_found', 'Principal does not exist.');
+    return this.jobs.locked(principalId, async () => {
+      const adopted = [];
+      for (const job of await this.jobs.list({ principalId })) {
+        if (typeof job.principalIncarnation === 'string') continue;
+        await this.jobs.update(job.id, j => { j.principalIncarnation = current.incarnation; j.adoptedAt = now(); });
+        adopted.push(job.id);
+      }
+      return { principalId, incarnation: current.incarnation, adopted };
+    });
   }
 
   async _attempt(job, code) {
