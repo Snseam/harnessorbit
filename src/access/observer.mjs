@@ -86,9 +86,14 @@ export class SessionObserver {
       try { await this.tick(); } catch (error) { this.log({ error: error.code || 'tick_failed' }); }
       count += 1;
       if (this.stopped || count >= ticks) break;
-      await new Promise(resolve => { const t = setTimeout(resolve, this.intervalMs); t.unref?.(); });
+      // The interval timer keeps the observer process alive between ticks (never unref'd); stop()
+      // cancels it so a signal ends the loop at once instead of after the interval.
+      await new Promise(resolve => { this.waiting = { timer: setTimeout(() => { this.waiting = null; resolve(); }, this.intervalMs), resolve }; });
     }
   }
 
-  stop() { this.stopped = true; }
+  stop() {
+    this.stopped = true;
+    if (this.waiting) { clearTimeout(this.waiting.timer); const { resolve } = this.waiting; this.waiting = null; resolve(); }
+  }
 }

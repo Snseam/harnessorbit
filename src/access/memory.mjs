@@ -72,9 +72,11 @@ export function normalizeProviderResult(kind, result) {
   return { ...result, status: 'error', reason: 'protocol', detail: `provider returned unknown status "${clip(String(status), 40)}"` };
 }
 
+// The timer is the only thing guaranteed to settle this race, so it must keep the event loop
+// alive: an unref'd timer would let a process exit while the caller still awaits the timeout.
 function withTimeout(promise, ms, label) {
   let timer;
-  const timeout = new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'timeout', reason: 'timeout', detail: `${label} did not answer within ${ms} ms` }), ms); timer.unref?.(); });
+  const timeout = new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'timeout', reason: 'timeout', detail: `${label} did not answer within ${ms} ms` }), ms); });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 

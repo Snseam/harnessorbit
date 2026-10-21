@@ -358,3 +358,67 @@ test('crash regression: a complete checksummed record without its final newline 
   assert.deepEqual((await coop.inbox(codex, {})).events.map(e => e.seq), [1, 2, 3]);
   assert.ok((await fs.readFile(journal, 'utf8')).endsWith('\n'));
 });
+
+test('review regressions: a recreated consumer inherits no old payloads, and ack and report re-check authority after waiting for the store lock', async t => {
+  const { coop, grok, codex, jobId, principals, project, base, access, stateRoot } = await setup(t);
+  const first = await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex' });
+  const old = await coop.report(grok, report(jobId, { idempotencyKey: 'old', payload: { summary: 'PROJECT_A_SECRET' } }));
+  // 1. Recreate the consumer principal and re-register the same recipient id: the new owner sees nothing of the old inbox.
+  await principals.remove('codex');
+  const other = path.join(base, 'B'); await fs.mkdir(other);
+  const reborn = (await principals.create({ id: 'codex', projects: [other], agents: ['codex'], kind: 'codex' })).principal;
+  await coop.revokeRecipient('codex-inbox');
+  const second = await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex' });
+  const inbox = await coop.inbox(reborn, {});
+  assert.equal(inbox.events.length, 0, 'the earlier owner’s delivery is not surfaced');
+  assert.equal(inbox.withheld, 1, 'but its existence is counted, not hidden');
+  assert.ok(!JSON.stringify(inbox).includes('PROJECT_A_SECRET'));
+  await assert.rejects(coop.ack(reborn, { eventId: old.event.eventId, epoch: second.epoch }), e => e.code === 'event_not_delivered');
+  await assert.rejects(coop.ack(reborn, { eventId: old.event.eventId, epoch: first.epoch }), e => e.code === 'event_not_delivered');
+  // A new event for the new recipient works normally.
+  const fresh = await coop.report(grok, report(jobId, { idempotencyKey: 'fresh' }));
+  assert.equal((await coop.inbox(reborn, {})).events[0].eventId, fresh.event.eventId);
+  assert.equal((await coop.ack(reborn, { eventId: fresh.event.eventId, epoch: second.epoch })).repeated, false);
+  // 2. ACK waits for the lock while the operator re-registers the recipient under a new epoch
+  // (done inside the held lock, as the operator CLI would under its own lock): the stale epoch is refused.
+  const e2 = await coop.report(grok, report(jobId, { idempotencyKey: 'e2' }));
+  let release2; const gate2 = new Promise(r => { release2 = r; });
+  let third;
+  const holding2 = coop.store.lock(async () => { await gate2; const recipients = await coop.store.recipients(); third = { ...recipients['codex-inbox'], epoch: 'feedfacefeedface', createdAt: new Date().toISOString() }; recipients['codex-inbox'] = third; await coop.store.saveRecipients(recipients); });
+  await new Promise(r => setTimeout(r, 30));
+  const waitingAck = coop.ack(reborn, { eventId: e2.event.eventId, epoch: second.epoch });
+  await new Promise(r => setTimeout(r, 30));
+  release2(); await holding2;
+  await assert.rejects(waitingAck, e => e.code === 'epoch_mismatch');
+  // ACK waits while the consumer principal is recreated: the stale request is refused.
+  let release3; const gate3 = new Promise(r => { release3 = r; });
+  const holding3 = coop.store.lock(() => gate3);
+  await new Promise(r => setTimeout(r, 30));
+  const e3 = await (async () => { release3(); await holding3; return coop.report(grok, report(jobId, { idempotencyKey: 'e3' })); })();
+  let release4; const gate4 = new Promise(r => { release4 = r; });
+  const holding4 = coop.store.lock(() => gate4);
+  await new Promise(r => setTimeout(r, 30));
+  const stale = coop.ack(reborn, { eventId: e3.event.eventId, epoch: third.epoch });
+  await new Promise(r => setTimeout(r, 30));
+  await principals.remove('codex');
+  await principals.create({ id: 'codex', projects: [other], agents: ['codex'], kind: 'codex' });
+  release4(); await holding4;
+  await assert.rejects(stale, e => e.code === 'permission_denied');
+  const receipts = (await new CoopStore({ root: stateRoot }).load()).acks;
+  assert.equal([...receipts.keys()].filter(k => k.endsWith(':codex-inbox')).length, 1, 'only the one legitimate receipt exists');
+  // 3. A report waits while the reporter's project or agent scope is narrowed: refused, zero events journaled.
+  const before = (await new CoopStore({ root: stateRoot }).load()).records.length;
+  for (const change of [{ projects: [other] }, { agents: ['codex'] }]) {
+    let rel; const g = new Promise(r => { rel = r; });
+    const h = coop.store.lock(() => g);
+    await new Promise(r => setTimeout(r, 30));
+    const waiting = coop.report(grok, report(jobId, { idempotencyKey: `narrow-${Object.keys(change)[0]}` }));
+    await new Promise(r => setTimeout(r, 30));
+    await principals.update('grok', change);
+    rel(); await h;
+    await assert.rejects(waiting, e => ['permission_denied', 'task_not_found'].includes(e.code));
+    await principals.update('grok', { projects: [project], agents: ['claude', 'codex'] });
+  }
+  assert.equal((await new CoopStore({ root: stateRoot }).load()).records.length, before, 'nothing was journaled for the narrowed reports');
+  assert.equal((await coop.report(grok, report(jobId, { idempotencyKey: 'still-ok' }))).reused, false, 'an unchanged authorized report still succeeds');
+});

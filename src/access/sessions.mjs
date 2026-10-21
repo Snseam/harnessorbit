@@ -28,7 +28,8 @@ const KEY_RE = /^[A-Za-z0-9+_-]{1,32}$/;
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const now = () => new Date().toISOString();
-const sleep = ms => new Promise(resolve => { const t = setTimeout(resolve, ms); t.unref?.(); });
+// Awaited sleeps keep the loop alive on purpose; an unref'd timer here would let the process exit mid-wait.
+const sleep = ms => new Promise(resolve => { setTimeout(resolve, ms); });
 const basename = value => (typeof value === 'string' && value ? path.basename(value.trim()) : '');
 
 // Screen classifiers per agent. Patterns are checked on the bottom rows of the pane, most

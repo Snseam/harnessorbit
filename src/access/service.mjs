@@ -31,7 +31,8 @@ const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const serializeError = e => ({ code: e.code || 'error', message: e.message, ...(e.details && Object.keys(e.details).length ? { details: e.details } : {}) });
 const now = () => new Date().toISOString();
 const tail = (value, max) => typeof value === 'string' && value.length > max ? value.slice(-max) : (value ?? '');
-const sleep = ms => new Promise(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.(); });
+// Awaited by the settle window in _run; it must keep the loop alive until it fires.
+const sleep = ms => new Promise(resolve => { setTimeout(resolve, ms); });
 // The principal answered after the attempt was last collected, so the worker's reaction is still unobserved.
 const answeredSince = (job, attempt) => {
   const last = (job.answers || []).filter(a => a.attemptId === attempt.id).at(-1);
