@@ -7,6 +7,7 @@ import { Orchestrator } from '../src/orchestrator.mjs';
 import { PrincipalStore } from '../src/access/principals.mjs';
 import { AccessService, ACCESS_TOOLS } from '../src/access/service.mjs';
 import { SessionStore } from '../src/access/sessions.mjs';
+import { CoopService } from '../src/access/coop.mjs';
 import { MemoryService, MemyHandoffCliProvider, NullMemoryProvider, memoryProviderFromEnv, uuidFromOperationId, boundedProvenance } from '../src/access/memory.mjs';
 import { startAccessServer } from '../src/access/server.mjs';
 import { parseArgs } from '../bin/cao.mjs';
@@ -507,4 +508,58 @@ test('gate regressions: memory operations re-check the current agent scope and s
   await assert.rejects(memory.checkpoint(principal, input), e => e.code === 'operation_conflict');
   assert.equal(provider.calls.length, before);
   assert.equal((await memory.begin(principal, { sessionId: 'ses-1', operationId: 'binding-op-2' })).status, 'admitted', 'a new operation works for the new binding');
+});
+
+test('memory authority is fixed at begin: the orchestrator carrier needs the host flag and an event-based attestation, never a borrowed agent grant', async t => {
+  const { memory, principal, access, project, stateRoot, principals, orchestrator, provider } = await setup(t);
+  const coop = new CoopService({ root: stateRoot, principals, jobs: access.jobs, orchestrator });
+  const submitted = await access.submit(principal, job(project));
+  const otherJob = await access.submit(principal, job(project, { idempotencyKey: 'req-2' }));
+  // Without the host flag the orchestrator carrier is explicitly unavailable; the provider is not asked and no agent grant stands in.
+  const off = await memory.begin(principal, { jobId: submitted.job.id, operationId: 'oc', authority: 'orchestrator' });
+  assert.equal(off.status, 'unconfigured');
+  assert.equal(off.reason, 'orchestrator_carrier_unavailable');
+  assert.equal(provider.calls.filter(c => c.tool === 'begin').length, 0);
+  await assert.rejects(memory.begin(principal, { jobId: submitted.job.id, operationId: 'oc', authority: 'owner' }), e => e.code === 'invalid_memory_request');
+  // With the flag, begin is carried by the orchestrator grant and the authority is frozen.
+  const enabled = new MemoryService({ root: stateRoot, provider, principals, jobs: access.jobs, orchestrator, coop, orchestratorCarrier: true, timeoutMs: 600 });
+  const begun = await enabled.begin(principal, { jobId: submitted.job.id, operationId: 'oc', authority: 'orchestrator' });
+  assert.equal(begun.status, 'admitted');
+  assert.equal(begun.authority, 'orchestrator');
+  assert.equal(provider.calls.at(-1).input.agent, 'orchestrator');
+  await assert.rejects(enabled.begin(principal, { jobId: submitted.job.id, operationId: 'oc', authority: 'agent' }), e => e.code === 'operation_conflict', 'an admitted operation never switches authority');
+  await assert.rejects(enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc', ...body() }), e => e.code === 'attestation_required');
+  await assert.rejects(enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc', ...body(), attestationEventId: '00000000-0000-4000-8000-000000000000' }), e => e.code === 'attestation_invalid');
+  const foreign = await coop.report(principal, { idempotencyKey: 'other-task', type: 'work.reported', task: { ref: `harnessorbit:job/${otherJob.job.id}` }, payload: {} });
+  await assert.rejects(enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc', ...body(), attestationEventId: foreign.event.eventId }), e => e.code === 'attestation_invalid', 'an event about another task is no attestation for this one');
+  const mine = await coop.report(principal, { idempotencyKey: 'mine', type: 'work.reported', task: { ref: `harnessorbit:job/${submitted.job.id}` }, payload: { summary: 'done' } });
+  const saved = await enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc', ...body(), attestationEventId: mine.event.eventId });
+  assert.equal(saved.status, 'saved');
+  const sent = provider.calls.filter(c => c.tool === 'save').at(-1).input;
+  assert.equal(sent.agent, 'orchestrator');
+  assert.equal(sent.document.session.agent, 'orchestrator');
+  assert.equal(sent.document.attested_by, `principal:grok@${principal.incarnation}`);
+  assert.equal(sent.document.attestation_ref, `harnessorbit:event/${mine.event.eventId}`);
+  assert.equal(sent.document.participants[0].kind, 'grok');
+  // Turning the host flag off afterwards does not rewrite the admission: a retry still goes through the orchestrator carrier, never the agent grant.
+  const later = new MemoryService({ root: stateRoot, provider, principals, jobs: access.jobs, orchestrator, coop, orchestratorCarrier: false, timeoutMs: 600 });
+  const replay = await later.checkpoint(principal, { jobId: submitted.job.id, operationId: 'oc' });
+  assert.equal(replay.status, 'deduplicated');
+  assert.equal(provider.calls.filter(c => c.tool === 'save').at(-1).input.agent, 'orchestrator');
+  // An agent-carried operation stays agent-carried and needs no attestation.
+  assert.equal((await enabled.begin(principal, { jobId: submitted.job.id, operationId: 'ag' })).authority, 'agent');
+  assert.equal((await enabled.checkpoint(principal, { jobId: submitted.job.id, operationId: 'ag', ...body() })).status, 'saved');
+  assert.equal(provider.calls.filter(c => c.tool === 'save').at(-1).input.agent, 'claude');
+  assert.equal(provider.calls.filter(c => c.tool === 'save').at(-1).input.document.attested_by, undefined);
+});
+
+test('the fake memy CLI exposes the orchestrator carrier only when the host enabled it', async t => {
+  const f = await fixture(); t.after(f.remove);
+  const project = await fs.realpath(f.project);
+  const env = { ...process.env, FAKE_MEMY_LOG: path.join(f.base, 'memy.log'), FAKE_MEMY_STATE: path.join(f.base, 'memy-state.json') };
+  const cli = extra => new MemyHandoffCliProvider({ argv: [process.execPath, FAKE_MEMY], timeoutMs: 1500, command: (argv, opts) => import('../src/process.mjs').then(m => m.runCommand(argv, { ...opts, env: { ...env, ...extra } })) });
+  assert.equal((await cli({}).begin({ project, agent: 'orchestrator', operationId: 'o' })).reason, 'agent_unsupported');
+  assert.equal((await cli({ FAKE_MEMY_ORCHESTRATOR: '1' }).begin({ project, agent: 'orchestrator', operationId: 'o' })).status, 'admitted');
+  const log = (await fs.readFile(env.FAKE_MEMY_LOG, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(log.every(l => l.flags.agent === 'orchestrator'));
 });

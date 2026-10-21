@@ -446,7 +446,9 @@ export class CoopService {
   // Records one dispatch attempt outcome durably. `unknown` is its own state: the transport may
   // have delivered, so the next attempt reconciles by eventId before any repeated side effect.
   async recordAttempt({ eventId, consumerId, epoch, outcome, detail = null, attempts = 1, nextAttemptAt = null }) {
-    invariant(['accepted', 'unknown', 'failed', 'revoked', 'dead'].includes(outcome), 'invalid_event', 'Unknown attempt outcome.');
+    // deferred: the destination cannot take it right now (wrong runtime, busy thread, missing
+    // secret); it stays pending without consuming the attempt budget.
+    invariant(['accepted', 'unknown', 'failed', 'deferred', 'revoked', 'dead'].includes(outcome), 'invalid_event', 'Unknown attempt outcome.');
     const receipt = { v: COOP_VERSION, kind: 'attempt', eventId, consumerId, epoch, outcome, detail: detail ? String(detail).slice(0, 200) : null, attempts, nextAttemptAt, at: this.now() };
     await this.store.lock(() => this.store.receipts.append(receipt));
     return receipt;

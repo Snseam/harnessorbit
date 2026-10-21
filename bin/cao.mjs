@@ -41,6 +41,7 @@ import { MemoryService, memoryProviderFromEnv } from '../src/access/memory.mjs';
 import { JobStore } from '../src/access/jobs.mjs';
 import { CoopService } from '../src/access/coop.mjs';
 import { SessionObserver } from '../src/access/observer.mjs';
+import { Dispatcher, defaultAdapters } from '../src/access/dispatch.mjs';
 
 export const help = `HarnessOrbit 0.1.0
 
@@ -154,8 +155,9 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access session read --principal ID --session ID [--cursor CURSOR] [--max-lines 120]
   access session unbind --principal ID --session ID   (or --operator to drop any binding by id)
   access memory recall --principal ID (--session ID | --job ID) --question TEXT [--top-k 5]
-  access memory begin --principal ID (--session ID | --job ID) --operation ID
-  access memory checkpoint --principal ID (--session ID | --job ID) --operation ID [--file CHECKPOINT.json]
+  access memory begin --principal ID (--session ID | --job ID) --operation ID [--authority agent|orchestrator]
+  access memory checkpoint --principal ID (--session ID | --job ID) --operation ID [--file CHECKPOINT.json] [--attestation EVENT-UUID]
+  (orchestrator carrier needs HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER=1 on the host after "memy connection orchestrator enable")
   access memory pending [--principal ID]
   access recipient register --id ID --kind inbox --principal ID [--task-refs harnessorbit:job/,…] [--sources ID,…] [--types work.reported,…] [--label TEXT]
   access recipient register --id ID --kind grok-native-webhook --endpoint https://… --secret-file FILE [scopes…]
@@ -165,6 +167,7 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access coop inbox --principal ID [--cursor N] [--limit 50]
   access coop ack --principal ID --event UUID --epoch EPOCH
   access coop deliveries                            (operator: pending non-inbox deliveries)
+  access coop dispatch [--once] [--interval-ms 5000] [--allow-http-loopback]   (operator: deliver pending events through registered transports)
   access observe [--once] [--interval-ms 5000] [--tmux-socket NAME]   (emit agent.turn_finished on observed working → ready)
   (memory provider: HARNESSORBIT_MEMORY_PROVIDER=memy-handoff-cli [HARNESSORBIT_MEMY_BIN=memy]; unset = unconfigured)
 
@@ -235,13 +238,14 @@ const optionsByCommand = {
   'access session read': ['principal', 'session', 'cursor', 'max-lines', 'tmux-socket'],
   'access session unbind': ['principal', 'session', 'operator', 'tmux-socket'],
   'access memory recall': ['principal', 'session', 'job', 'question', 'top-k'],
-  'access memory begin': ['principal', 'session', 'job', 'operation'],
-  'access memory checkpoint': ['principal', 'session', 'job', 'operation', 'file'],
+  'access memory begin': ['principal', 'session', 'job', 'operation', 'authority'],
+  'access memory checkpoint': ['principal', 'session', 'job', 'operation', 'file', 'attestation'],
   'access memory pending': ['principal'],
   'access recipient register': ['id', 'kind', 'principal', 'endpoint', 'secret-file', 'socket', 'thread', 'task-refs', 'sources', 'types', 'label'],
   'access recipient list': [], 'access recipient revoke': ['id'],
   'access coop report': ['principal', 'key', 'type', 'task', 'payload-file', 'evidence-file', 'conversation', 'correlation', 'causation'],
   'access coop inbox': ['principal', 'cursor', 'limit'], 'access coop ack': ['principal', 'event', 'epoch'], 'access coop deliveries': [],
+  'access coop dispatch': ['once', 'interval-ms', 'allow-http-loopback'],
   'access observe': ['once', 'interval-ms', 'tmux-socket'],
 };
 const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop']);
@@ -258,7 +262,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once', 'allow-http-loopback'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -416,8 +420,8 @@ export async function main(argv = process.argv.slice(2)) {
       const service = new AccessService({ root: profiles.root, orchestrator, driver: 'background' });
       const sessions = new SessionService({ root: profiles.root, principals: service.principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
       const provider = memoryProviderFromEnv();
-      const memory = new MemoryService({ root: profiles.root, provider, principals: service.principals, sessions: sessions.sessions, jobs: service.jobs, orchestrator });
       const coop = new CoopService({ root: profiles.root, principals: service.principals, jobs: service.jobs, sessions: sessions.sessions, orchestrator });
+      const memory = new MemoryService({ root: profiles.root, provider, principals: service.principals, sessions: sessions.sessions, jobs: service.jobs, orchestrator, coop, orchestratorCarrier: process.env.HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER === '1' });
       const port = o.port === undefined ? 0 : Number(o.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new OrchestratorError('invalid_arguments', '--port must be an integer from 0 to 65535.');
       const started = await startAccessServer({ service, sessions, memory, coop, port, host: o.host || '127.0.0.1' });
@@ -468,7 +472,9 @@ export async function main(argv = process.argv.slice(2)) {
     case 'access memory checkpoint':
     case 'access memory pending': {
       const principals = new PrincipalStore({ root: profiles.root });
-      const memory = new MemoryService({ root: profiles.root, provider: memoryProviderFromEnv(), principals, sessions: new SessionStore({ root: profiles.root }), jobs: new JobStore({ root: profiles.root }), orchestrator });
+      const memorySessions = new SessionStore({ root: profiles.root });
+      const memoryJobs = new JobStore({ root: profiles.root });
+      const memory = new MemoryService({ root: profiles.root, provider: memoryProviderFromEnv(), principals, sessions: memorySessions, jobs: memoryJobs, orchestrator, coop: new CoopService({ root: profiles.root, principals, jobs: memoryJobs, sessions: memorySessions, orchestrator }), orchestratorCarrier: process.env.HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER === '1' });
       const tool = command.slice('access memory '.length);
       if (tool === 'pending') return memory.pending(o.principal ? { id: o.principal } : null);
       const principal = await principals.get(required('principal'));
@@ -480,8 +486,8 @@ export async function main(argv = process.argv.slice(2)) {
         const result = tool === 'recall'
           ? await memory.recall(principal, { ...target, question: required('question'), ...(o['top-k'] === undefined ? {} : { topK: Number(o['top-k']) }) })
           : tool === 'begin'
-            ? await memory.begin(principal, { ...target, operationId: required('operation') })
-            : await memory.checkpoint(principal, { ...target, operationId: required('operation'), ...(o.file ? await readProfile(o.file) : {}) });
+            ? await memory.begin(principal, { ...target, operationId: required('operation'), ...(o.authority ? { authority: o.authority } : {}) })
+            : await memory.checkpoint(principal, { ...target, operationId: required('operation'), ...(o.file ? await readProfile(o.file) : {}), ...(o.attestation ? { attestationEventId: o.attestation } : {}) });
         await audit.record({ principalId: principal.id, transport: 'cli', tool: `memory_${tool}`, jobId: o.job || null, sessionId: o.session || null, ok: true, code: result.status, durationMs: Date.now() - startedAt });
         return result;
       } catch (error) {
@@ -496,6 +502,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'access coop inbox':
     case 'access coop ack':
     case 'access coop deliveries':
+    case 'access coop dispatch':
     case 'access observe': {
       const principals = new PrincipalStore({ root: profiles.root });
       const sessionStore = new SessionStore({ root: profiles.root });
@@ -505,6 +512,13 @@ export async function main(argv = process.argv.slice(2)) {
       if (command === 'access recipient list') return coop.listRecipients();
       if (command === 'access recipient revoke') return coop.revokeRecipient(required('id'));
       if (command === 'access coop deliveries') return { deliveries: await coop.pendingDeliveries() };
+      if (command === 'access coop dispatch') {
+        const dispatcher = new Dispatcher({ root: profiles.root, coop, principals, adapters: defaultAdapters({ grok: { allowHttpLoopback: !!o['allow-http-loopback'] } }) });
+        if (o.once) return { results: await dispatcher.tick() };
+        process.once('SIGINT', () => dispatcher.stop()); process.once('SIGTERM', () => dispatcher.stop());
+        await dispatcher.run({ intervalMs: o['interval-ms'] === undefined ? 5000 : Number(o['interval-ms']) });
+        return { stopped: true };
+      }
       if (command === 'access observe') {
         const sessions = new SessionService({ root: profiles.root, principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
         const observer = new SessionObserver({ root: profiles.root, sessions, coop, intervalMs: o['interval-ms'] === undefined ? 5000 : Number(o['interval-ms']), log: entry => process.stderr.write(`${JSON.stringify(entry)}\n`) });

@@ -44,8 +44,9 @@ export function uuidFromOperationId(operationId, namespace = 'harnessorbit-acces
 
 // HarnessOrbit agent kinds → the Memy-integrated Agent whose grant carries the request.
 export function handoffAgent(kind) {
-  return kind === 'claude' ? { flag: 'claude-code', id: 'claude_code' } : kind === 'codex' ? { flag: 'codex', id: 'codex' } : null;
+  return kind === 'claude' ? { flag: 'claude-code', id: 'claude_code' } : kind === 'codex' ? { flag: 'codex', id: 'codex' } : kind === 'orchestrator' ? { flag: 'orchestrator', id: 'orchestrator' } : null;
 }
+export const MEMORY_AUTHORITIES = Object.freeze(['agent', 'orchestrator']);
 
 // Provenance is kept as a flat object of short scalars so it stays bounded without ever being
 // cut in the middle of a JSON document.
@@ -203,11 +204,15 @@ function listField(value, field, { maxItems = LIST_LIMIT, maxChars = 400 } = {})
 }
 
 export class MemoryService {
-  constructor({ root, provider = new NullMemoryProvider(), principals, sessions, jobs, orchestrator, timeoutMs = 8000 } = {}) {
+  // orchestratorCarrier is the host operator's explicit choice to allow Memy's distinct
+  // orchestrator grant (`--agent orchestrator`) for checkpoints that no Claude/Codex session grant
+  // carries. Off by default; never a fallback for an agent-carried operation or vice versa.
+  constructor({ root, provider = new NullMemoryProvider(), principals, sessions, jobs, orchestrator, coop = null, orchestratorCarrier = false, timeoutMs = 8000 } = {}) {
     invariant(typeof root === 'string' && root.length > 0, 'invalid_state_root', 'Memory service root is required.');
     invariant(principals, 'invalid_principals', 'Memory service requires a principal store.');
     this.root = path.resolve(root);
-    this.provider = provider; this.principals = principals; this.sessions = sessions || null; this.jobs = jobs || null; this.orchestrator = orchestrator || null;
+    this.provider = provider; this.principals = principals; this.sessions = sessions || null; this.jobs = jobs || null; this.orchestrator = orchestrator || null; this.coop = coop;
+    this.orchestratorCarrier = orchestratorCarrier === true;
     this.timeoutMs = timeoutMs;
     this.directory = path.join(this.root, 'access', 'memory');
   }
@@ -217,6 +222,7 @@ export class MemoryService {
       provider: this.provider.name, configured: this.provider.configured === true, experimental: this.provider.experimental === true,
       ...(this.provider.configured ? {} : { reason: this.provider.reason || null, detail: this.provider.detail || null }),
       tools: ['memory_recall', 'memory_begin', 'memory_checkpoint'], contract: 'memy.handoff.v1',
+      authorities: { default: 'agent', orchestratorCarrier: this.orchestratorCarrier, note: 'agent: the bound Claude/Codex session’s own grant. orchestrator: Memy’s distinct orchestrator grant, only when the host enabled it; needs attestationEventId (a cooperation event you reported about the target). Fixed at begin; never a fallback.' },
       allowed: { sessions: principal.permissions.sessions === true, jobs: principal.permissions.submit !== false },
       flow: 'recall (read) → begin (admission, before you gather handoff content) → checkpoint (save under the same operationId; retry with the same operationId and body).',
       note: 'Memory is evidence, not permission: the target checkout comes from the binding or job, never from the request. Live sessions are never verified by HarnessOrbit; evidence you supply stays attributed to you.',
@@ -297,14 +303,26 @@ export class MemoryService {
   // Admission for new handoff content. It must precede gathering what the checkpoint will say,
   // and it is idempotent per operationId: the provider re-checks that the original admission is
   // still current and never replaces it.
-  async begin(principal, { sessionId, jobId, operationId } = {}) {
+  // Which Memy grant carries an operation is fixed here, at admission, and never changes: `agent`
+  // (default) is the bound Claude/Codex session's own v1 grant; `orchestrator` is Memy's distinct
+  // orchestrator grant, usable only when the host operator enabled that carrier. A repeat begin
+  // under the other authority is a conflict, not a switch.
+  async begin(principal, { sessionId, jobId, operationId, authority = 'agent' } = {}) {
     const op = textField(operationId, 'operationId', 128, { multiline: false });
+    invariant(MEMORY_AUTHORITIES.includes(authority), 'invalid_memory_request', 'authority must be agent or orchestrator.', { field: 'authority' });
     return this._lock(op, async () => {
       const { target, principal: current } = await this._target(principal, { sessionId, jobId });
       const existing = await readJson(this._file('admissions', op), { optional: true });
-      if (existing) this._sameOwner(existing, current, target, op);
+      if (existing) {
+        this._sameOwner(existing, current, target, op);
+        invariant((existing.authority || 'agent') === authority, 'operation_conflict', `This operationId was admitted under the ${existing.authority || 'agent'} authority; it cannot be switched.`, { operationId: op });
+      }
+      if (authority === 'orchestrator' && !this.orchestratorCarrier) {
+        return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: 'unconfigured', reason: 'orchestrator_carrier_unavailable', detail: 'The host operator has not enabled Memy’s orchestrator carrier (HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER=1 after `memy connection orchestrator enable`). No Claude/Codex grant is borrowed instead.', operationId: op, target: this._publicTarget(target), authority, writeGeneration: null, repeated: Boolean(existing), latencyMs: null, note: 'Not admitted.' };
+      }
+      const carrier = authority === 'orchestrator' ? 'orchestrator' : target.agent;
       let result;
-      try { result = await withTimeout(this.provider.begin({ project: target.project, agent: target.agent, operationId: op, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
+      try { result = await withTimeout(this.provider.begin({ project: target.project, agent: carrier, operationId: op, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
       catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
       result = normalizeProviderResult('begin', result);
       if (result.status === 'admitted') {
@@ -312,10 +330,10 @@ export class MemoryService {
         if (existing && ((existing.projectId && result.projectId && existing.projectId !== result.projectId) || (Number.isInteger(existing.writeGeneration) && Number.isInteger(result.writeGeneration) && existing.writeGeneration !== result.writeGeneration))) {
           result = { status: 'denied', reason: 'collection_changed', detail: 'The provider admitted a different Project or generation than the original admission.' };
         } else {
-          await writeJsonAtomic(this._file('admissions', op), { ...this._owner(current, target, op), provider: this.provider.name, projectId: result.projectId ?? null, writeGeneration: result.writeGeneration ?? null, at: existing?.at || now(), confirmedAt: now() });
+          await writeJsonAtomic(this._file('admissions', op), { ...this._owner(current, target, op), authority, carrier, provider: this.provider.name, projectId: result.projectId ?? null, writeGeneration: result.writeGeneration ?? null, at: existing?.at || now(), confirmedAt: now() });
         }
       }
-      return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, operationId: op, target: this._publicTarget(target), writeGeneration: result.writeGeneration ?? null, repeated: Boolean(existing), latencyMs: result.latencyMs ?? null, note: result.status === 'admitted' ? 'Admitted. Gather the handoff content now and save it with memory_checkpoint under this operationId.' : 'Not admitted; no checkpoint can be saved under this operationId until begin succeeds.' };
+      return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, operationId: op, target: this._publicTarget(target), authority, writeGeneration: result.writeGeneration ?? null, repeated: Boolean(existing), latencyMs: result.latencyMs ?? null, note: result.status === 'admitted' ? 'Admitted. Gather the handoff content now and save it with memory_checkpoint under this operationId.' : 'Not admitted; no checkpoint can be saved under this operationId until begin succeeds.' };
     });
   }
 
@@ -369,10 +387,24 @@ export class MemoryService {
     return { evidence, attemptStatus: status, attemptId: attempt?.id || null };
   }
 
+  // The attestation for an orchestrator-carried checkpoint: a durable cooperation event that the
+  // authenticated principal itself reported about this very target. attested_by names the
+  // principal with its incarnation; attestation_ref names that event. Nothing else is accepted.
+  async _attestation(current, target, eventId) {
+    invariant(typeof eventId === 'string' && /^[0-9a-f-]{36}$/i.test(eventId), 'attestation_required', 'An orchestrator-carried checkpoint needs attestationEventId: the UUID of a cooperation event you reported about this target.', { field: 'attestationEventId' });
+    invariant(this.coop, 'attestation_unavailable', 'Cooperation events are not enabled on this host, so no attestation source exists.');
+    const state = await this.coop.store.load();
+    const record = state.byId.get(eventId);
+    invariant(record && record.event.source.principalId === current.id && record.event.source.incarnation === current.incarnation && record.event.source.via !== 'observer', 'attestation_invalid', 'The attestation event was not reported by you.', { eventId });
+    const ref = target.kind === 'job' ? `harnessorbit:job/${target.id}` : `harnessorbit:session/${target.id}`;
+    invariant(record.event.task.ref === ref, 'attestation_invalid', 'The attestation event is about a different task.', { eventId, task: record.event.task.ref });
+    return { attested_by: `principal:${current.id}@${current.incarnation}`, attestation_ref: `harnessorbit:event/${eventId}` };
+  }
+
   // Builds the memy.handoff.checkpoint.v1 document. Field order is fixed so the canonical bytes
   // of a retry equal the first attempt's.
-  _document(normalized, target, principal, machine, observedAt) {
-    const agent = handoffAgent(target.agent);
+  _document(normalized, target, principal, machine, observedAt, { authority = 'agent', attestation = null } = {}) {
+    const agent = authority === 'orchestrator' ? handoffAgent('orchestrator') : handoffAgent(target.agent);
     const participants = [
       { id: `principal:${principal.id}`, kind: PARTICIPANT_KINDS.includes(principal.kind) ? principal.kind : 'other', role: 'principal' },
       { id: 'harnessorbit', kind: 'orchestrator', role: 'orchestrator' },
@@ -390,6 +422,7 @@ export class MemoryService {
       session: { id: target.sessionId, agent: agent ? agent.id : 'other' },
       participants,
       orchestrator: { name: 'harnessorbit', version: ORCHESTRATOR_VERSION },
+      ...(attestation ? { attested_by: attestation.attested_by, attestation_ref: attestation.attestation_ref } : {}),
       evidence: [...normalized.evidence.map(e => ({ label: e.label, ref: e.ref, issuer: e.issuer, ...(e.summary ? { summary: e.summary } : {}) })), ...machine.evidence],
     };
   }
@@ -418,20 +451,26 @@ export class MemoryService {
       // The frozen document comes from the first attempt's durable record (pending or receipt);
       // only a brand-new operation renders one. Memy, not the local receipt, decides what a
       // replay means: it re-checks authority and answers saved+deduplicated, or denied.
+      const authority = admission.authority || 'agent';
+      const carrier = admission.carrier || (authority === 'orchestrator' ? 'orchestrator' : target.agent);
       let frozen = pending?.frozen || index?.frozen || null;
       if (!frozen) {
         invariant(supplied, 'invalid_memory_request', 'summary is required for a new checkpoint (a retry may omit the body only while the checkpoint is pending).', { field: 'summary' });
         const machine = await this._machineEvidence(target, supplied.evidence);
-        const document = this._document(supplied, target, current, machine, now());
-        frozen = { document, canonical: JSON.stringify(document), payloadHash: suppliedHash, attemptStatus: machine.attemptStatus };
+        // An orchestrator-carried checkpoint is attested by the authenticated principal through a
+        // durable Orbit record it owns about this target: a cooperation event. A caller string is
+        // never an attestation source, and nothing is derived from the agent's session grant.
+        const attestation = authority === 'orchestrator' ? await this._attestation(current, target, input.attestationEventId) : null;
+        const document = this._document(supplied, target, current, machine, now(), { authority, attestation });
+        frozen = { document, canonical: JSON.stringify(document), payloadHash: suppliedHash, attemptStatus: machine.attemptStatus, authority };
       }
-      const base = { ...this._owner(current, target, op), provider: this.provider.name, payloadHash: frozen.payloadHash };
+      const base = { ...this._owner(current, target, op), authority, carrier, provider: this.provider.name, payloadHash: frozen.payloadHash };
       // Durable first, send second: if this process dies after the provider accepted the bytes,
       // the retry still finds the same observed_at and content on disk.
       const attempts = (pending?.attempts || index?.attempts || 0) + 1;
       await writeJsonAtomic(this._file('pending', op), { ...base, frozen, at: pending?.at || index?.at || now(), lastAttemptAt: now(), lastStatus: 'in_flight', lastReason: null, attempts });
       let result;
-      try { result = await withTimeout(this.provider.save({ project: target.project, agent: target.agent, operationId: op, canonical: frozen.canonical, document: frozen.document, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
+      try { result = await withTimeout(this.provider.save({ project: target.project, agent: carrier, operationId: op, canonical: frozen.canonical, document: frozen.document, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
       catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
       result = normalizeProviderResult('save', result);
       // A receipt must describe the admission this operation was begun under.

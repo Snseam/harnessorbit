@@ -25,7 +25,9 @@ const reply = (status, reason, extra = {}) => {
   process.exit(['ok', 'admitted', 'saved'].includes(status) ? 0 : 1);
 };
 
-if (group !== 'handoff' || !['status', 'recall', 'begin', 'save'].includes(command) || !['claude-code', 'codex'].includes(flags.agent)) process.exit(2);
+if (group !== 'handoff' || !['status', 'recall', 'begin', 'save'].includes(command) || !['claude-code', 'codex', 'orchestrator'].includes(flags.agent)) process.exit(2);
+// The orchestrator carrier exists only when the fake host enabled it (like `memy connection orchestrator enable`).
+if (flags.agent === 'orchestrator' && process.env.FAKE_MEMY_ORCHESTRATOR !== '1') reply('unconfigured', 'agent_unsupported');
 if (mode === 'hang') setTimeout(() => process.exit(1), 60000);
 else if (mode === 'protocol') { process.stdout.write('not json\n'); process.exit(1); }
 else if (mode === 'not_connected') reply('unconfigured', 'not_connected');
