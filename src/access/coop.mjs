@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { OrchestratorError, invariant } from '../errors.mjs';
-import { readJson, writeJsonAtomic, validateId, withLock } from '../state.mjs';
+import { readJson, writeJsonAtomic, validateId, withLock, runPath } from '../state.mjs';
 
 // Durable cooperation events: a bound agent reports what happened to a task it is authorized
 // for; HarnessOrbit records the event once, durably, and delivers it to registered recipients,
@@ -41,6 +41,15 @@ export const MAX_PAYLOAD_BYTES = 8192;
 export const MAX_INBOX_LIMIT = 200;
 export const MAX_HOPS = 8;
 export const MAX_CURSOR_TOKEN = 400;
+// Historical facts imported by the host from a managed source. Never reportable, never a verifier
+// or observer signal, never an attestation; delivered only to recipients that name the type.
+export const HISTORICAL_TYPES = Object.freeze(['history.imported']);
+export const IMPORT_LINEAGE = 'harnessorbit.run-events.v1';
+export const IMPORTABLE_TYPES = Object.freeze(['attempt.reserved', 'attempt.state']);
+export const IMPORT_CAPS = Object.freeze({ maxRowBytes: 65536, captureLimit: 8 * 1048576, maxPrefixBytes: 64 * 1048576 });
+const IMPORT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,159}$/;
+const IMPORT_TUPLE = ['id', 'runId', 'taskId', 'principalId', 'principalIncarnation'];
+const sameTuple = (a, b) => Boolean(a && b) && IMPORT_TUPLE.every(k => a[k] === b[k]);
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const now = () => new Date().toISOString();
@@ -72,6 +81,15 @@ export function boundedPayload(value, field = 'payload', depth = 0) {
 }
 
 function canonical(value) { return JSON.stringify(value); }
+// Key-sorted canonical form of a persisted source row, so every field (known or not) is in its hash.
+function canonicalRow(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalRow).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonicalRow(value[k])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+const EMPTY_SHA = crypto.createHash('sha256').update('').digest('hex');
+// A zero-length prefix hashes to sha256(""); a persisted null from an earlier record means the same.
+const sameSha = (stored, computed) => stored === computed || (stored === null && computed === EMPTY_SHA);
 
 // The exact bytes writeJsonAtomic produces for a JSON document, so a sha recorded before a
 // replacement names the file that will exist after it.
@@ -318,9 +336,23 @@ export class CoopStore {
       else if (receipt.kind === 'attempt') attempts.set(key, receipt);
     }
     return {
-      control, generation: control.generation, boundary: control.boundary, records: examined.events.records, byId, byKey, acks, attempts, recipients: recipientsDoc?.recipients || {}, recipientsDoc,
+      control, generation: control.generation, boundary: control.boundary, records: examined.events.records, byId, byKey, acks, attempts, receipts: examined.receipts.records, recipients: recipientsDoc?.recipients || {}, recipientsDoc,
       recovered, lastRecovery: control.lastRecovery || null, retentionFloor: control.boundary.retentionFloor, nextSeq: examined.events.records.length ? examined.events.records.at(-1).seq + 1 : 1,
     };
+  }
+
+  // Read-only view for a dry run: the committed records only, no recovery, no writes. Callers check
+  // examined.* for pending recovery first.
+  static readOnlyState(examined) {
+    const byId = new Map(); const byKey = new Map();
+    for (const record of examined.events.records) { byId.set(record.event.eventId, record); byKey.set(`${record.idempotency.principalId}:${record.idempotency.incarnation}:${record.idempotency.keyHash}`, record); }
+    return { control: examined.control, generation: examined.control.generation, boundary: examined.control.boundary, records: examined.events.records, byId, byKey, receipts: examined.receipts.records, recipients: examined.recipients.doc?.recipients || {}, nextSeq: examined.events.records.length ? examined.events.records.at(-1).seq + 1 : 1, readOnly: true };
+  }
+
+  static pendingRecovery(examined) {
+    const e = examined.events, r = examined.receipts, p = examined.recipients;
+    const pending = { journal: e.problem || e.repair || (e.excess ? { adopt: e.excess } : null) || null, receipts: r.problem || r.repair || (r.excess ? { adopt: r.excess } : null) || null, recipients: p.problem || p.action || (p.intent ? { intent: true } : null) || null };
+    return Object.values(pending).some(Boolean) ? pending : null;
   }
 
   async _commit(control, patch, { recovery } = {}) {
@@ -338,6 +370,9 @@ export class CoopStore {
     const { sha: lineSha, bytes } = await this.journal.append(record, b.eventLines ? b.eventLastSha : this._anchor(state.control, 'events'));
     state.control = await this._commit(state.control, { eventSeq: record.seq, eventLines: b.eventLines + 1, eventBytes: b.eventBytes + bytes, eventLastSha: lineSha });
     state.boundary = state.control.boundary; state.nextSeq = record.seq + 1;
+    // Index only after the boundary commit, so a later row in the same lock finds this one by key
+    // and id; a failed append throws before this point and is never treated as committed.
+    state.records.push(record); state.byId.set(record.event.eventId, record); state.byKey.set(`${record.idempotency.principalId}:${record.idempotency.incarnation}:${record.idempotency.keyHash}`, record);
     return record;
   }
 
@@ -346,6 +381,7 @@ export class CoopStore {
     const { sha: lineSha, bytes } = await this.receipts.append(receipt, b.receiptLines ? b.receiptLastSha : this._anchor(state.control, 'receipts'));
     state.control = await this._commit(state.control, { receiptLines: b.receiptLines + 1, receiptBytes: b.receiptBytes + bytes, receiptLastSha: lineSha });
     state.boundary = state.control.boundary;
+    if (Array.isArray(state.receipts)) state.receipts.push(receipt);
     return receipt;
   }
 
@@ -607,7 +643,7 @@ export class CoopService {
     invariant(current.permissions.submit !== false || current.permissions.sessions === true, 'permission_denied', 'This principal may not report.');
     const idempotencyKey = textField(input.idempotencyKey, 'idempotencyKey', 128);
     const type = textField(input.type, 'type', 64);
-    invariant(!VERIFIER_TYPES.includes(type) && !OBSERVER_TYPES.includes(type), 'authority_denied', `${type} is issued only by a verifier or the observer, never by a reporting principal.`, { type });
+    invariant(!VERIFIER_TYPES.includes(type) && !OBSERVER_TYPES.includes(type) && !HISTORICAL_TYPES.includes(type), 'authority_denied', `${type} is issued only by a verifier, the observer or the host importer, never by a reporting principal.`, { type });
     invariant(REPORTABLE_TYPES.includes(type), 'invalid_event', `type must be one of ${REPORTABLE_TYPES.join(', ')}.`, { type });
     const task = await this._task(current, input.task?.ref ?? input.taskRef);
     const payload = boundedPayload(input.payload === undefined ? {} : input.payload);
@@ -666,7 +702,9 @@ export class CoopService {
       if (recipient.principalId === source.id && recipient.kind === 'inbox') continue; // a reporter does not receive its own report in its inbox
       const taskOk = !recipient.scope.taskRefs.length || recipient.scope.taskRefs.some(prefix => event.task.ref === prefix || event.task.ref.startsWith(prefix));
       const sourceOk = !recipient.scope.sources.length || recipient.scope.sources.includes(source.id);
-      const typeOk = !recipient.scope.types.length || recipient.scope.types.includes(event.type);
+      // A wildcard registration (types: []) receives every current type and never a historical import;
+      // historical types reach only registrations that name them explicitly.
+      const typeOk = recipient.scope.types.length ? recipient.scope.types.includes(event.type) : !HISTORICAL_TYPES.includes(event.type);
       // The delivery freezes who the recipient was: registration epoch and, for inboxes, the owning
       // principal incarnation. A later registration under the same id is a different recipient.
       if (taskOk && sourceOk && typeOk) out.push({ consumerId: recipient.id, kind: recipient.kind, epoch: recipient.epoch, principalId: recipient.principalId ?? null, principalIncarnation: recipient.principalIncarnation ?? null, state: 'pending' });
@@ -819,7 +857,7 @@ export class CoopService {
     invariant(RECIPIENT_KINDS.includes(kind), 'invalid_recipient', `kind must be one of ${RECIPIENT_KINDS.join(', ')}.`, { kind });
     invariant(Array.isArray(taskRefs) && taskRefs.every(t => typeof t === 'string' && /^harnessorbit:(job|session)\/[a-zA-Z0-9_-]*$/.test(t)) && taskRefs.length <= 50, 'invalid_recipient', 'taskRefs must be harnessorbit:job/… or harnessorbit:session/… prefixes.');
     invariant(Array.isArray(sources) && sources.every(s => typeof s === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(s)) && sources.length <= 50, 'invalid_recipient', 'sources must be principal ids.');
-    invariant(Array.isArray(types) && types.every(t => [...REPORTABLE_TYPES, ...OBSERVER_TYPES, ...VERIFIER_TYPES].includes(t)) && types.length <= 20, 'invalid_recipient', 'types must be known event types.');
+    invariant(Array.isArray(types) && types.every(t => [...REPORTABLE_TYPES, ...OBSERVER_TYPES, ...VERIFIER_TYPES, ...HISTORICAL_TYPES].includes(t)) && types.length <= 20, 'invalid_recipient', 'types must be known event types.');
     invariant(label === null || (typeof label === 'string' && label.length <= 120), 'invalid_recipient', 'label must be at most 120 characters.');
     const record = { id, kind, epoch: crypto.randomBytes(8).toString('hex'), label, scope: { taskRefs, sources, types }, createdAt: now(), revokedAt: null };
     if (kind === 'inbox') {
@@ -912,5 +950,253 @@ export class CoopService {
   _publicRecipient(record) {
     const { transport, ...rest } = record;
     return { ...rest, transport: transport ? { ...transport, ...(transport.secretFile ? { secretFile: '<redacted path>' } : {}) } : null };
+  }
+
+  // ---- Host-only import of stable-ID lifecycle facts (phase 2B) -------------------------------
+  //
+  // Source: the job's own run event log (runs/<runId>/events.jsonl), reached only through the job
+  // record. Custody: the job's recorded owner at its current incarnation (an authorized custodian,
+  // not a proven original author); checked without the orchestrator. Protocol: durable preparation
+  // (custody, prior checkpoint, exact captured range and its hash) before the first imported event,
+  // one journal record per event (the idempotency record is the mapping), then a checkpoint tied to
+  // the same plan. Both import records live in receipts.jsonl under the Gate A chain and boundary.
+  // Every offset and hash comes from one captured byte image; nothing is re-read after a commit.
+
+  async _custody(jobId) {
+    invariant(this.jobs, 'jobs_unavailable', 'Jobs are not enabled on this host.');
+    const job = await this.jobs.get(jobId);
+    invariant(job, 'job_not_found', `Job ${jobId} does not exist.`, { jobId });
+    invariant(typeof job.principalIncarnation === 'string', 'legacy_migration_required', `Job ${jobId} predates principal identity tracking; the host operator adopts it first (access principal adopt-jobs). Import never adopts.`, { jobId });
+    const owner = await this.principals.get(job.principalId).catch(() => null);
+    invariant(owner && owner.incarnation === job.principalIncarnation, 'permission_denied', 'The job’s custodian is not the current incarnation of that principal; not importing.', { jobId });
+    invariant(owner.permissions.submit !== false || owner.permissions.sessions === true, 'permission_denied', 'The custodian may not report; not importing.', { jobId });
+    const inScope = typeof job.project === 'string' && owner.projects.some(p => job.project === p || job.project.startsWith(`${p}${path.sep}`)) && owner.agents.includes(job.agent);
+    invariant(inScope, 'permission_denied', 'The job is outside its custodian’s current project or agent scope; not importing.', { jobId });
+    invariant(typeof job.runId === 'string' && typeof job.taskId === 'string', 'source_missing', 'The job record names no run or task.', { jobId });
+    return { job, owner, tuple: { id: job.id, runId: job.runId, taskId: job.taskId, principalId: owner.id, principalIncarnation: owner.incarnation } };
+  }
+
+  // Indices over the import records in receipts.jsonl. Any inconsistency refuses the import.
+  _importIndex(receipts) {
+    const byJob = new Map(), bySource = new Map(), prepares = new Map(), unresolved = new Map();
+    const bad = detail => { throw storeError('import_records_invalid', `Import records in receipts.jsonl are inconsistent: ${detail}.`, { status: 'import_records_invalid', operatorAction: 'Inspect receipts.jsonl and restore it from backup; nothing is imported until then.' }); };
+    const tupleOk = t => t && typeof t === 'object' && IMPORT_TUPLE.every(k => typeof t[k] === 'string');
+    for (const r of receipts) {
+      if (r.kind === 'import.prepare') {
+        if (r.v !== 1 || typeof r.planId !== 'string' || !tupleOk(r.job) || typeof r.sourceId !== 'string' || !r.range || !r.prior) bad(`malformed prepare ${r.planId ?? '?'}`);
+        if (prepares.has(r.planId)) bad(`duplicate planId ${r.planId}`);
+        const frozen = byJob.get(r.job.id);
+        if (frozen && !sameTuple(frozen, r.job)) bad(`job ${r.job.id} prepared under two tuples`);
+        if (!frozen) byJob.set(r.job.id, r.job);
+        const src = bySource.get(r.sourceId);
+        if (src && src.jobId !== r.job.id) bad(`source ${r.sourceId} bound to two jobs`);
+        if (!src) bySource.set(r.sourceId, { jobId: r.job.id, checkpoint: null, prepare: r }); else src.prepare = r;
+        if (unresolved.has(r.sourceId)) bad(`source ${r.sourceId} has two unresolved plans`);
+        unresolved.set(r.sourceId, r); prepares.set(r.planId, r);
+      } else if (r.kind === 'import.checkpoint') {
+        const p = prepares.get(r.planId);
+        if (!p || p.sourceId !== r.sourceId || !sameTuple(p.job, r.job) || !r.checkpoint) bad(`checkpoint without matching prepare ${r.planId ?? '?'}`);
+        if (unresolved.get(r.sourceId) !== p) bad(`checkpoint ${r.planId} does not settle the open plan`);
+        unresolved.delete(r.sourceId);
+        bySource.get(r.sourceId).checkpoint = r;
+      }
+    }
+    return { byJob, bySource, unresolved };
+  }
+
+  // One handle, one read, one byte image. Returns image[0 .. min(size, fromBytes + captureLimit)].
+  async _captureSource(file, { fromBytes, captureLimit }) {
+    let handle;
+    try { handle = await fs.open(file, 'r'); }
+    catch (error) { if (error.code === 'ENOENT') return { status: 'source_missing', detail: 'the run has no events.jsonl' }; throw error; }
+    try {
+      const st = await handle.stat();
+      const ps = await fs.stat(file).catch(() => null);
+      if (!ps || ps.ino !== st.ino || ps.dev !== st.dev) return { status: 'source_unstable', detail: 'the source path was replaced while it was being opened' };
+      if (st.size < fromBytes) return { status: 'source_shortened', detail: `the source is ${st.size} bytes, shorter than the ${fromBytes} verified bytes`, size: st.size, expected: fromBytes };
+      const end = Math.min(st.size, fromBytes + captureLimit);
+      const image = Buffer.alloc(end);
+      let offset = 0;
+      while (offset < end) { const { bytesRead } = await handle.read(image, offset, end - offset, offset); if (!bytesRead) break; offset += bytesRead; }
+      const after = await handle.stat();
+      if (offset < end || after.size < end) return { status: 'source_unstable', detail: 'the source shrank while it was being read' };
+      return { status: 'ok', image, size: st.size, end };
+    } finally { await handle?.close(); }
+  }
+
+  _classifyRow(line, T) {
+    let row;
+    try { row = JSON.parse(line); } catch { return { gap: 'malformed_row' }; }
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return { gap: 'malformed_row' };
+    if (typeof row.eventId !== 'string' || !IMPORT_ID_RE.test(row.eventId) || typeof row.timestamp !== 'string' || typeof row.type !== 'string') return { gap: 'anonymous_row' };
+    if (row.runId !== T.runId) return { gap: 'foreign_run' };
+    if (!IMPORTABLE_TYPES.includes(row.type)) return { unsupported: true, row };
+    if (row.taskId !== T.taskId) return { gap: 'foreign_task' };
+    if (typeof row.attemptId !== 'string' || !row.attemptId) return { gap: 'missing_attempt_identity' };
+    const sourceKey = `harnessorbit:run/${T.runId}/event/${row.eventId}`;
+    const sourceBodyHash = sha(canonicalRow(row));
+    const legacyRef = { lineage: IMPORT_LINEAGE, sourceId: `harnessorbit:run/${T.runId}`, runId: T.runId, taskId: T.taskId, attemptId: row.attemptId, eventId: row.eventId, type: row.type, timestamp: row.timestamp };
+    const bodyHash = sha(canonical({ type: 'history.imported', task: `harnessorbit:job/${T.id}`, legacyRef, sourceBodyHash }));
+    const known = new Set(['schemaVersion', 'runId', 'eventId', 'type', 'timestamp', 'taskId', 'attemptId', 'sequence', 'from', 'to', 'errorCode', 'phase', 'source']);
+    const clip = v => typeof v === 'string' ? v.slice(0, 200) : v;
+    const payload = { observedAt: row.timestamp, runtimeType: row.type, attemptId: clip(row.attemptId), sourceBodyHash, extraFields: Object.keys(row).filter(k => !known.has(k)).length, projection: 'bounded' };
+    for (const f of ['sequence', 'from', 'to', 'errorCode', 'phase', 'source']) if (typeof row[f] === 'string' || Number.isInteger(row[f])) payload[f] = clip(row[f]);
+    return { row, sourceKey, keyHash: sha(`import:${sourceKey}`), sourceBodyHash, bodyHash, legacyRef, payload: boundedPayload(payload) };
+  }
+
+  // Plans a batch from the captured image, from the prior checkpoint, bounded by the line limit,
+  // the row size, the batch capture and the prefix cap. Pure: no writes, no re-reads.
+  _planRows(capture, prior, T, owner, state, caps, limit) {
+    const { image, end, size } = capture;
+    const rows = []; const overlay = new Map();
+    let at = prior.bytes, lines = 0, gap = null, partialTail = false, capBlocked = false, capReached = false, more = false, lastEventId = prior.lastEventId ?? null;
+    while (lines < limit && at < end) {
+      const nl = image.indexOf(0x0a, at);
+      if (nl < 0) {
+        if (end - at > caps.maxRowBytes) gap = { row: prior.rows + lines + 1, byte: at, reason: 'oversized_row' };
+        else if (end < size) more = true; // cut by the batch capture, not by the file
+        else partialTail = true;
+        break;
+      }
+      const lineEnd = nl + 1;
+      if (lineEnd > caps.maxPrefixBytes) { if (lines === 0) capBlocked = true; else capReached = true; more = true; break; }
+      if (nl - at > caps.maxRowBytes) { gap = { row: prior.rows + lines + 1, byte: at, reason: 'oversized_row' }; break; }
+      const rowNo = prior.rows + lines + 1;
+      const cls = this._classifyRow(image.subarray(at, nl).toString('utf8'), T);
+      if (cls.gap) { gap = { row: rowNo, byte: at, reason: cls.gap }; break; }
+      const entry = { row: rowNo, byte: at, sourceEventId: cls.row.eventId, runtimeType: cls.row.type };
+      if (cls.unsupported) { entry.outcome = 'skipped'; entry.reason = 'unsupported_type'; }
+      else {
+        const ns = `${owner.id}:${owner.incarnation}:${cls.keyHash}`;
+        const committed = state.byKey.get(ns);
+        const existing = committed ? committed.idempotency.bodyHash : overlay.get(ns);
+        if (existing === undefined) { entry.outcome = 'new'; overlay.set(ns, cls.bodyHash); }
+        else if (existing === cls.bodyHash) { entry.outcome = 'reused'; entry.planned = !committed; }
+        else { gap = { row: rowNo, byte: at, reason: 'conflict', committedBodyHash: existing, sourceBodyHash: cls.sourceBodyHash }; break; }
+        Object.assign(entry, { sourceKey: cls.sourceKey, keyHash: cls.keyHash, sourceBodyHash: cls.sourceBodyHash, bodyHash: cls.bodyHash, legacyRef: cls.legacyRef, payload: cls.payload, committedEventId: committed?.event.eventId || null });
+      }
+      rows.push(entry); lines += 1; at = lineEnd; lastEventId = cls.row.eventId;
+    }
+    if (lines === limit && at < end) more = true;
+    return { rows, lines, toByte: at, range: { fromByte: prior.bytes, toByte: at, lines, sha: sha(image.subarray(0, at)) }, gap, partialTail, more, capBlocked, capReached, lastEventId };
+  }
+
+  // Commits the planned new rows one by one, re-reading custody before each new effect. Returns
+  // truthfully how far it got; a refusal leaves the plan unresolved for resume.
+  async _settlePlan(state, plan, T, hooks) {
+    let committed = 0, reused = 0, unsupported = 0; const rows = [];
+    for (const entry of plan.rows) {
+      if (entry.outcome === 'skipped') { unsupported += 1; rows.push(entry); continue; }
+      const ns = `${T.principalId}:${T.principalIncarnation}:${entry.keyHash}`;
+      const existing = state.byKey.get(ns);
+      if (existing) {
+        if (existing.idempotency.bodyHash !== entry.bodyHash) return { committed, reused, unsupported, rows, refused: 'conflict', detail: `row ${entry.row} differs from the committed event ${existing.event.eventId}` };
+        reused += 1; rows.push({ ...entry, outcome: 'reused', committedEventId: existing.event.eventId }); continue;
+      }
+      let fresh;
+      try { fresh = await this._custody(T.id); } catch (error) { return { committed, reused, unsupported, rows, refused: error.code || 'permission_denied', detail: error.message }; }
+      if (!sameTuple(fresh.tuple, T)) return { committed, reused, unsupported, rows, refused: 'source_remapped', detail: 'the job no longer maps to the frozen run, task and custodian' };
+      const owner = fresh.owner;
+      const event = {
+        schema: COOP_SCHEMA, eventId: uuid(), seq: state.nextSeq, createdAt: this.now(), type: 'history.imported',
+        source: { principalId: owner.id, incarnation: owner.incarnation, kind: owner.kind || 'other', via: 'import', binding: null, importer: 'harnessorbit:host', custody: 'authorized custodian of the job, not the proven original author' },
+        task: { ref: `harnessorbit:job/${T.id}`, kind: 'job', id: T.id, intentRevision: null },
+        legacyRef: entry.legacyRef, conversationRef: null, correlationId: null, causationId: null, hop: 0, payload: entry.payload,
+        evidenceRefs: [{ label: 'reported', ref: entry.sourceKey, issuer: 'harnessorbit:importer' }],
+      };
+      const deliveries = this._deliveriesFor(event, owner, state.recipients);
+      await this.store.appendEvent(state, { v: COOP_VERSION, kind: 'event', seq: event.seq, event, idempotency: { principalId: owner.id, incarnation: owner.incarnation, keyHash: entry.keyHash, bodyHash: entry.bodyHash }, deliveries });
+      committed += 1; rows.push({ ...entry, outcome: 'new', committedEventId: event.eventId, deliveries: deliveries.map(d => d.consumerId) });
+      if (hooks?.afterEventCommit) await hooks.afterEventCommit(committed); // test seam: simulates a crash after a commit
+    }
+    return { committed, reused, unsupported, rows, refused: null };
+  }
+
+  _prepareRecord({ planId, T, prior, range, limit, gap }) {
+    return { v: 1, kind: 'import.prepare', planId, at: this.now(), lineage: IMPORT_LINEAGE, sourceId: `harnessorbit:run/${T.runId}`, job: T, prior: { planId: prior.planId, rows: prior.rows, bytes: prior.bytes, sha: prior.sha }, range, limit, gapAt: gap ? { row: gap.row, byte: gap.byte, reason: gap.reason } : null };
+  }
+
+  _checkpointRecord({ planId, T, prior, range, lastEventId, settled, gap }) {
+    return { v: 1, kind: 'import.checkpoint', planId, at: this.now(), sourceId: `harnessorbit:run/${T.runId}`, job: T, checkpoint: { rows: prior.rows + range.lines, bytes: range.toByte, sha: range.sha, lastEventId }, settled: { new: settled.committed, reused: settled.reused, unsupported: settled.unsupported }, gap: gap ? { row: gap.row, byte: gap.byte, reason: gap.reason } : null };
+  }
+
+  // access coop import run-events --job ID [--limit N] [--dry-run]. Host CLI only.
+  async importRunEvents({ jobId, limit = 50, dryRun = false, caps = IMPORT_CAPS, hooks = null } = {}) {
+    validateId(jobId);
+    invariant(Number.isInteger(limit) && limit >= 1 && limit <= MAX_INBOX_LIMIT, 'invalid_arguments', `limit must be 1 to ${MAX_INBOX_LIMIT}.`);
+    return this.store.lock(async () => {
+      let state;
+      if (dryRun) {
+        const examined = await this.store._examine();
+        const pending = CoopStore.pendingRecovery(examined);
+        if (pending) return { ok: false, status: 'recovery_pending', mode: 'dry_run', pendingRecovery: pending, note: 'The store has recovery to apply on its next open; a dry run plans nothing and writes nothing.' };
+        state = CoopStore.readOnlyState(examined);
+      } else state = await this.store.open();
+      const custody = await this._custody(jobId);
+      const T = custody.tuple;
+      const idx = this._importIndex(state.receipts);
+      const sourceId = `harnessorbit:run/${T.runId}`;
+      const mode = dryRun ? 'dry_run' : 'fresh';
+      const base = { job: T.id, runId: T.runId, sourceId, lineage: IMPORT_LINEAGE, custody: 'authorized custodian, not proven original author' };
+      const frozen = idx.byJob.get(T.id);
+      if (frozen && !sameTuple(frozen, T)) return { ok: false, status: 'source_remapped', mode, ...base, frozen, current: T, note: 'The job no longer maps to the run, task and custodian it was bound to; nothing imported, nothing written.' };
+      const src = idx.bySource.get(sourceId);
+      if (src && src.jobId !== T.id) return { ok: false, status: 'source_claimed', mode, ...base, boundJob: src.jobId, note: 'This run is bound to another job; nothing imported, nothing written.' };
+      const file = path.join(runPath(this.root, T.runId), 'events.jsonl');
+      const unresolved = idx.unresolved.get(sourceId);
+      if (unresolved) return this._resumeImport({ state, prepare: unresolved, T, file, caps, dryRun, hooks, base });
+      const cp = src?.checkpoint?.checkpoint;
+      const prior = cp ? { planId: src.checkpoint.planId, rows: cp.rows, bytes: cp.bytes, sha: cp.sha, lastEventId: cp.lastEventId ?? null } : { planId: null, rows: 0, bytes: 0, sha: EMPTY_SHA, lastEventId: null };
+      if (prior.bytes > caps.maxPrefixBytes) return { ok: false, status: 'source_too_large', mode, ...base, prior, note: `The verified prefix exceeds the ${caps.maxPrefixBytes}-byte verification cap.` };
+      const capture = await this._captureSource(file, { fromBytes: prior.bytes, captureLimit: caps.captureLimit });
+      if (capture.status !== 'ok') return { ok: false, status: capture.status, mode, ...base, prior, detail: capture.detail, note: 'Nothing imported, nothing written; the committed events stand.' };
+      if (hooks?.afterCapture) await hooks.afterCapture(); // test seam: a source change after the image was taken
+      if (!sameSha(prior.sha, sha(capture.image.subarray(0, prior.bytes)))) return { ok: false, status: 'source_replaced', mode, ...base, prior, note: 'The verified prefix of the source differs from the committed checkpoint; restore the source bytes. Nothing imported, nothing written.' };
+      const plan = this._planRows(capture, prior, T, custody.owner, state, caps, limit);
+      if (plan.capBlocked) return { ok: false, status: 'source_prefix_cap', mode, ...base, prior, cap: caps.maxPrefixBytes, note: 'The next row would end beyond the prefix verification cap; no row consumed, no plan written.' };
+      const bound = Boolean(frozen);
+      const result = { ok: true, mode, ...base, planId: null, prior: { rows: prior.rows, bytes: prior.bytes }, range: plan.range, consumed: plan.lines, committed: 0, reused: plan.rows.filter(r => r.outcome === 'reused').length, skipped: { unsupported_type: plan.rows.filter(r => r.outcome === 'skipped').length }, gap: plan.gap, partialTail: plan.partialTail, more: plan.more, capReached: plan.capReached, complete: !plan.gap && !plan.partialTail && !plan.more, rows: plan.rows.map(({ legacyRef: _l, payload: _p, ...r }) => r), wrote: [] };
+      if (plan.lines === 0) {
+        if (bound || dryRun) return { ...result, bound, wouldBind: !bound && dryRun, note: bound ? 'No complete new row; nothing written.' : 'Dry run: a first import would bind this job to its run with an empty range.' };
+        // First-import binding with zero progress: custody becomes durable, the offending bytes do not.
+        const planId = uuid();
+        await this.store.appendReceipt(state, this._prepareRecord({ planId, T, prior, range: plan.range, limit, gap: plan.gap }));
+        await this.store.appendReceipt(state, this._checkpointRecord({ planId, T, prior, range: plan.range, lastEventId: null, settled: { committed: 0, reused: 0, unsupported: 0 }, gap: plan.gap }));
+        return { ...result, planId, bound: true, wrote: ['import.prepare', 'import.checkpoint'], note: 'Bound the job to its run; no row was consumed.' };
+      }
+      if (dryRun) return { ...result, bound, wouldPrepare: this._prepareRecord({ planId: '<new>', T, prior, range: plan.range, limit, gap: plan.gap }), wouldCommit: plan.rows.filter(r => r.outcome === 'new').length, note: 'Dry run: nothing written.' };
+      const planId = uuid();
+      await this.store.appendReceipt(state, this._prepareRecord({ planId, T, prior, range: plan.range, limit, gap: plan.gap }));
+      const settled = await this._settlePlan(state, plan, T, hooks);
+      const out = { ...result, planId, bound: true, committed: settled.committed, reused: settled.reused, rows: settled.rows.map(({ legacyRef: _l, payload: _p, ...r }) => r), wrote: ['import.prepare'] };
+      if (settled.refused) return { ...out, ok: false, status: settled.refused, detail: settled.detail, planPending: planId, note: `Refused after ${settled.committed} committed row(s); the plan stays unresolved and resumes under the same source constraint.` };
+      await this.store.appendReceipt(state, this._checkpointRecord({ planId, T, prior, range: plan.range, lastEventId: plan.lastEventId, settled, gap: plan.gap }));
+      out.wrote.push('import.checkpoint');
+      return out;
+    });
+  }
+
+  // An unresolved preparation is authoritative: the same job tuple and the same captured bytes, or
+  // an explicit refusal that preserves the plan and the events already committed under it.
+  async _resumeImport({ state, prepare, T, file, caps, dryRun, hooks, base }) {
+    const mode = dryRun ? 'dry_run' : 'resume';
+    const pending = { planId: prepare.planId, range: prepare.range, prior: prepare.prior };
+    if (!sameTuple(prepare.job, T)) return { ok: false, status: 'source_remapped', mode, ...base, planPending: prepare.planId, frozen: prepare.job, current: T, note: 'The unresolved plan was prepared for another job mapping; nothing imported, plan preserved.' };
+    const toByte = prepare.range.toByte;
+    const capture = await this._captureSource(file, { fromBytes: toByte, captureLimit: 0 });
+    if (capture.status !== 'ok') return { ok: false, status: capture.status, mode, ...base, planPending: prepare.planId, detail: capture.detail, note: 'The prepared range cannot be re-read; plan and committed events preserved.' };
+    if (hooks?.afterCapture) await hooks.afterCapture();
+    const verified = sameSha(prepare.range.sha, sha(capture.image.subarray(0, toByte)));
+    if (!verified) return { ok: false, status: 'source_replaced', mode, ...base, planPending: prepare.planId, pending, note: 'The source no longer holds the bytes the plan was prepared from; restore them. Plan and committed events preserved; no new event ids.' };
+    const prior = { planId: prepare.prior.planId, rows: prepare.prior.rows, bytes: prepare.prior.bytes, sha: prepare.prior.sha, lastEventId: null };
+    const plan = this._planRows({ image: capture.image, end: toByte, size: toByte }, prior, T, { id: T.principalId, incarnation: T.principalIncarnation }, state, caps, prepare.limit || MAX_INBOX_LIMIT);
+    if (plan.toByte !== toByte || plan.lines !== prepare.range.lines) throw storeError('import_records_invalid', 'The prepared range does not re-derive from the same bytes.', { status: 'import_records_invalid', planId: prepare.planId });
+    const result = { ok: true, mode, ...base, planId: prepare.planId, prior: { rows: prior.rows, bytes: prior.bytes }, range: plan.range, consumed: plan.lines, committed: 0, reused: 0, skipped: { unsupported_type: plan.rows.filter(r => r.outcome === 'skipped').length }, gap: prepare.gapAt || null, partialTail: false, more: false, complete: false, rows: plan.rows.map(({ legacyRef: _l, payload: _p, ...r }) => r), wrote: [] };
+    if (dryRun) return { ...result, status: 'plan_pending', sourceVerified: true, wouldCommit: plan.rows.filter(r => r.outcome === 'new').length, wouldReuse: plan.rows.filter(r => r.outcome === 'reused').length, note: 'Dry run: an unresolved plan would be settled from its own captured range; nothing written.' };
+    const settled = await this._settlePlan(state, plan, T, hooks);
+    const out = { ...result, committed: settled.committed, reused: settled.reused, rows: settled.rows.map(({ legacyRef: _l, payload: _p, ...r }) => r) };
+    if (settled.refused) return { ...out, ok: false, status: settled.refused, detail: settled.detail, planPending: prepare.planId };
+    await this.store.appendReceipt(state, this._checkpointRecord({ planId: prepare.planId, T, prior, range: plan.range, lastEventId: plan.lastEventId, settled, gap: prepare.gapAt || null }));
+    return { ...out, wrote: ['import.checkpoint'], note: 'Resumed and settled the unresolved plan; a further batch is a new invocation.' };
   }
 }

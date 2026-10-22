@@ -4,6 +4,7 @@ import path from 'node:path';
 import { OrchestratorError, invariant } from '../errors.mjs';
 import { runCommand } from '../process.mjs';
 import { readJson, writeJsonAtomic, withLock } from '../state.mjs';
+import { HISTORICAL_TYPES } from './coop.mjs';
 
 // Memory for the access layer: recall before continuing a session or job, an explicit admission
 // (begin) before new handoff content is gathered, and a distilled checkpoint (save) afterwards.
@@ -409,7 +410,7 @@ export class MemoryService {
     invariant(this.coop, 'attestation_unavailable', 'Cooperation events are not enabled on this host, so no attestation source exists.');
     const state = await this.coop.store.load();
     const record = state.byId.get(eventId);
-    invariant(record && record.event.source.principalId === current.id && record.event.source.incarnation === current.incarnation && record.event.source.via !== 'observer', 'attestation_invalid', 'The attestation event was not reported by you.', { eventId });
+    invariant(record && record.event.source.principalId === current.id && record.event.source.incarnation === current.incarnation && record.event.source.via !== 'observer' && record.event.source.via !== 'import' && !HISTORICAL_TYPES.includes(record.event.type), 'attestation_invalid', 'The attestation event was not reported by you (observer and imported historical events attest nothing).', { eventId });
     const ref = target.kind === 'job' ? `harnessorbit:job/${target.id}` : `harnessorbit:session/${target.id}`;
     invariant(record.event.task.ref === ref, 'attestation_invalid', 'The attestation event is about a different task.', { eventId, task: record.event.task.ref });
     if (target.kind === 'session') {
