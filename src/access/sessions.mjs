@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { OrchestratorError, invariant } from '../errors.mjs';
 import { runCommand } from '../process.mjs';
@@ -82,6 +83,150 @@ export function classifyScreen(kind, screen) {
     return { state: 'draft', reason: 'prompt_has_text' };
   }
   return { state: 'unknown', reason: 'no_marker' };
+}
+
+// ---- Native busy-text queue (Claude Code), explicit opt-in -------------------------------------
+//
+// Default: text is accepted only while a session is idle. A binding the operator created with
+// --allow-queue and a candidate profile, plus a call that says mode "queue", may paste one ordinary
+// text while a Claude Code session is busy with an empty input box; the receipt then comes only from
+// the provider's own transcript rows (queue-operation enqueue / remove, attachment queued_command),
+// read as raw complete lines with byte offsets from a frozen baseline. One attempt, one outstanding
+// message per binding, unknown kept, same key never pasted again. Nothing here interrupts, sends
+// keys, withdraws, or infers that the model read or acted on the text.
+// Claude Code keeps one transcript per session under ~/.claude/projects/<cwd with / → ->/<session>.jsonl.
+export function claudeTranscriptPath(home, cwd, sessionId) {
+  const encoded = path.resolve(cwd).replace(/[\\/]/g, '-');
+  return path.join(home, 'projects', encoded, `${sessionId}.jsonl`);
+}
+
+export const QUEUE_FORMAT_VERSION = 1;
+export const QUEUE_PROFILES = Object.freeze({
+  'claude-queue-2.1.306': Object.freeze({ id: 'claude-queue-2.1.306', provider: 'claude', version: '2.1.306', entrypoint: 'cli', status: 'candidate', acceptedTerminalReasons: Object.freeze(['absorbed_mid_turn']), evidence: 'review/memy-headless-resident/native-busy-queue-evidence.json (one operator paste; not Orbit acceptance)' }),
+});
+export const QUEUE_CAPABILITY = Object.freeze({ providers: ['claude'], profiles: Object.values(QUEUE_PROFILES).map(p => ({ id: p.id, status: p.status })), optIn: 'operator binding with --allow-queue --queue-profile <id> and request mode "queue"', meaning: 'queue receipt only: Claude accepted the envelope into its queue or absorbed it into the running turn; not a response, not task completion, not authorization', note: 'candidate profiles are for root-owned isolated acceptance until real acceptance is recorded' });
+const QUEUE_WINDOW_BYTES = 65536;
+const QUEUE_READ_BYTES = 8 * 1048576;
+const QUEUE_TERMINAL_STATES = new Set(['absorbed']);
+const QUEUE_CONTENT_RE = /^<pasted_content id="([0-9a-f]{4})">\n([\s\S]*)\n<\/pasted_content id="\1">$/;
+const QUEUE_ORDINARY_ROWS = new Set(['assistant', 'user', 'system']);
+
+// While busy, the input box must be provably empty: a prompt row below the spinner matching the
+// empty/placeholder rule, no dialog or permission marker. Anything that cannot be told refuses.
+export function classifyBusyInput(kind, screen) {
+  const profile = PROFILES[kind];
+  if (!profile) return { ok: false, reason: 'unsupported_agent' };
+  const state = classifyScreen(kind, screen);
+  if (state.state !== 'busy') return { ok: false, reason: `state_${state.state}`, state };
+  const rows = (Array.isArray(screen) ? screen : String(screen || '').split('\n')).map(r => r.replace(/\s+$/, ''));
+  while (rows.length && !rows.at(-1)) rows.pop();
+  const bottom = rows.slice(-12);
+  if (profile.waiting.some(re => bottom.some(row => re.test(row)))) return { ok: false, reason: 'dialog_marker', state };
+  for (let i = bottom.length - 1; i >= 0; i--) {
+    const m = profile.prompt.exec(bottom[i]);
+    if (!m) continue;
+    return profile.placeholder.test(m[1].replace(/\s+$/, '')) ? { ok: true, state } : { ok: false, reason: 'input_not_empty', state };
+  }
+  return { ok: false, reason: 'no_prompt_row', state };
+}
+
+export function queueWire(nonce, text) { return `orbit-queue v${QUEUE_FORMAT_VERSION} ${nonce}\n${text}`; }
+
+// Strict decode of a native queue row's content: exactly the wire, or exactly the TUI's
+// pasted_content wrapper around it (same 4-hex id in both tags). Never a substring.
+export function queueContentMatches(content, wireHash) {
+  if (typeof content !== 'string') return false;
+  if (sha(content) === wireHash) return true;
+  const m = QUEUE_CONTENT_RE.exec(content);
+  return Boolean(m) && sha(m[2]) === wireHash;
+}
+
+// Splits a byte range of a JSONL file into complete rows with absolute offsets. The remainder
+// after the last newline (possibly a split UTF-8 sequence) is left unconsumed.
+function splitRows(buffer, base) {
+  const rows = []; let at = 0;
+  while (at < buffer.length) {
+    const nl = buffer.indexOf(0x0a, at);
+    if (nl < 0) break;
+    const raw = buffer.subarray(at, nl);
+    let row = null; try { row = JSON.parse(raw.toString('utf8')); } catch { row = null; }
+    rows.push({ start: base + at, end: base + nl + 1, row, sha: sha(raw) });
+    at = nl + 1;
+  }
+  return { rows, consumed: at };
+}
+
+// Preflight baseline: the file must end on a complete line and the bounded tail window must hold
+// that whole last row (never a suffix of it); the row becomes the continuity anchor.
+export async function queueBaseline(file) {
+  let handle;
+  try { handle = await fs.open(file, 'r'); } catch (error) { return { ok: false, reason: error.code === 'ENOENT' ? 'source_missing' : 'source_unreadable' }; }
+  try {
+    const st = await handle.stat();
+    if (st.size === 0) return { ok: true, baseline: { dev: st.dev, ino: st.ino, size: 0, anchor: null } };
+    const from = Math.max(0, st.size - QUEUE_WINDOW_BYTES);
+    const buffer = Buffer.alloc(st.size - from);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, from);
+    const tail = buffer.subarray(0, bytesRead);
+    if (tail.length === 0 || tail[tail.length - 1] !== 0x0a) return { ok: false, reason: 'incomplete_final_line' };
+    const prev = tail.lastIndexOf(0x0a, tail.length - 2);
+    if (prev < 0 && from > 0) return { ok: false, reason: 'anchor_row_exceeds_window' }; // the window holds only a suffix of the last row
+    const rowStart = prev < 0 ? 0 : prev + 1;
+    const raw = tail.subarray(rowStart, tail.length - 1);
+    return { ok: true, baseline: { dev: st.dev, ino: st.ino, size: st.size, anchor: { start: from + rowStart, end: st.size, sha: sha(raw) } } };
+  } finally { await handle?.close(); }
+}
+
+// One bounded scan from scanCursor on one handle: identity (dev/ino), no shrink, anchor row bytes
+// unchanged, then complete rows only. `eof` says whether the scan reached the size seen by fstat.
+export async function queueScan(file, { dev, ino, scanCursor, anchor }) {
+  let handle;
+  try { handle = await fs.open(file, 'r'); } catch (error) { return { ok: false, reset: error.code === 'ENOENT' ? 'source_missing' : 'source_unreadable' }; }
+  try {
+    const st = await handle.stat();
+    if (st.dev !== dev || st.ino !== ino) return { ok: false, reset: 'inode_changed' };
+    if (st.size < scanCursor) return { ok: false, reset: 'shrunk' };
+    if (anchor) {
+      const raw = Buffer.alloc(anchor.end - anchor.start);
+      const { bytesRead } = await handle.read(raw, 0, raw.length, anchor.start);
+      if (bytesRead !== raw.length || raw[raw.length - 1] !== 0x0a || sha(raw.subarray(0, raw.length - 1)) !== anchor.sha) return { ok: false, reset: 'anchor_mismatch' };
+    }
+    const end = Math.min(st.size, scanCursor + QUEUE_READ_BYTES);
+    const buffer = Buffer.alloc(end - scanCursor);
+    let offset = 0;
+    while (offset < buffer.length) { const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, scanCursor + offset); if (!bytesRead) break; offset += bytesRead; }
+    const { rows, consumed } = splitRows(buffer.subarray(0, offset), scanCursor);
+    const oversized = consumed === 0 && offset >= QUEUE_READ_BYTES ? { start: scanCursor } : null;
+    const nextCursor = scanCursor + consumed;
+    const lastRow = rows.at(-1);
+    return { ok: true, rows, scanCursor: nextCursor, anchor: lastRow ? { start: lastRow.start, end: lastRow.end, sha: lastRow.sha } : anchor, sizeAtScan: st.size, eof: nextCursor === st.size, oversized };
+  } finally { await handle?.close(); }
+}
+
+// Compatibility evidence for a profile: an ordinary row (assistant/user/system) of this provider
+// session in the bounded tail must carry the profile's version and entrypoint. A clue that can only
+// refuse; never a permission.
+export async function queueProfileEvidence(file, sessionId, profile) {
+  let handle;
+  try { handle = await fs.open(file, 'r'); } catch (error) { return { ok: false, reason: error.code === 'ENOENT' ? 'source_missing' : 'source_unreadable' }; }
+  try {
+    const st = await handle.stat();
+    const from = Math.max(0, st.size - QUEUE_WINDOW_BYTES);
+    const buffer = Buffer.alloc(st.size - from);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, from);
+    const text = buffer.subarray(0, bytesRead).toString('utf8');
+    const lines = text.split('\n'); if (from > 0) lines.shift(); // a partial first line of the window
+    let seen = null;
+    for (const line of lines) {
+      if (!line) continue;
+      let row; try { row = JSON.parse(line); } catch { continue; }
+      if (!row || !QUEUE_ORDINARY_ROWS.has(row.type) || row.sessionId !== sessionId) continue;
+      seen = { uuid: row.uuid ?? null, type: row.type, version: row.version ?? null, entrypoint: row.entrypoint ?? null, timestamp: row.timestamp ?? null };
+    }
+    if (!seen) return { ok: false, reason: 'no_ordinary_row_in_window' };
+    if (seen.version !== profile.version || seen.entrypoint !== profile.entrypoint) return { ok: false, reason: 'evidence_mismatch', observed: seen };
+    return { ok: true, evidence: seen };
+  } finally { await handle?.close(); }
 }
 
 // The readable stream of a session: scrollback plus the transcript part of the screen, which
@@ -368,7 +513,8 @@ function anchorIndex(history, cursor) {
 }
 
 export class SessionService {
-  constructor({ root, principals, sessions, tmux, processes, settleMs = 3000, now: clock = Date.now } = {}) {
+  constructor({ root, principals, sessions, tmux, processes, settleMs = 3000, now: clock = Date.now, claudeHome = path.join(os.homedir(), '.claude') } = {}) {
+    this.claudeHome = claudeHome;
     invariant(typeof root === 'string' && root.length > 0, 'invalid_state_root', 'Session service root is required.');
     invariant(principals, 'invalid_principals', 'Session service requires a principal store.');
     this.root = path.resolve(root);
@@ -418,7 +564,10 @@ export class SessionService {
     return null;
   }
 
-  async bind({ principalId, pane, id = null, allowKeys = false, label = null, providerSessionId = null } = {}) {
+  async bind({ principalId, pane, id = null, allowKeys = false, label = null, providerSessionId = null, allowQueue = false, queueProfile = null } = {}) {
+    invariant(typeof allowQueue === 'boolean', 'invalid_session', 'allowQueue must be a boolean.');
+    invariant(!allowQueue || (typeof queueProfile === 'string' && Object.hasOwn(QUEUE_PROFILES, queueProfile)), allowQueue && queueProfile ? 'queue_profile_unknown' : 'invalid_session', allowQueue ? `--allow-queue needs an accepted or candidate profile (--queue-profile): ${Object.keys(QUEUE_PROFILES).join(', ')}.` : 'queueProfile is only meaningful with allowQueue.');
+    invariant(allowQueue || queueProfile === null, 'invalid_session', 'queueProfile is only meaningful with allowQueue.');
     const principal = await this.principals.get(principalId);
     invariant(principal, 'principal_not_found', 'Principal does not exist.');
     invariant(typeof principal.incarnation === 'string' && principal.incarnation.length > 0, 'legacy_migration_required', `Principal ${principalId} predates identity tracking. Run "access principal migrate --id ${principalId}" first.`);
@@ -444,6 +593,18 @@ export class SessionService {
       const found = await this._codexNativeSource(agent, project, providerSessionId === null ? null : providerSessionId.toLowerCase());
       if (found.status === 'ok') providerSession = found.providerSession; else nativeDiagnostic = found;
     }
+    // Queue opt-in is frozen on the binding with the profile and the compatibility evidence observed
+    // now in this provider session's own rows; without a native source or evidence the bind refuses.
+    let queue = null;
+    if (allowQueue) {
+      const profile = QUEUE_PROFILES[queueProfile];
+      invariant(agent.kind === profile.provider, 'queue_unsupported', `Profile ${profile.id} is for ${profile.provider} sessions; this pane runs ${agent.kind}.`);
+      invariant(providerSession && providerSession.kind === profile.provider && typeof providerSession.sessionId === 'string', 'queue_unsupported', 'Queue mode needs the provider session id (claude --resume/--session-id or --provider-session) so receipts can be read from its native record.');
+      const file = providerSession.transcriptPath || claudeTranscriptPath(this.claudeHome, project, providerSession.sessionId);
+      const evidence = await queueProfileEvidence(file, providerSession.sessionId, profile);
+      invariant(evidence.ok, 'queue_profile_unverified', `The native record does not show ${profile.id} compatibility (${evidence.reason}); queue mode is not enabled.`, { reason: evidence.reason, observed: evidence.observed ?? null });
+      queue = { allowed: true, profile: profile.id, profileStatus: profile.status, transcriptPath: file, evidenceAtBind: evidence.evidence, boundAt: now() };
+    }
     // One pane, one binding: the uniqueness check and the create happen under the bind lock and
     // the pane's own lock, so a send or unbind on that pane cannot interleave with the rebind.
     const record = await withLock(path.join(this.root, 'locks', 'access-sessions-bind'), () => withLock(this._paneLock(pane), async () => {
@@ -451,7 +612,7 @@ export class SessionService {
       return this.sessions.create({
         id: sessionId, bindingId: crypto.randomBytes(8).toString('hex'), principalId, principalIncarnation: principal.incarnation ?? null, label, paneId: pane, target: target.target, panePid: target.panePid, tmuxSocket: this.tmux.socket,
         agent: { kind: agent.kind, pid: agent.pid, startedAt: agent.startedAt, comm: agent.comm }, project, allowKeys,
-        providerSession, ...(nativeDiagnostic ? { nativeDiagnostic } : {}),
+        providerSession, ...(nativeDiagnostic ? { nativeDiagnostic } : {}), ...(queue ? { queue } : {}),
       });
     }, { timeoutMs: 15000 }), { timeoutMs: 15000 });
     return { ...this._public(record, { ok: true }), native: providerSession ? { kind: providerSession.kind, sessionId: providerSession.sessionId, source: providerSession.source } : { status: nativeDiagnostic?.status || 'source_unavailable', reason: nativeDiagnostic?.reason || 'no_native_source', fallback: 'session.ready (screen)' } };
@@ -520,20 +681,33 @@ export class SessionService {
   }
 
   async status(principal, { sessionId } = {}) {
-    const record = await this._owned(principal, sessionId);
-    const identity = await this._identity(record);
-    const screen = await this.tmux.captureScreen(record.paneId);
-    const state = classifyScreen(record.agent.kind, screen);
-    return this._public(record, identity, state);
+    const first = await this._owned(principal, sessionId);
+    // A binding with an outstanding queued message reconciles it here; that is a write, so it runs
+    // in the pane critical section with fresh authorization like every other mutation.
+    if (SessionService.outstandingQueue(first)) {
+      return this._withPane(principal, first.id, async record => {
+        const identity = await this._identity(record);
+        const updated = await this._reconcileOutstanding(record);
+        const screen = await this.tmux.captureScreen(record.paneId);
+        return this._public(updated, identity, classifyScreen(record.agent.kind, screen));
+      });
+    }
+    const identity = await this._identity(first);
+    const screen = await this.tmux.captureScreen(first.paneId);
+    return this._public(first, identity, classifyScreen(first.agent.kind, screen));
   }
 
-  async send(principal, { sessionId, idempotencyKey, text, keys } = {}) {
+  static outstandingQueue(record) { return (record.messages || []).find(m => m.mode === 'queue' && !QUEUE_TERMINAL_STATES.has(m.queue?.state)) || null; }
+
+  async send(principal, { sessionId, idempotencyKey, text, keys, mode = 'idle_only' } = {}) {
     const record0 = await this._owned(principal, sessionId);
     invariant(typeof idempotencyKey === 'string' && idempotencyKey.trim().length > 0 && idempotencyKey.length <= 128, 'invalid_message', 'idempotencyKey is required (1 to 128 characters).', { field: 'idempotencyKey' });
+    invariant(['idle_only', 'queue'].includes(mode), 'invalid_message', 'mode must be idle_only or queue.', { field: 'mode' });
     const message = text === undefined ? undefined : this._text(text);
     if (keys !== undefined) {
       invariant(Array.isArray(keys) && keys.length > 0 && keys.length <= 8 && keys.every(k => typeof k === 'string' && KEY_RE.test(k)), 'invalid_message', 'keys must be 1 to 8 key names such as Enter, y, or Escape.', { field: 'keys' });
       invariant(record0.allowKeys, 'keys_not_allowed', 'This binding does not allow key presses. Only text can be sent; the host operator answers prompts.');
+      invariant(mode === 'idle_only', 'invalid_message', 'keys are never sent in queue mode.', { field: 'keys' });
     }
     invariant(Boolean(message) !== Boolean(keys), 'invalid_message', 'Supply either text or keys.');
     const payloadHash = sha(message ? `text:${message}` : `keys:${keys.join('\u0000')}`);
@@ -543,8 +717,13 @@ export class SessionService {
       const existing = record.messages.find(m => m.keyHash === keyHash);
       if (existing) {
         invariant(existing.payloadHash === payloadHash, 'idempotency_conflict', 'This idempotencyKey was already used with a different message. Choose a new key.', { idempotencyKey });
-        return { ...this._public(record, await this._identity(record), null), message: { ...existing, reused: true } };
+        invariant((existing.mode || 'idle_only') === mode, 'idempotency_conflict', 'This idempotencyKey was already used with a different mode. Choose a new key.', { idempotencyKey, mode: existing.mode || 'idle_only' });
+        // A queue entry is reconciled (never re-pasted) on a same-key retry.
+        const current = existing.mode === 'queue' ? await this._reconcileOutstanding(record) : record;
+        const stored = current.messages.find(m => m.keyHash === keyHash);
+        return { ...this._public(current, await this._identity(current), null), message: { ...stored, reused: true, ...(stored.mode === 'queue' ? { meaning: QUEUE_CAPABILITY.meaning } : {}) } };
       }
+      if (mode === 'queue') return this._sendQueued(record, { keyHash, payloadHash, message });
       invariant(record.messages.length < MAX_MESSAGES, 'session_message_limit', `This binding has recorded ${MAX_MESSAGES} messages; the operator must re-bind it before more can be sent.`);
       const identity = await this._identity(record);
       const before = await this.tmux.captureScreen(record.paneId);
@@ -689,6 +868,101 @@ export class SessionService {
     return { ok: true, pane, agent: { kind, pid: proc.pid, startedAt: proc.startedAt } };
   }
 
+  // Queue mode: every check below runs inside the pane lock, after the fresh authorization, and
+  // nothing is pasted until the entry (nonce, wire, baseline) is durable.
+  async _sendQueued(record, { keyHash, payloadHash, message }) {
+    const queue = record.queue;
+    invariant(queue && queue.allowed === true && Object.hasOwn(QUEUE_PROFILES, queue.profile), 'queue_not_allowed', 'This binding does not allow queued text while busy (the operator binds with --allow-queue --queue-profile).');
+    const profile = QUEUE_PROFILES[queue.profile];
+    invariant(record.agent.kind === profile.provider && record.providerSession?.kind === profile.provider, 'queue_unsupported', 'Queue mode is available only for the provider the profile names.');
+    invariant(!SessionService.outstandingQueue(record), 'queue_outstanding', 'A queued message is still outstanding on this binding; read its receipt (session_status) and wait for absorbed before queuing another.', { outstanding: SessionService.outstandingQueue(record)?.keyHash });
+    invariant(record.messages.length < MAX_MESSAGES, 'session_message_limit', `This binding has recorded ${MAX_MESSAGES} messages; the operator must re-bind it before more can be sent.`);
+    const identity = await this._identity(record);
+    const file = queue.transcriptPath;
+    // Compatibility is re-observed now, in this session's own ordinary rows; a clue that only refuses.
+    const evidence = await queueProfileEvidence(file, record.providerSession.sessionId, profile);
+    invariant(evidence.ok, 'queue_profile_unverified', `The native record no longer shows ${profile.id} compatibility (${evidence.reason}); nothing was pasted.`, { reason: evidence.reason, observed: evidence.observed ?? null });
+    const base = await queueBaseline(file);
+    invariant(base.ok, 'queue_source_unstable', `The native record cannot anchor a receipt right now (${base.reason}); nothing was pasted.`, { reason: base.reason });
+    const before = await this.tmux.captureScreen(record.paneId);
+    const busy = classifyBusyInput(record.agent.kind, before);
+    if (!busy.ok) {
+      const code = busy.reason === 'state_idle' ? 'invalid_message' : busy.reason === 'state_waiting_input' ? 'session_waiting_input' : busy.reason === 'state_draft' || busy.reason === 'input_not_empty' ? 'queue_input_not_empty' : busy.reason === 'state_unknown' || busy.reason === 'no_prompt_row' ? 'queue_unverifiable' : 'queue_unverifiable';
+      invariant(false, code, busy.reason === 'state_idle' ? 'The session is idle; send with mode idle_only.' : `Queue mode needs a busy session with an empty input box (${busy.reason}); nothing was pasted.`, { reason: busy.reason, state: busy.state?.state ?? null });
+    }
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const wire = queueWire(nonce, message);
+    invariant(wire.length <= 8000, 'invalid_message', 'text plus the queue envelope must be at most 8000 characters.', { field: 'text' });
+    const entry = {
+      keyHash, payloadHash, at: now(), kind: 'text', mode: 'queue', length: message.length, stateBefore: 'busy', outcome: 'pending',
+      formatVersion: QUEUE_FORMAT_VERSION, nonce, wireHash: sha(wire), profile: profile.id, evidenceAtSend: evidence.evidence,
+      queue: { state: 'pending', conflict: null, baseline: base.baseline, scanCursor: base.baseline.size, anchor: base.baseline.anchor, enqueue: null, remove: null, attachment: null, nativeRemoval: null, terminalBoundary: null, lastScanAt: null },
+    };
+    await this._commit(record, r => { r.messages = [...r.messages, entry]; });
+    try { await this.tmux.sendText(record.paneId, wire); }
+    catch (error) {
+      await this._commit(record, r => { const m = r.messages.find(x => x.keyHash === keyHash); if (m) { m.queue.state = 'uncertain'; m.outcome = 'uncertain'; m.error = error.code || 'send_failed'; } }).catch(() => {});
+      throw new OrchestratorError('send_uncertain', 'tmux did not confirm the paste. The queued message stays outstanding; do not resend, read session_status for its receipt.', { cause: error.code || 'send_failed' });
+    }
+    let current = await this._commit(record, r => { const m = r.messages.find(x => x.keyHash === keyHash); if (m) { m.queue.state = 'sent_unobserved'; m.outcome = 'sent_unobserved'; } });
+    // Observation window: receipts come only from matched native rows, never from the screen.
+    const deadline = this.clock() + this.settleMs;
+    while (true) {
+      current = await this._reconcileOutstanding(current);
+      const m = current.messages.find(x => x.keyHash === keyHash);
+      if (['queued', 'absorbed'].includes(m.queue.state) || m.queue.conflict || this.clock() >= deadline) break;
+      await sleep(150);
+    }
+    const stored = current.messages.find(x => x.keyHash === keyHash);
+    if (stored.queue.state === 'sent_unobserved') current = await this._commit(current, r => { const m = r.messages.find(x => x.keyHash === keyHash); if (m) { m.queue.state = 'uncertain'; m.outcome = 'uncertain'; } });
+    const final = current.messages.find(x => x.keyHash === keyHash);
+    return { ...this._public(current, identity, { state: 'busy', reason: 'working' }), message: { ...final, reused: false, meaning: QUEUE_CAPABILITY.meaning, note: final.queue.state === 'absorbed' ? 'Absorbed into the running turn as context; the model’s answer, if any, is read with session_read, and the turn boundary is the observer’s agent.turn_finished.' : final.queue.state === 'queued' ? 'Accepted into Claude’s queue; poll session_status for absorbed.' : 'Not yet observed in the native record; the message stays outstanding and will never be pasted again under this key. Poll session_status.' } };
+  }
+
+  // Reconciles the binding's outstanding queue entry from its own frozen baseline. Caller holds the
+  // pane lock and has re-authorized. Only enqueue rows create candidates; a remove is lifecycle
+  // evidence attributed to the one persisted enqueue; conflicts (second distinct enqueue, source
+  // discontinuity, unknown removal, oversized row) are sticky and never resolve to absorbed.
+  async _reconcileOutstanding(record) {
+    const entry = SessionService.outstandingQueue(record);
+    if (!entry || entry.queue.state === 'pending' || entry.queue.conflict) return record;
+    const q = entry.queue;
+    const scan = await queueScan(record.queue.transcriptPath, { dev: q.baseline.dev, ino: q.baseline.ino, scanCursor: q.scanCursor, anchor: q.anchor });
+    const change = {};
+    if (!scan.ok) { Object.assign(change, { conflict: 'native_reset', nativeReset: { reason: scan.reset, at: now() }, state: 'uncertain' }); }
+    else {
+      let enqueue = q.enqueue, remove = q.remove, attachment = q.attachment, conflict = null, nativeRemoval = null;
+      for (const { start, end, row } of scan.rows) {
+        if (!row || row.sessionId !== record.providerSession.sessionId) continue;
+        if (row.type === 'queue-operation' && row.operation === 'enqueue' && queueContentMatches(row.content, entry.wireHash)) {
+          if (!enqueue) enqueue = { start, end, timestamp: row.timestamp ?? null };
+          else if (enqueue.start !== start) { conflict = 'ambiguous'; break; } // a second distinct matching enqueue before the terminal
+          continue;
+        }
+        if (row.type === 'queue-operation' && row.operation === 'remove' && enqueue && start > enqueue.start && queueContentMatches(row.content, entry.wireHash)) {
+          const ids = typeof row.commandUuid === 'string' && typeof row.deliveryId === 'string';
+          if (QUEUE_PROFILES[entry.profile].acceptedTerminalReasons.includes(row.reason) && ids) { if (!remove) remove = { start, end, reason: row.reason, commandUuid: row.commandUuid, deliveryId: row.deliveryId, timestamp: row.timestamp ?? null }; }
+          else { nativeRemoval = { start, reason: typeof row.reason === 'string' ? row.reason.slice(0, 80) : null, commandUuid: row.commandUuid ?? null, deliveryId: row.deliveryId ?? null }; conflict = 'unknown_removal'; break; }
+          continue;
+        }
+        if (row.type === 'attachment' && remove && start > remove.start && row.attachment?.type === 'queued_command' && row.attachment.source_uuid === remove.commandUuid && row.attachment.delivery_id === remove.deliveryId && queueContentMatches(row.attachment.prompt, entry.wireHash)) {
+          if (!attachment) attachment = { start, uuid: row.uuid ?? null };
+        }
+      }
+      if (scan.oversized && !conflict) conflict = 'oversized_row';
+      Object.assign(change, { scanCursor: conflict ? q.scanCursor : scan.scanCursor, anchor: conflict ? q.anchor : scan.anchor, enqueue, remove, attachment, lastScanAt: now() });
+      if (conflict) Object.assign(change, { conflict, state: 'uncertain', ...(nativeRemoval ? { nativeRemoval } : {}), ...(scan.oversized ? { oversizedRow: scan.oversized } : {}) });
+      else if (remove) {
+        // Terminal only after every complete row through the captured EOF boundary has been inspected.
+        const boundary = q.terminalBoundary ?? scan.sizeAtScan;
+        change.terminalBoundary = boundary;
+        if (scan.scanCursor >= boundary && scan.eof) change.state = 'absorbed'; else change.state = 'queued';
+      } else if (enqueue) change.state = 'queued';
+    }
+    if (!Object.keys(change).length) return record;
+    return this._commit(record, r => { const m = r.messages.find(x => x.keyHash === entry.keyHash); if (m) { Object.assign(m.queue, change); m.outcome = m.queue.state; } });
+  }
+
   // After sending, watch the screen for the echo of the message or a busy marker.
   async _confirm(record, message, keys, before) {
     const deadline = this.clock() + this.settleMs;
@@ -713,6 +987,7 @@ export class SessionService {
     return {
       schemaVersion: SESSION_SCHEMA_VERSION,
       session: { id: record.id, principalId: record.principalId, label: record.label, paneId: record.paneId, target: record.target, agent: record.agent.kind, project: record.project, allowKeys: record.allowKeys, createdAt: record.createdAt, messages: record.messages.length },
+      queue: record.queue ? { allowed: true, profile: record.queue.profile, profileStatus: record.queue.profileStatus, outstanding: (() => { const o = SessionService.outstandingQueue(record); return o ? { keyHash: o.keyHash, state: o.queue.state, conflict: o.queue.conflict, at: o.at } : null; })() } : { allowed: false, profile: null, outstanding: null },
       identity: identity ? { ok: identity.ok !== false, ...(identity.code ? { code: identity.code, message: identity.message } : {}) } : null,
       state: state ? state.state : null,
       stateReason: state ? state.reason : null,

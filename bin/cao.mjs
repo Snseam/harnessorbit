@@ -148,11 +148,11 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access principal migrate --id ID      (operator, once: give a pre-identity principal its incarnation)
   access principal adopt-jobs --id ID   (operator: assign this principal's pre-identity jobs to its current incarnation)
   access session discover [--tmux-socket NAME]       (operator: which tmux panes run claude/codex)
-  access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT] [--tmux-socket NAME] [--provider-session UUID]
+  access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT] [--tmux-socket NAME] [--provider-session UUID] [--allow-queue --queue-profile claude-queue-2.1.306]
       (native source: Claude from --resume/--session-id or --provider-session; Codex only from the rollout the live process holds open, header-validated; --provider-session must match it)
   access session list --principal ID
   access session status --principal ID --session ID
-  access session send --principal ID --session ID --key KEY (--text TEXT | --text-file FILE | --keys Enter)
+  access session send --principal ID --session ID --key KEY (--text TEXT | --text-file FILE | --keys Enter) [--mode idle_only|queue]
   access session read --principal ID --session ID [--cursor CURSOR] [--max-lines 120]
   access session unbind --principal ID --session ID   (or --operator to drop any binding by id)
   access memory recall --principal ID (--session ID | --job ID) --question TEXT [--top-k 5] [--authority agent|orchestrator]
@@ -240,9 +240,9 @@ const optionsByCommand = {
   'access principal update': ['id', 'allow-sessions', 'deny-sessions', 'allow-integrate', 'deny-integrate'],
   'access principal adopt-jobs': ['id'], 'access principal migrate': ['id'],
   'access session discover': ['tmux-socket'],
-  'access session bind': ['principal', 'pane', 'id', 'allow-keys', 'label', 'tmux-socket', 'provider-session'],
+  'access session bind': ['principal', 'pane', 'id', 'allow-keys', 'label', 'tmux-socket', 'provider-session', 'allow-queue', 'queue-profile'],
   'access session list': ['principal', 'tmux-socket'], 'access session status': ['principal', 'session', 'tmux-socket'],
-  'access session send': ['principal', 'session', 'key', 'text', 'text-file', 'keys', 'tmux-socket'],
+  'access session send': ['principal', 'session', 'key', 'text', 'text-file', 'keys', 'tmux-socket', 'mode'],
   'access session read': ['principal', 'session', 'cursor', 'max-lines', 'tmux-socket'],
   'access session unbind': ['principal', 'session', 'operator', 'tmux-socket'],
   'access memory recall': ['principal', 'session', 'job', 'question', 'top-k', 'authority'],
@@ -271,7 +271,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once', 'allow-http-loopback', 'from-v1', 'resume', 'dry-run'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once', 'allow-http-loopback', 'from-v1', 'resume', 'dry-run', 'allow-queue'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -399,7 +399,7 @@ export async function main(argv = process.argv.slice(2)) {
       const audit = new AccessAudit({ root: profiles.root });
       const tool = command.slice('access session '.length);
       if (tool === 'discover') return sessions.discover();
-      if (tool === 'bind') return sessions.bind({ principalId: required('principal'), pane: required('pane'), id: o.id || null, allowKeys: !!o['allow-keys'], label: o.label || null, providerSessionId: o['provider-session'] || null });
+      if (tool === 'bind') return sessions.bind({ principalId: required('principal'), pane: required('pane'), id: o.id || null, allowKeys: !!o['allow-keys'], label: o.label || null, providerSessionId: o['provider-session'] || null, allowQueue: !!o['allow-queue'], queueProfile: o['queue-profile'] || null });
       if (tool === 'unbind' && o.operator) return { id: required('session'), removed: await sessions.unbindAsOperator(o.session) };
       const principal = await principals.get(required('principal'));
       if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
@@ -415,7 +415,7 @@ export async function main(argv = process.argv.slice(2)) {
           const sources = ['text', 'text-file', 'keys'].filter(key => o[key] !== undefined);
           if (sources.length !== 1) throw new OrchestratorError('invalid_arguments', 'Supply exactly one of --text, --text-file, or --keys.');
           const input = o.keys !== undefined ? { keys: String(o.keys).split(',').map(v => v.trim()).filter(Boolean) } : { text: o['text-file'] ? await read(o['text-file']) : o.text };
-          result = await sessions.send(principal, { sessionId: required('session'), idempotencyKey: required('key'), ...input });
+          result = await sessions.send(principal, { sessionId: required('session'), idempotencyKey: required('key'), ...input, ...(o.mode ? { mode: o.mode } : {}) });
         }
         await audit.record({ principalId: principal.id, transport: 'cli', tool: auditName, sessionId: o.session || null, ok: true, durationMs: Date.now() - startedAt });
         return result;

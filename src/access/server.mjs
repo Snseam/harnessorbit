@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { QUEUE_CAPABILITY } from './sessions.mjs';
 import { OrchestratorError } from '../errors.mjs';
 import { ACCESS_VERSION, TOOL_TIMEOUT_MS, AccessAudit } from './service.mjs';
 
@@ -89,7 +90,7 @@ export const TOOLS = Object.freeze([
   {
     name: 'session_send', title: 'Send a follow-up message to a live session',
     description: 'Type a message into an idle bound session and submit it, continuing its existing context. Requires an idempotencyKey; a repeated key returns the earlier message instead of sending again. Refused while the session is busy, waiting on a prompt, or in an unknown state. keys (such as ["Enter"]) are accepted only while the session waits on a prompt and only if the binding allows keys. If the result says uncertain, do not resend: read the session first.',
-    inputSchema: { type: 'object', additionalProperties: false, required: ['sessionId', 'idempotencyKey'], properties: { sessionId: sessionIdSchema, idempotencyKey: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 8000 }, keys: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', pattern: '^[A-Za-z0-9+_-]{1,32}$' } } } },
+    inputSchema: { type: 'object', additionalProperties: false, required: ['sessionId', 'idempotencyKey'], properties: { sessionId: sessionIdSchema, idempotencyKey: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 8000 }, keys: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', pattern: '^[A-Za-z0-9+_-]{1,32}$' } }, mode: { type: 'string', enum: ['idle_only', 'queue'], description: 'idle_only (default): accepted only while the session is idle. queue: only on a binding the operator created with --allow-queue and a candidate profile; pastes one ordinary-text envelope while a Claude Code session is busy with an empty input box and returns a queue receipt from its native record (queued / absorbed / uncertain). A receipt is not a response, not completion, not authorization.' } } },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   {
@@ -199,7 +200,7 @@ export async function startAccessServer({ service, sessions = null, memory = nul
 
   async function callTool(principal, name, args) {
     switch (name) {
-      case 'describe': return { ...service.describe(principal), ...(memory ? { memory: memory.describe(principal) } : {}), ...(coop ? { cooperation: coop.describe(principal) } : {}), liveSessions: Boolean(sessions) };
+      case 'describe': return { ...service.describe(principal), ...(memory ? { memory: memory.describe(principal) } : {}), ...(coop ? { cooperation: coop.describe(principal) } : {}), liveSessions: Boolean(sessions), ...(sessions ? { busyQueue: QUEUE_CAPABILITY } : {}) };
       case 'coop_report': { if (!coop) throw new OrchestratorError('coop_unavailable', 'Cooperation events are not enabled on this server.'); return coop.report(principal, args || {}, { via: 'mcp' }); }
       case 'coop_inbox': { if (!coop) throw new OrchestratorError('coop_unavailable', 'Cooperation events are not enabled on this server.'); return coop.inbox(principal, { ...(args?.cursor === undefined ? {} : { cursor: args.cursor }), ...(args?.cursorV2 === undefined ? {} : { cursorV2: args.cursorV2 }), ...(args?.limit === undefined ? {} : { limit: args.limit }) }); }
       case 'coop_ack': { if (!coop) throw new OrchestratorError('coop_unavailable', 'Cooperation events are not enabled on this server.'); return coop.ack(principal, { eventId: args?.eventId, epoch: args?.epoch }); }
@@ -216,7 +217,7 @@ export async function startAccessServer({ service, sessions = null, memory = nul
       case 'events': return service.events(principal, { jobId: args?.jobId, since: args?.since, ...(args?.limit === undefined ? {} : { limit: args.limit }) });
       case 'sessions': return sessionTool(p => sessions.list(p))(principal, args);
       case 'session_status': return sessionTool((p, a) => sessions.status(p, { sessionId: a?.sessionId }))(principal, args);
-      case 'session_send': return sessionTool((p, a) => sessions.send(p, { sessionId: a?.sessionId, idempotencyKey: a?.idempotencyKey, text: a?.text, keys: a?.keys }))(principal, args);
+      case 'session_send': return sessionTool((p, a) => sessions.send(p, { sessionId: a?.sessionId, idempotencyKey: a?.idempotencyKey, text: a?.text, keys: a?.keys, ...(a?.mode === undefined ? {} : { mode: a.mode }) }))(principal, args);
       case 'session_read': return sessionTool((p, a) => sessions.read(p, { sessionId: a?.sessionId, cursor: a?.cursor, ...(a?.maxLines === undefined ? {} : { maxLines: a.maxLines }) }))(principal, args);
       case 'session_unbind': return sessionTool((p, a) => sessions.unbind(p, { sessionId: a?.sessionId }))(principal, args);
       default: throw new OrchestratorError('unknown_tool', `Unknown tool: ${name}`);

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { invariant } from '../errors.mjs';
 import { readJson, writeJsonAtomic } from '../state.mjs';
-import { classifyScreen, readCodexRolloutHeader, parseCodexRolloutHeader } from './sessions.mjs';
+import { classifyScreen, readCodexRolloutHeader, parseCodexRolloutHeader, claudeTranscriptPath } from './sessions.mjs';
 
 // Automatic end-of-turn signal for bound live sessions, in two grades:
 //
@@ -37,10 +37,7 @@ const MAX_TAIL_BYTES = 8 * 1048576;
 const SCAN_CHUNK = 1048576;
 const OBSERVATION_VERSION = 2;
 
-export function claudeTranscriptPath(home, cwd, sessionId) {
-  const encoded = path.resolve(cwd).replace(/[\\/]/g, '-');
-  return path.join(home, 'projects', encoded, `${sessionId}.jsonl`);
-}
+export { claudeTranscriptPath };
 
 // Brings a stored observation to the current shape without losing pending work.
 export function migrateObservation(previous, at) {
