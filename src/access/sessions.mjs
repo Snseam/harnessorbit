@@ -298,11 +298,19 @@ export class Tmux {
   // Underscores, CJK, tabs, inner newlines and the format characters # , } are preserved exactly.
   static formatLiteral(value) { return String(value).replace(/#/g, '##').replace(/,/g, '#,').replace(/}/g, '#}'); }
 
-  async _paneField(paneId, field) {
-    const out = await this.run(['display-message', '-p', '-t', paneId, '-F', `#{${field}}`]);
-    const value = out.endsWith('\n') ? out.slice(0, -1) : out;
-    const confirmed = (await this.run(['display-message', '-p', '-t', paneId, '-F', `#{==:#{${field}},${Tmux.formatLiteral(value)}}`])).trim();
-    invariant(confirmed === '1', 'tmux_value_unverifiable', `tmux did not confirm the ${field} of pane ${paneId} as read; refusing to use an unverified value (a non-UTF-8 client, or a value ending in a newline, cannot be read faithfully).`, { paneId, field });
+  // A field may legitimately change between the read and the confirmation (a pane process that has
+  // just exec'd), so the pair is retried a few times; a value that never confirms (a client that
+  // rewrote its bytes, or any other mismatch) is an explicit error.
+  async _paneField(paneId, field, attempts = 3) {
+    let value = null;
+    for (let i = 0; i < attempts; i++) {
+      const out = await this.run(['display-message', '-p', '-t', paneId, '-F', `#{${field}}`]);
+      value = out.endsWith('\n') ? out.slice(0, -1) : out;
+      const confirmed = (await this.run(['display-message', '-p', '-t', paneId, '-F', `#{==:#{${field}},${Tmux.formatLiteral(value)}}`])).trim();
+      if (confirmed === '1') return value;
+      if (i < attempts - 1) await sleep(50);
+    }
+    invariant(false, 'tmux_value_unverifiable', `tmux did not confirm the ${field} of pane ${paneId} as read; refusing to use an unverified value (a client that does not render UTF-8 cannot be read faithfully).`, { paneId, field });
     return value;
   }
 

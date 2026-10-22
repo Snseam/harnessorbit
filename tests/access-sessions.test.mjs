@@ -432,6 +432,11 @@ test('tmux pane listing reads each free-form field on its own and verifies it ro
   // Non-ids and non-numeric facts are refused.
   await assert.rejects(new Tmux({ socket: null, command: async argv => (argv.includes('list-panes') ? { code: 0, stdout: '%0_claude-ho_95599\n', stderr: '' } : { code: 0, stdout: '1 0 0 0 0\n', stderr: '' }) }).listPanes(), e => e.code === 'tmux_format_unparsed');
   await assert.rejects(new Tmux({ socket: null, command: async argv => (argv.includes('list-panes') ? { code: 0, stdout: '%0\n', stderr: '' } : { code: 0, stdout: 'x 0 0 0 0\n', stderr: '' }) }).listPanes(), e => e.code === 'tmux_format_unparsed');
+  // A value that changes between the read and the confirmation (a pane process that just exec'd) is re-read and accepted once stable.
+  let reads = 0;
+  const changing = async argv => { const fmt = argv[argv.indexOf('-F') + 1]; if (fmt === '#{pane_current_command}') { reads += 1; return { code: 0, stdout: reads === 1 ? 'tmux\n' : 'claude\n', stderr: '' }; } return panesOf({ '%0': { ...odd['%0'], pane_current_command: 'claude' } })(argv); };
+  assert.equal((await new Tmux({ socket: null, command: changing }).listPanes())[0].currentCommand, 'claude');
+  assert.equal(reads, 2, 'one retry after the first confirmation failed');
   // A pane that closes between the id listing and its reads is skipped as vanished, not reported as a parse error.
   let listed = 0;
   const vanishing = async argv => { if (argv.includes('list-panes')) { listed += 1; return { code: 0, stdout: listed === 1 ? '%0\n%9\n' : '%0\n', stderr: '' }; } if (argv.includes('%9')) return { code: 0, stdout: '', stderr: '' }; return panesOf(odd)(argv); };
