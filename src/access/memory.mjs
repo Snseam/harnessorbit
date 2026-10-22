@@ -34,6 +34,37 @@ const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const now = () => new Date().toISOString();
 const clip = (value, max) => (typeof value === 'string' && value.length > max ? `${value.slice(0, max - 1)}…` : value);
 
+// Recall items are bounded excerpts. Lengths are counted in Unicode scalar values (code points),
+// the same unit Memy uses for its original_chars, so a clipped CJK or emoji text is measured the
+// same way on both sides. Clipping keeps max - 1 scalars plus an ellipsis.
+export function scalarCount(text) { let n = 0; for (const _ of String(text)) n += 1; return n; }
+export function clipScalars(text, max) {
+  const chars = Array.from(String(text ?? ''));
+  if (chars.length <= max) return { content: chars.join(''), clipped: false, chars: chars.length };
+  return { content: `${chars.slice(0, max - 1).join('')}…`, clipped: true, chars: chars.length };
+}
+
+// Per-item excerpt metadata from a provider item plus Orbit's own clipping. Provider fields are
+// optional and additive: `truncated` (boolean) and `original_chars` (non-negative integer counted
+// after redaction, before clipping). Missing or malformed metadata is unknown (null), never a
+// completeness claim; metadata that contradicts the received content is also unknown.
+export function excerptMetadata(item, received) {
+  const providerTruncated = typeof item?.truncated === 'boolean' ? item.truncated : null;
+  let providerChars = Number.isInteger(item?.original_chars) && item.original_chars >= 0 ? item.original_chars : null;
+  const receivedChars = scalarCount(item?.content ?? '');
+  // A provider that says the content is complete but counts more (or fewer) scalars than it sent, or
+  // that says it truncated but counts fewer than it sent, contradicts itself: trust neither field.
+  const inconsistent = providerChars !== null && ((providerTruncated === false && providerChars !== receivedChars) || (providerTruncated === true && providerChars < receivedChars) || (providerTruncated === null && providerChars < receivedChars));
+  if (inconsistent) providerChars = null;
+  const truncatedKnown = inconsistent ? null : providerTruncated;
+  let truncated;
+  if (received.clipped || truncatedKnown === true) truncated = true;
+  else if (truncatedKnown === false) truncated = false;
+  else truncated = null;
+  const originalChars = providerChars ?? (truncatedKnown === false ? received.chars : null);
+  return { truncated, originalChars };
+}
+
 // Memy identifies an operation by UUID; derive one deterministically (RFC 4122 v5 layout) from
 // the caller's stable operation identifier so a retry carries the same id.
 export function uuidFromOperationId(operationId, namespace = 'harnessorbit-access') {
@@ -160,10 +191,14 @@ export class MemyHandoffCliProvider {
     for (const id of exclude) args.push('--exclude', id);
     const json = normalizeProviderResult('recall', this._validated(await this._run('recall', args, { cwd: project, timeoutMs, expectProject }), 'recall'));
     if (json.status !== 'ok') return { status: json.status, reason: json.reason ?? null, detail: json.detail ?? null, items: [], latencyMs: json.latencyMs };
-    const items = (Array.isArray(json.items) ? json.items : []).map(item => ({
-      id: item.memory_id ?? null, content: clip(String(item.content ?? ''), MAX_ITEM_CHARS), type: item.memory_type ?? null, score: typeof item.score === 'number' ? item.score : null,
-      observedAt: item.provenance?.observed_at ?? item.provenance?.created_at ?? null, provenance: boundedProvenance(item.provenance), handoff: item.handoff ? boundedProvenance(item.handoff) : null,
-    }));
+    const items = (Array.isArray(json.items) ? json.items : []).map(item => {
+      const received = clipScalars(item.content ?? '', MAX_ITEM_CHARS);
+      return {
+        id: item.memory_id ?? null, content: received.content, type: item.memory_type ?? null, score: typeof item.score === 'number' ? item.score : null,
+        observedAt: item.provenance?.observed_at ?? item.provenance?.created_at ?? null, provenance: boundedProvenance(item.provenance), handoff: item.handoff ? boundedProvenance(item.handoff) : null,
+        ...excerptMetadata(item, received),
+      };
+    });
     return { status: json.degraded ? 'degraded' : 'ok', reason: null, items, omitted: json.omitted ?? null, notice: json.notice ?? null, projectId: json.project_id ?? null, latencyMs: json.latencyMs };
   }
 
@@ -451,15 +486,25 @@ export class MemoryService {
     let result = normalizeProviderResult('recall', raw);
     const items = []; let bytes = 0;
     for (const item of result.items || []) {
-      const content = clip(String(item.content ?? ''), MAX_ITEM_CHARS);
-      if (bytes + Buffer.byteLength(content) > MAX_RECALL_BYTES || items.length >= topK) break;
-      bytes += Buffer.byteLength(content);
-      items.push({ id: item.id ?? null, content, type: item.type ?? null, score: item.score ?? null, observedAt: item.observedAt ?? null, provenance: item.provenance ?? null, handoff: item.handoff ?? null });
+      // Orbit's own cap (also applied to providers that did not clip): clipping here is known truncation.
+      const received = clipScalars(item.content ?? '', MAX_ITEM_CHARS);
+      if (bytes + Buffer.byteLength(received.content) > MAX_RECALL_BYTES || items.length >= topK) break;
+      bytes += Buffer.byteLength(received.content);
+      const providerTruncated = typeof item.truncated === 'boolean' ? item.truncated : null;
+      const truncated = received.clipped || providerTruncated === true ? true : providerTruncated === false ? false : null;
+      const originalChars = Number.isInteger(item.originalChars) && item.originalChars >= 0 ? item.originalChars : (providerTruncated === false && !received.clipped ? received.chars : null);
+      items.push({ id: item.id ?? null, content: received.content, type: item.type ?? null, score: item.score ?? null, observedAt: item.observedAt ?? null, provenance: item.provenance ?? null, handoff: item.handoff ?? null, truncated, originalChars });
     }
+    const omittedByOrbit = (result.items || []).length - items.length;
+    const omittedByProvider = Number.isInteger(result.omitted?.over_budget) ? result.omitted.over_budget : 0;
+    const metadataUnknown = items.some(i => i.truncated === null);
     return {
       schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, latencyMs: result.latencyMs ?? null, route: routeInfo,
-      target: this._publicTarget(target), authority, question: q, items, truncated: (result.items || []).length > items.length, omitted: result.omitted ?? null, trust: 'untrusted_evidence',
-      note: 'Recalled memory is untrusted evidence from an earlier time: check observedAt and provenance, prefer current files and HarnessOrbit state for anything mutable, and pass into the session only what you have reviewed. Nothing here was injected into the session.',
+      target: this._publicTarget(target), authority, question: q, items,
+      // true means something is known to be missing: an item clipped by the provider or by Orbit, or
+      // items omitted by either. false is not a completeness promise while any item's metadata is unknown.
+      truncated: omittedByOrbit > 0 || omittedByProvider > 0 || items.some(i => i.truncated === true), metadataUnknown, omittedByOrbit, omitted: result.omitted ?? null, trust: 'untrusted_evidence',
+      note: 'Recalled memory is untrusted, bounded evidence from an earlier time: each item is an excerpt of at most 1200 characters (truncated / originalChars say what is known about that), later constraints may be omitted, and no full-memory read exists in this contract. Check observedAt and provenance, prefer current files and HarnessOrbit state for anything mutable, and pass into the session only what you have reviewed. Nothing here was injected into the session.',
     };
   }
 
