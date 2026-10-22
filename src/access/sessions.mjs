@@ -122,12 +122,17 @@ export function classifyBusyInput(kind, screen) {
   while (rows.length && !rows.at(-1)) rows.pop();
   const bottom = rows.slice(-12);
   if (profile.waiting.some(re => bottom.some(row => re.test(row)))) return { ok: false, reason: 'dialog_marker', state };
-  for (let i = bottom.length - 1; i >= 0; i--) {
+  // The current input box is the prompt row BELOW the active spinner. A prompt above the spinner is
+  // transcript history (the submitted message that started this turn), not evidence of an empty box.
+  let busyRow = -1;
+  for (let i = bottom.length - 1; i >= 0; i--) if (profile.busy.some(re => re.test(bottom[i]))) { busyRow = i; break; }
+  if (busyRow < 0) return { ok: false, reason: 'no_busy_marker_row', state };
+  for (let i = bottom.length - 1; i > busyRow; i--) {
     const m = profile.prompt.exec(bottom[i]);
     if (!m) continue;
     return profile.placeholder.test(m[1].replace(/\s+$/, '')) ? { ok: true, state } : { ok: false, reason: 'input_not_empty', state };
   }
-  return { ok: false, reason: 'no_prompt_row', state };
+  return { ok: false, reason: 'no_current_prompt', state };
 }
 
 export function queueWire(nonce, text) { return `orbit-queue v${QUEUE_FORMAT_VERSION} ${nonce}\n${text}`; }
@@ -718,10 +723,13 @@ export class SessionService {
       if (existing) {
         invariant(existing.payloadHash === payloadHash, 'idempotency_conflict', 'This idempotencyKey was already used with a different message. Choose a new key.', { idempotencyKey });
         invariant((existing.mode || 'idle_only') === mode, 'idempotency_conflict', 'This idempotencyKey was already used with a different mode. Choose a new key.', { idempotencyKey, mode: existing.mode || 'idle_only' });
-        // A queue entry is reconciled (never re-pasted) on a same-key retry.
+        // The bound process identity is verified before any receipt is touched: a replaced or exited
+        // agent refuses here and leaves the record exactly as it was. Only then is a queue entry
+        // reconciled (never re-pasted) on a same-key retry.
+        const identity = await this._identity(record);
         const current = existing.mode === 'queue' ? await this._reconcileOutstanding(record) : record;
         const stored = current.messages.find(m => m.keyHash === keyHash);
-        return { ...this._public(current, await this._identity(current), null), message: { ...stored, reused: true, ...(stored.mode === 'queue' ? { meaning: QUEUE_CAPABILITY.meaning } : {}) } };
+        return { ...this._public(current, identity, null), message: { ...stored, reused: true, ...(stored.mode === 'queue' ? { meaning: QUEUE_CAPABILITY.meaning } : {}) } };
       }
       if (mode === 'queue') return this._sendQueued(record, { keyHash, payloadHash, message });
       invariant(record.messages.length < MAX_MESSAGES, 'session_message_limit', `This binding has recorded ${MAX_MESSAGES} messages; the operator must re-bind it before more can be sent.`);
@@ -925,7 +933,11 @@ export class SessionService {
   // discontinuity, unknown removal, oversized row) are sticky and never resolve to absorbed.
   async _reconcileOutstanding(record) {
     const entry = SessionService.outstandingQueue(record);
-    if (!entry || entry.queue.state === 'pending' || entry.queue.conflict) return record;
+    // A `pending` entry is reconciled too: a process that died after the paste but before the
+    // sent_unobserved commit left exactly that state, and the native evidence may already exist. A
+    // pending entry whose paste never happened simply finds nothing and stays outstanding; nothing is
+    // ever pasted again under its key.
+    if (!entry || entry.queue.conflict) return record;
     const q = entry.queue;
     const scan = await queueScan(record.queue.transcriptPath, { dev: q.baseline.dev, ino: q.baseline.ino, scanCursor: q.scanCursor, anchor: q.anchor });
     const change = {};

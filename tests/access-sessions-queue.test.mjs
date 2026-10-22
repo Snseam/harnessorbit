@@ -57,7 +57,12 @@ async function setup(t, { bind = {}, settleMs = 800, pasteBehaviour = 'claude' }
 test('helpers: busy input classification, wire envelope, strict content decode, baseline anchor and bounded scan', async t => {
   assert.equal(classifyBusyInput('claude', BUSY).ok, true);
   assert.equal(classifyBusyInput('claude', BUSY_DRAFT).reason, 'input_not_empty');
-  assert.equal(classifyBusyInput('claude', BUSY_NO_PROMPT).reason, 'no_prompt_row');
+  assert.equal(classifyBusyInput('claude', BUSY_NO_PROMPT).reason, 'no_current_prompt');
+  // Review C7: a prompt ABOVE the spinner is the submitted message, not a current empty input box.
+  assert.equal(classifyBusyInput('claude', ['❯ ', '✻ Brewing… (esc to interrupt)', 'some tool output']).reason, 'no_current_prompt');
+  assert.equal(classifyBusyInput('claude', ['❯ fix it', '✻ Brewing… (esc to interrupt)', '❯ ']).ok, true, 'history above, current empty prompt below');
+  assert.equal(classifyBusyInput('claude', ['❯ ', '✻ Brewing… (esc to interrupt)', '❯ draft']).reason, 'input_not_empty');
+  assert.equal(classifyBusyInput('claude', ['❯ ', '✻ Brewing… (esc to interrupt)', '❯ ', 'Do you want to proceed?']).reason, 'state_waiting_input', 'a dialog is waiting_input before any busy evaluation');
   assert.equal(classifyBusyInput('claude', IDLE).reason, 'state_idle');
   assert.equal(classifyBusyInput('claude', PERMISSION).reason, 'state_waiting_input');
   assert.equal(classifyBusyInput('claude', ['some log']).reason, 'state_unknown');
@@ -323,4 +328,59 @@ test('MCP and CLI surfaces: describe labels the candidate, session_send takes mo
   assert.deepEqual(parseArgs(['access', 'session', 'bind', '--principal', 'g', '--pane', '%1', '--allow-queue', '--queue-profile', PROFILE]).values, { principal: 'g', pane: '%1', 'allow-queue': true, 'queue-profile': PROFILE });
   assert.deepEqual(parseArgs(['access', 'session', 'send', '--principal', 'g', '--session', 's', '--key', 'k', '--text', 't', '--mode', 'queue']).values.mode, 'queue');
   assert.throws(() => parseArgs(['access', 'session', 'send', '--principal', 'g', '--session', 's', '--key', 'k', '--text', 't', '--send-now']), e => e.code === 'invalid_arguments');
+});
+
+test('review regressions: a post-paste crash leaves pending that reconciles from native evidence with zero re-paste, a pre-paste crash control stays outstanding with zero paste, a changed process identity refuses a same-key retry before any receipt mutation, and a historical prompt above the spinner never passes the gate', async t => {
+  const { live, grok, tmux, pasted, entry, transcript, sessions, principals, record } = await setup(t, { settleMs: 500 });
+  // C5: the process dies after the paste (native enqueue + absorbed remove already written) and before the
+  // sent_unobserved commit. Emulated by making that commit throw once; the stored entry is `pending`.
+  tmux.afterPaste = async text => { const r = remove(wrap(text)); await fs.appendFile(transcript, r.text + attachment(wrap(text), r)); };
+  const commit = live._commit.bind(live); let commits = 0;
+  live._commit = async (rec, change) => { commits += 1; if (commits === 2) { const e = new Error('process died'); e.code = 'simulated_crash'; throw e; } return commit(rec, change); };
+  await assert.rejects(live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c5', text: 'diagnosis', mode: 'queue' }), e => e.code === 'simulated_crash');
+  live._commit = commit;
+  assert.equal((await entry('c5')).queue.state, 'pending'); assert.equal(pasted.length, 1);
+  const restarted = new SessionService({ root: live.root, principals, sessions, tmux, processes: live.processes, settleMs: 500, claudeHome: live.claudeHome });
+  const st = await restarted.status(grok, { sessionId: 'ses-1' });
+  assert.equal(st.queue.outstanding, null, 'status reconciled the pending entry from the native rows');
+  const e5 = await entry('c5'); assert.equal(e5.queue.state, 'absorbed'); assert.ok(e5.queue.enqueue && e5.queue.remove && e5.queue.attachment);
+  const retry = await restarted.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c5', text: 'diagnosis', mode: 'queue' });
+  assert.equal(retry.message.reused, true); assert.equal(retry.message.queue.state, 'absorbed'); assert.equal(pasted.length, 1, 'zero re-paste after restart');
+  // Pre-paste crash control: the entry was committed as pending but the paste never happened.
+  tmux.afterPaste = null; tmux.pasteMode = 'throw';
+  await assert.rejects(live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c5b', text: 'never pasted', mode: 'queue' }), e => e.code === 'send_uncertain');
+  await sessions.update('ses-1', r => { const m = r.messages.find(x => x.keyHash === sha('c5b')); m.queue.state = 'pending'; m.outcome = 'pending'; delete m.error; }); // as a crash before the uncertain commit would leave it
+  tmux.pasteMode = 'claude';
+  const before = pasted.length;
+  const again = await restarted.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c5b', text: 'never pasted', mode: 'queue' });
+  assert.equal(again.message.reused, true); assert.equal(again.message.queue.state, 'pending'); assert.equal(again.message.queue.enqueue, null); assert.equal(pasted.length, before, 'unknown delivery: outstanding, never pasted again');
+  assert.equal((await live.status(grok, { sessionId: 'ses-1' })).queue.outstanding.state, 'pending');
+  await assert.rejects(live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c5c', text: 'x', mode: 'queue' }), e => e.code === 'queue_outstanding');
+  // C6: queued, then a valid remove appears, then the bound process changes; the same-key retry must refuse
+  // before touching the receipt. Fresh binding so the slot is free.
+  await sessions.remove('ses-1'); await live.bind({ principalId: 'grok', pane: '%9', id: 'ses-1', providerSessionId: SESSION, allowQueue: true, queueProfile: PROFILE });
+  const r6 = await live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c6', text: 'note six', mode: 'queue' });
+  assert.equal(r6.message.queue.state, 'queued');
+  await fs.appendFile(transcript, remove(wrap(pasted.at(-1))).text);
+  const bytesBefore = JSON.stringify(await record());
+  const table = await live.processes.table(); const proc = table.get(1);
+  live.processes.table = async () => new Map([[1, { ...proc, startedAt: 'restarted-later' }]]);
+  await assert.rejects(live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c6', text: 'note six', mode: 'queue' }), e => e.code === 'session_exited');
+  await assert.rejects(live.status(grok, { sessionId: 'ses-1' }), e => e.code === 'session_exited');
+  assert.equal(JSON.stringify(await record()), bytesBefore, 'denied identity: receipt bytes unchanged (still queued)');
+  assert.equal((await entry('c6')).queue.state, 'queued');
+  live.processes.table = async () => new Map([[1, proc]]);
+  const ok6 = await live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c6', text: 'note six', mode: 'queue' });
+  assert.equal(ok6.message.reused, true); assert.equal(ok6.message.queue.state, 'absorbed', 'same identity: the retry reconciles'); assert.equal(pasted.length, before + 1 + 1 - 1 + 1 - 1 + 1 - 1 + 0 + (pasted.length - (before + 1)), 'no paste from any retry');
+  // C7 at the service level: the old prompt above the spinner refuses with zero paste; a current prompt below passes.
+  await sessions.remove('ses-1'); await live.bind({ principalId: 'grok', pane: '%9', id: 'ses-1', providerSessionId: SESSION, allowQueue: true, queueProfile: PROFILE });
+  const n = pasted.length;
+  tmux.screen = ['❯ ', '✻ Brewing… (esc to interrupt)', 'some tool output'];
+  await assert.rejects(live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c7', text: 'x', mode: 'queue' }), e => e.code === 'queue_unverifiable' && e.details.reason === 'no_current_prompt');
+  tmux.screen = ['❯ ', '✻ Brewing… (esc to interrupt)', '❯ half'];
+  await assert.rejects(live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c7b', text: 'x', mode: 'queue' }), e => e.code === 'queue_input_not_empty');
+  assert.equal(pasted.length, n);
+  tmux.screen = ['❯ earlier request', '✻ Brewing… (esc to interrupt)', '❯ ', '─────'];
+  assert.equal((await live.send(grok, { sessionId: 'ses-1', idempotencyKey: 'c7c', text: 'x', mode: 'queue' })).message.queue.state, 'queued');
+  assert.equal(pasted.length, n + 1);
 });
