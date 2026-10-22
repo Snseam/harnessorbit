@@ -138,6 +138,29 @@ test('a disabled route never falls back to the default; a malformed or unreadabl
   await assert.rejects(memory.begin(principal, { jobId: jobA, operationId: 'op-z' }), e => e.code === 'memory_route_invalid');
   assert.equal((await memory.begin(principal, { jobId: jobB, operationId: 'op-z2' })).status, 'admitted');
   await fs.writeFile(routesFile, good);
+  // Review case R4: the project's key is present but its value is not a record (null, false, 0, "",
+  // [], {}). That is a malformed route, never a legacy unmapped request: refused with zero provider
+  // calls, while another project whose key is absent keeps the default.
+  for (const value of [null, false, 0, '', [], {}, 'memy', { routeId: 'x' }]) {
+    const broken = JSON.parse(good.toString()); broken.routes[project] = value;
+    await fs.writeFile(routesFile, JSON.stringify(broken));
+    const n = command.calls.length;
+    for (const call of [() => memory.recall(principal, { jobId: jobA, question: 'what was decided?' }), () => memory.begin(principal, { jobId: jobA, operationId: 'op-r4' })]) {
+      await assert.rejects(call(), e => e.code === 'memory_route_invalid', `present ${JSON.stringify(value)} must fail closed`);
+    }
+    assert.equal(command.calls.length, n, `no provider call for present ${JSON.stringify(value)}`);
+    assert.equal((await memory.begin(principal, { jobId: jobB, operationId: `op-r4-${n}` })).route, null, 'the absent-key project keeps its default');
+    await assert.rejects(routes.show({ hostProject: project }), e => e.code === 'memory_route_invalid');
+    await assert.rejects(routes.unbind({ hostProject: project }), e => e.code === 'memory_route_invalid', 'a malformed record is reported, never silently tombstoned');
+    const listed = await routes.list();
+    assert.equal(listed.routes.find(r => r.hostProject === project).invalid, true, 'the operator sees the invalid record in the listing');
+  }
+  // Binding over a present malformed record replaces it with a fresh revision 1 route.
+  const brokenAgain = JSON.parse(good.toString()); brokenAgain.routes[project] = null; await fs.writeFile(routesFile, JSON.stringify(brokenAgain));
+  const replaced = await routes.bind({ hostProject: project, argv: argvA, providerCheckout: '/x', expectedProjectId: PROJECT_A });
+  assert.equal(replaced.revision, 1); assert.equal((await memory.begin(principal, { jobId: jobA, operationId: 'op-r4-replaced' })).route.routeId, replaced.routeId);
+  await fs.writeFile(routesFile, good);
+  assert.equal((await memory.begin(principal, { jobId: jobA, operationId: 'op-r4-ok' })).route.revision, 2, 'the restored valid record is routed again');
   // Absent store is the plain default.
   await fs.unlink(routesFile);
   assert.equal((await memory.begin(principal, { jobId: jobA, operationId: 'op-default' })).route, null);

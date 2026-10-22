@@ -277,9 +277,11 @@ export class MemoryRouteStore {
   // The resolution for one canonical project, as one immutable snapshot.
   async lookup(project) {
     const doc = await this.load();
-    const record = doc.routes[project];
-    if (!record) return { kind: 'unmapped', snapshot: null };
-    const snapshot = MemoryRouteStore.snapshot(MemoryRouteStore.validateRecord(record, project));
+    // Only an absent key is "unmapped" (the same-machine default). A key that is present with any
+    // value that is not a valid record (null, false, 0, "", [], a half-written object) is a malformed
+    // route and fails closed; it never becomes a default request.
+    if (!Object.hasOwn(doc.routes, project)) return { kind: 'unmapped', snapshot: null };
+    const snapshot = MemoryRouteStore.snapshot(MemoryRouteStore.validateRecord(doc.routes[project], project));
     return { kind: snapshot.enabled ? 'route' : 'disabled', snapshot };
   }
 
@@ -300,8 +302,9 @@ export class MemoryRouteStore {
     invariant(label === null || (typeof label === 'string' && label.length <= 120), 'invalid_route', 'label must be at most 120 characters.');
     return this.gate(key, () => this._lock(async () => {
       const doc = await this.load();
-      const previous = doc.routes[key] || null;
-      const record = { routeId: crypto.randomUUID(), revision: (previous?.revision || 0) + 1, hostProject: key, argv: [...argv], providerCheckout, expectedProjectId: expectedProjectId.toLowerCase(), label, enabled: true, createdAt: previous?.createdAt || now(), updatedAt: now(), disabledAt: null };
+      // A present but malformed record carries no trustworthy revision; binding over it starts a new one.
+      const previous = Object.hasOwn(doc.routes, key) && doc.routes[key] && typeof doc.routes[key] === 'object' && Number.isInteger(doc.routes[key].revision) ? doc.routes[key] : null;
+      const record = { routeId: crypto.randomUUID(), revision: (previous?.revision || 0) + 1, hostProject: key, argv: [...argv], providerCheckout, expectedProjectId: expectedProjectId.toLowerCase(), label, enabled: true, createdAt: typeof previous?.createdAt === 'string' ? previous.createdAt : now(), updatedAt: now(), disabledAt: null };
       doc.routes[key] = record;
       await writeJsonAtomic(this.file, doc);
       return this.public(record, { argv: true });
@@ -312,15 +315,20 @@ export class MemoryRouteStore {
     const key = await MemoryRouteStore.canonicalProject(hostProject);
     return this.gate(key, () => this._lock(async () => {
       const doc = await this.load();
-      const record = doc.routes[key];
-      invariant(record, 'memory_route_not_found', `No route is bound for ${key}.`, { hostProject: key });
+      invariant(Object.hasOwn(doc.routes, key), 'memory_route_not_found', `No route is bound for ${key}.`, { hostProject: key });
+      const record = MemoryRouteStore.validateRecord(doc.routes[key], key); // a malformed record is reported, not silently tombstoned
       if (record.enabled) { record.enabled = false; record.disabledAt = now(); record.updatedAt = now(); await writeJsonAtomic(this.file, doc); }
       return this.public(record);
     }));
   }
 
-  async list() { const doc = await this.load(); return { routes: Object.values(doc.routes).map(r => this.public(r)) }; }
-  async show({ hostProject } = {}) { const key = await MemoryRouteStore.canonicalProject(hostProject); const doc = await this.load(); const record = doc.routes[key]; invariant(record, 'memory_route_not_found', `No route is bound for ${key}.`, { hostProject: key }); return this.public(record, { argv: true }); }
+  // Operator views. A present malformed record is listed as invalid (so the operator can see and
+  // replace it) and shown as the error the memory operations raise for it.
+  async list() {
+    const doc = await this.load();
+    return { routes: Object.entries(doc.routes).map(([key, record]) => { try { return this.public(MemoryRouteStore.validateRecord(record, key)); } catch (error) { return { hostProject: key, invalid: true, reason: error.message, operatorAction: 'access memory route bind … to replace it' }; } }) };
+  }
+  async show({ hostProject } = {}) { const key = await MemoryRouteStore.canonicalProject(hostProject); const doc = await this.load(); invariant(Object.hasOwn(doc.routes, key), 'memory_route_not_found', `No route is bound for ${key}.`, { hostProject: key }); return this.public(MemoryRouteStore.validateRecord(doc.routes[key], key), { argv: true }); }
 
   public(record, { argv = false } = {}) {
     return { routeId: record.routeId, revision: record.revision, hostProject: record.hostProject, providerCheckout: record.providerCheckout, expectedProjectId: record.expectedProjectId, label: record.label ?? null, enabled: record.enabled, createdAt: record.createdAt, updatedAt: record.updatedAt, disabledAt: record.disabledAt ?? null, argvHash: MemoryRouteStore.argvHash(record.argv), ...(argv ? { argv: [...record.argv] } : {}) };
