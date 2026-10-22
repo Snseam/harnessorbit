@@ -809,12 +809,19 @@ export class CoopService {
   async observe({ sessionId, transitionId, observedAt, fromState, toState, bindingId, via = 'observer', type = 'session.ready', signal = null, legacy = false } = {}) {
     invariant(this.sessions, 'sessions_unavailable', 'Live sessions are not enabled on this server.');
     invariant(OBSERVER_TYPES.includes(type), 'invalid_event', 'Observer events are session.ready or agent.turn_finished.');
-    const record = await this.sessions.get(sessionId).catch(() => null);
-    invariant(record && record.bindingId === bindingId, 'session_not_found', `Session ${sessionId} is not bound (or was re-bound).`);
-    const owner = await this.principals.get(record.principalId).catch(() => null);
-    invariant(owner && owner.incarnation === record.principalIncarnation && owner.permissions.sessions === true, 'permission_denied', 'The binding’s principal is no longer current or lacks the sessions permission; not observing.');
-    // Fresh scope at emission: the bound checkout and agent must still be within the owner's current scope.
-    invariant(owner.projects.some(p => record.project === p || record.project.startsWith(`${p}${path.sep}`)) && owner.agents.includes(record.agent.kind), 'permission_denied', 'The bound session is outside its principal’s current project or agent scope; not observing.');
+    // Authorization is read from the stores, never from a snapshot: once before the lock (fail fast)
+    // and again inside it, after the wait, before an existing event is returned or a new one written.
+    // A binding replaced, a principal recreated, a permission revoked or a scope narrowed while
+    // waiting therefore cannot emit from stale authority.
+    const authorize = async () => {
+      const record = await this.sessions.get(sessionId).catch(() => null);
+      invariant(record && record.bindingId === bindingId, 'session_not_found', `Session ${sessionId} is not bound (or was re-bound).`);
+      const owner = await this.principals.get(record.principalId).catch(() => null);
+      invariant(owner && owner.incarnation === record.principalIncarnation && owner.permissions.sessions === true, 'permission_denied', 'The binding’s principal is no longer current or lacks the sessions permission; not observing.');
+      invariant(owner.projects.some(p => record.project === p || record.project.startsWith(`${p}${path.sep}`)) && owner.agents.includes(record.agent.kind), 'permission_denied', 'The bound session is outside its principal’s current project or agent scope; not observing.');
+      return { record, owner };
+    };
+    const { record } = await authorize();
     invariant(typeof transitionId === 'string' && /^[0-9a-f]{16,64}$/.test(transitionId), 'invalid_event', 'transitionId must be a hex transition identity.');
     let payload;
     if (type === 'agent.turn_finished') {
@@ -834,21 +841,24 @@ export class CoopService {
     const body = { type, task: `harnessorbit:session/${record.id}`, payload };
     const bodyHash = sha(canonical(body));
     return this.store.lock(async () => {
+      // Re-read binding, owner incarnation, permission and scope after the wait; the same binding id
+      // keeps the same transition identity, so a legitimate retry still finds its original event.
+      const { record: fresh, owner } = await authorize();
       const state = await this.store.open();
       // The first pilot keyed screen observations without a type. A migrated pending transition whose
       // event that pilot already committed is found by that old identity and reused as it is: same
       // UUID, same body, still a screen observation, never relabelled.
       if (legacy && type === 'session.ready') {
-        const old = state.byKey.get(`${owner.id}:${owner.incarnation}:${sha(`observer:${record.bindingId}:${transitionId}`)}`);
+        const old = state.byKey.get(`${owner.id}:${owner.incarnation}:${sha(`observer:${fresh.bindingId}:${transitionId}`)}`);
         if (old) return this._reported(old, state, { reused: true });
       }
-      const keyHash = sha(`observer:${type}:${record.bindingId}:${transitionId}`);
+      const keyHash = sha(`observer:${type}:${fresh.bindingId}:${transitionId}`);
       const existing = state.byKey.get(`${owner.id}:${owner.incarnation}:${keyHash}`);
       if (existing) return this._reported(existing, state, { reused: true });
       const event = {
         schema: COOP_SCHEMA, eventId: uuid(), seq: state.nextSeq, createdAt: this.now(), type,
-        source: { principalId: owner.id, incarnation: owner.incarnation, kind: 'orchestrator', via, binding: record.bindingId, observer: 'harnessorbit' },
-        task: { ref: `harnessorbit:session/${record.id}`, kind: 'session', id: record.id, intentRevision: null },
+        source: { principalId: owner.id, incarnation: owner.incarnation, kind: 'orchestrator', via, binding: fresh.bindingId, observer: 'harnessorbit' },
+        task: { ref: `harnessorbit:session/${fresh.id}`, kind: 'session', id: fresh.id, intentRevision: null },
         conversationRef: null, correlationId: null, causationId: null, hop: 0, payload, evidenceRefs: [],
       };
       const deliveries = this._deliveriesFor(event, owner, state.recipients);

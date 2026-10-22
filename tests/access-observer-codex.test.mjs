@@ -178,6 +178,38 @@ test('source discipline: a partial tail waits, an oversized line is skipped with
   await fs.writeFile(rollout, header('/elsewhere') + complete('01a160de-9999-7df0-8638-000000000009', 1000));
   assert.equal((await observer.tick())[0].native, 'source_identity_mismatch:header_cwd_mismatch');
   assert.equal((await inbox()).length, 3, 'no event from a foreign rollout');
+  // Review regression (d05a6b7): same inode, truncate and rewrite to an equal or larger final size with a
+  // foreign session or foreign cwd header. Neither a new inode nor a shrink is visible; the header is
+  // re-verified from the same handle on every incremental read, nothing is consumed, cursor and pending
+  // stay, and a legitimate continuation afterwards still works.
+  await fs.rename(rollout, `${rollout}.old3`);
+  await fs.writeFile(rollout, header(project));
+  assert.equal((await observer.tick())[0].native, 'reset');
+  await fs.appendFile(rollout, complete('01a160e9-0000-7112-9368-00000000000b', 1100));
+  assert.equal((await observer.tick())[0].emitted.length, 1);
+  const legit = await fs.readFile(rollout);
+  const legitState = await observation();
+  for (const [label, foreignHeader] of [['session', header(project, OTHER_SESSION)], ['cwd', header('/elsewhere')]]) {
+    for (const pad of [0, 300]) {
+      const foreign = complete(`01a160de-7777-7df0-8638-00000000${label === 'session' ? '0a' : '0b'}${pad ? '1' : '0'}`, 1200 + pad, { pad: 'p'.repeat(pad) });
+      let rewritten = Buffer.concat([Buffer.from(foreignHeader), Buffer.from(foreign)]);
+      if (rewritten.length < legit.length) rewritten = Buffer.concat([Buffer.from(foreignHeader), Buffer.from(complete(`01a160de-7777-7df0-8638-00000000${label === 'session' ? '0a' : '0b'}${pad ? '1' : '0'}`, 1200 + pad, { pad: 'p'.repeat(pad + (legit.length - rewritten.length)) }))]);
+      assert.ok(rewritten.length >= legit.length, 'equal or larger than before');
+      const inoBefore = (await fs.stat(rollout)).ino;
+      await fs.writeFile(rollout, rewritten); // truncate + rewrite in place
+      assert.equal((await fs.stat(rollout)).ino, inoBefore, 'same inode');
+      const r = await observer.tick();
+      assert.equal(r[0].native, `source_identity_mismatch:header_${label}_mismatch`, `${label} pad ${pad}`); assert.equal(r[0].emitted, null);
+      const st = await observation();
+      assert.equal(st.nativeCursor, legitState.nativeCursor); assert.deepEqual(st.pending, []);
+      await fs.writeFile(rollout, legit); // restore the legitimate bytes
+      assert.equal((await observer.tick())[0].native, 'unchanged');
+    }
+  }
+  await fs.appendFile(rollout, complete('01a160e9-0000-7112-9368-00000000000c', 1500));
+  assert.equal((await observer.tick())[0].emitted.length, 1, 'a legitimate append after the rewrites is read normally');
+  assert.deepEqual((await inbox()).map(e => e.payload.providerTurnId).slice(-2), ['01a160e9-0000-7112-9368-00000000000b', '01a160e9-0000-7112-9368-00000000000c']);
+  assert.ok(!(await inbox()).some(e => e.payload.providerTurnId.startsWith('01a160de-7777')), 'no foreign record was attributed to this binding');
   // The screen fallback is untouched by native mismatches: still a session.ready on working → ready.
   const { tmux } = await setup(t, { bindNative: false });
   void tmux;

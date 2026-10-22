@@ -429,3 +429,49 @@ test('review regressions: a recreated consumer inherits no old payloads, and ack
   assert.equal((await new CoopStore({ root: stateRoot }).load()).records.length, before, 'nothing was journaled for the narrowed reports');
   assert.equal((await coop.report(grok, report(jobId, { idempotencyKey: 'still-ok' }))).reused, false, 'an unchanged authorized report still succeeds');
 });
+
+test('review regression: observe re-reads binding and authority after waiting for the store lock; revoke, recreate, rebind and scope narrowing during the wait emit nothing, while a legitimate retry still reuses its UUID', async t => {
+  const { coop, grok, codex, stateRoot, sessions, project, principals, base } = await setup(t);
+  await coop.registerRecipient({ id: 'codex-inbox', kind: 'inbox', principalId: 'codex', types: ['session.ready'] });
+  await sessions.create(bound(project, grok));
+  const observeArgs = (transitionId, bindingId = 'b-1') => ({ sessionId: 'ses-1', bindingId, transitionId, observedAt: 'x', fromState: 'busy', toState: 'idle' });
+  const control = await coop.observe(observeArgs('a'.repeat(32)));
+  assert.equal(control.reused, false);
+  // Hold the store lock, start observe (it waits), change authority, release.
+  const during = async (change) => {
+    let release; const gate = new Promise(r => { release = r; });
+    const holding = coop.store.lock(() => gate);
+    await new Promise(r => setTimeout(r, 30));
+    const waiting = coop.observe(observeArgs('b'.repeat(32)));
+    await new Promise(r => setTimeout(r, 30));
+    await change();
+    release(); await holding;
+    return waiting;
+  };
+  await assert.rejects(during(() => principals.update('grok', { permissions: { sessions: false } })), e => e.code === 'permission_denied', 'permission revoked while waiting');
+  await principals.update('grok', { permissions: { sessions: true } });
+  const other = path.join(base, 'elsewhere'); await fs.mkdir(other);
+  await assert.rejects(during(() => principals.update('grok', { projects: [other] })), e => e.code === 'permission_denied', 'project narrowed while waiting');
+  await principals.update('grok', { projects: [project] });
+  await assert.rejects(during(() => principals.update('grok', { agents: ['codex'] })), e => e.code === 'permission_denied', 'agent narrowed while waiting');
+  await principals.update('grok', { agents: ['claude', 'codex'] });
+  await assert.rejects(during(async () => { await sessions.remove('ses-1'); await sessions.create(bound(project, grok, { bindingId: 'b-2' })); }), e => e.code === 'session_not_found', 'rebound while waiting');
+  await sessions.remove('ses-1'); await sessions.create(bound(project, grok));
+  await assert.rejects(during(async () => { await principals.remove('grok'); await principals.create({ id: 'grok', projects: [project], agents: ['claude', 'codex'], permissions: { sessions: true }, kind: 'grok' }); }), e => e.code === 'permission_denied', 'principal recreated while waiting');
+  const events = (await coop.inbox(codex, {})).events;
+  assert.deepEqual(events.map(e => e.eventId), [control.event.eventId], 'only the authorized control event exists');
+  // Legitimate retry of the control identity (same binding, authority unchanged) during a lock wait reuses the UUID.
+  const reborn = (await principals.get('grok'));
+  await sessions.remove('ses-1'); await sessions.create(bound(project, reborn));
+  const again = await coop.observe(observeArgs('c'.repeat(32)));
+  let release; const gate = new Promise(r => { release = r; });
+  const holding = coop.store.lock(() => gate);
+  await new Promise(r => setTimeout(r, 30));
+  const retry = coop.observe(observeArgs('c'.repeat(32)));
+  await new Promise(r => setTimeout(r, 30));
+  release(); await holding;
+  const reused = await retry;
+  assert.equal(reused.reused, true); assert.equal(reused.event.eventId, again.event.eventId);
+  assert.equal((await coop.inbox(codex, {})).events.length, 2);
+  void stateRoot;
+});

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { invariant } from '../errors.mjs';
 import { readJson, writeJsonAtomic } from '../state.mjs';
-import { classifyScreen, readCodexRolloutHeader } from './sessions.mjs';
+import { classifyScreen, readCodexRolloutHeader, parseCodexRolloutHeader } from './sessions.mjs';
 
 // Automatic end-of-turn signal for bound live sessions, in two grades:
 //
@@ -131,19 +131,46 @@ export class SessionObserver {
     }
     const baselineAt = observation.nativeBaselineAt ?? at;
     if (!sameIdentity) {
-      // A replaced file is a new source generation. For Codex the new file must still carry this
-      // session's header for this checkout; otherwise nothing is read and the operator rebinds.
-      if (provider.kind === 'codex') { const header = await readCodexRolloutHeader(file, { sessionId: provider.sessionId, project: record.project }); if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor: observation.nativeCursor, identity: observation.nativeIdentity, baselineAt, reset: 'identity_changed' }; }
-      // Read it from its start, but only rows written after observation began are candidates; older
-      // rows are history and are never emitted.
-      return { ...(await this._readRows(file, 0, stat.size, provider, baselineAt, observation)), status: 'reset', identity, baselineAt, reset: 'identity_changed' };
+      // A replaced file is a new source generation: read it from its start, but only rows written
+      // after observation began are candidates; older rows are history and are never emitted. For
+      // Codex, _readRows verifies the header of the very handle it reads from; a mismatch keeps the
+      // old cursor and identity and reads nothing (the operator rebinds).
+      const read = await this._readRows(file, 0, stat.size, record, baselineAt, observation);
+      if (read.status === 'source_identity_mismatch') return { ...read, cursor: observation.nativeCursor, identity: observation.nativeIdentity, baselineAt, reset: 'identity_changed' };
+      return { ...read, status: 'reset', identity, baselineAt, reset: 'identity_changed' };
     }
     if (stat.size < observation.nativeCursor) {
       if (provider.kind === 'codex') { const header = await readCodexRolloutHeader(file, { sessionId: provider.sessionId, project: record.project }); if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor: observation.nativeCursor, identity, baselineAt, reset: 'shrunk' }; }
       return { status: 'reset', turns: [], cursor: stat.size, identity, baselineAt, reset: 'shrunk' };
     }
-    if (stat.size === observation.nativeCursor) return { status: 'unchanged', turns: [], cursor: stat.size, identity, baselineAt };
-    return { ...(await this._readRows(file, observation.nativeCursor, stat.size, provider, baselineAt, observation)), identity, baselineAt };
+    if (stat.size === observation.nativeCursor) {
+      // Nothing new to consume, but a same-inode rewrite to exactly the old size would otherwise go
+      // unnoticed until the next append; for Codex the header is verified even here.
+      if (provider.kind === 'codex') {
+        const handle = await fs.open(file, 'r');
+        let header; try { header = await this._codexHeaderFromHandle(handle, stat.size, record); } finally { await handle.close(); }
+        if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor: observation.nativeCursor, identity, baselineAt };
+      }
+      return { status: 'unchanged', turns: [], cursor: stat.size, identity, baselineAt };
+    }
+    // Every incremental read re-verifies the source header from the same handle: a same-inode
+    // truncate-and-rewrite to an equal or larger size shows neither a new inode nor a shrink.
+    return { ...(await this._readRows(file, observation.nativeCursor, stat.size, record, baselineAt, observation)), identity, baselineAt };
+  }
+
+  // Header check for a Codex rollout from an already opened handle: the first line must be this
+  // session's session_meta for this checkout. Bounded to the first 64 KiB.
+  async _codexHeaderFromHandle(handle, size, record) {
+    const buffer = Buffer.alloc(Math.min(size, 65536));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, bytesRead).toString('utf8');
+    const nl = text.indexOf('\n');
+    if (nl < 0) return { ok: false, reason: bytesRead >= 65536 ? 'header_oversized' : 'header_incomplete' };
+    const parsed = parseCodexRolloutHeader(text.slice(0, nl), { sessionId: record.providerSession.sessionId, project: record.project });
+    if (!parsed.ok) return parsed;
+    let real = parsed.cwd; try { real = await fs.realpath(parsed.cwd); } catch { /* compare raw */ }
+    if (real !== record.project) return { ok: false, reason: 'header_cwd_mismatch' };
+    return { ok: true };
   }
 
   // One provider's finished-turn rule over one parsed row. Returns null for every row that is not
@@ -169,10 +196,16 @@ export class SessionObserver {
     return null;
   }
 
-  async _readRows(file, cursor, size, provider, baselineAt, observation) {
+  async _readRows(file, cursor, size, record, baselineAt, observation) {
+    const provider = record.providerSession;
     const length = Math.min(size - cursor, MAX_TAIL_BYTES);
     const handle = await fs.open(file, 'r');
     try {
+      if (provider.kind === 'codex') {
+        // Same handle, same bytes: the header is checked before any new byte of this read is consumed.
+        const header = await this._codexHeaderFromHandle(handle, size, record);
+        if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor };
+      }
       const buffer = Buffer.alloc(length);
       await handle.read(buffer, 0, length, cursor);
       const text = buffer.toString('utf8');
