@@ -818,8 +818,15 @@ export class CoopService {
     invariant(typeof transitionId === 'string' && /^[0-9a-f]{16,64}$/.test(transitionId), 'invalid_event', 'transitionId must be a hex transition identity.');
     let payload;
     if (type === 'agent.turn_finished') {
-      invariant(signal && signal.source === 'native_end_turn' && typeof signal.providerSessionId === 'string' && typeof signal.providerMessageId === 'string', 'invalid_event', 'agent.turn_finished needs the provider’s native end_turn record identity.');
-      payload = { observation: 'native_end_turn', provider: signal.provider || record.agent.kind, providerSessionId: signal.providerSessionId, providerMessageId: signal.providerMessageId, providerTimestamp: signal.providerTimestamp || null, observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'The provider’s own record says a model turn ended (end_turn). This is an observation of the turn boundary, not task completion and not verification.' };
+      // Two native variants, each from the provider's own terminal record. Claude: end_turn keyed by
+      // the provider message id. Codex CLI: event_msg/task_complete keyed by the native turn id (a
+      // msg_* response id is not a turn id). Nothing else finishes a turn here.
+      const claude = signal && signal.source === 'native_end_turn' && typeof signal.providerSessionId === 'string' && typeof signal.providerMessageId === 'string';
+      const codex = signal && signal.source === 'native_task_complete' && signal.provider === 'codex' && typeof signal.providerSessionId === 'string' && typeof signal.providerTurnId === 'string' && signal.providerTurnId.trim().length > 0;
+      invariant(claude || codex, 'invalid_event', 'agent.turn_finished needs the provider’s native terminal record identity (Claude end_turn message id or Codex task_complete turn id).');
+      payload = claude
+        ? { observation: 'native_end_turn', provider: signal.provider || record.agent.kind, providerSessionId: signal.providerSessionId, providerMessageId: signal.providerMessageId, providerTimestamp: signal.providerTimestamp || null, observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'The provider’s own record says a model turn ended (end_turn). This is an observation of the turn boundary, not task completion and not verification.' }
+        : { observation: 'native_task_complete', provider: 'codex', providerSessionId: signal.providerSessionId, providerTurnId: signal.providerTurnId, providerTimestamp: signal.providerTimestamp || null, nativeTerminal: 'event_msg:task_complete', outcome: 'completed', observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'Codex CLI’s own rollout says this turn completed (task_complete). This is an observation of the turn boundary, not task acceptance, not saved memory and not verification; failed or cancelled turns are not sampled and never appear here.' };
     } else {
       invariant(fromState === 'busy' && toState === 'idle', 'invalid_event', 'Only a working → ready transition is emitted; an initial idle snapshot is not a completion.');
       payload = { observation: 'working_to_ready', fromState, toState, observedAt, sessionId: record.id, agent: record.agent.kind, meaning: 'The agent’s prompt became ready for input again (screen observation). Not a provider turn boundary, not task completion, not verification.' };

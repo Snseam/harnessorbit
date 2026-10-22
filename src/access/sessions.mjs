@@ -210,6 +210,82 @@ export class ProcessInspector {
       return line ? line.slice(1) : null;
     } catch { return null; }
   }
+
+  // Regular files one exact live process has open (lsof, read-only). null when lsof is unavailable
+  // or fails, so a caller distinguishes "nothing open" from "could not look".
+  async openFiles(pid) {
+    try {
+      const result = await this.command(['lsof', '-a', '-p', String(pid), '-Fn'], { timeoutMs: 5000, maxBytes: 4 * 1048576 });
+      if (result.code !== 0) return null;
+      return result.stdout.split('\n').filter(l => l.startsWith('n/')).map(l => l.slice(1));
+    } catch { return null; }
+  }
+
+  // The process and its descendants within `depth` levels (the Codex CLI's native binary is a child
+  // of the Node entry point that the pane shows).
+  descendants(pid, table, depth = 3) {
+    const out = []; const queue = [[pid, 0]];
+    while (queue.length) {
+      const [current, level] = queue.shift();
+      if (!table.has(current)) continue;
+      out.push(current);
+      if (level >= depth) continue;
+      for (const row of table.values()) if (row.ppid === current) queue.push([row.pid, level + 1]);
+    }
+    return out;
+  }
+}
+
+// Codex CLI (0.163.0, observed) keeps one rollout JSONL per session under sessions/… named
+// rollout-<time>-<session uuid>.jsonl and a thread-writer-locks/<session uuid>.lock, both held open by
+// the live native process. The first rollout row is `session_meta` whose payload.id and
+// payload.session_id are the session uuid and whose payload.cwd is the working directory.
+const CODEX_ROLLOUT_RE = /[\\/]sessions[\\/].*[\\/]rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const CODEX_LOCK_RE = /[\\/]thread-writer-locks[\\/]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.lock$/i;
+const CODEX_HEADER_BYTES = 65536;
+
+// Picks the one rollout a verified process chain holds open. Pure: paths in, decision out.
+export function codexRolloutFromOpenFiles(paths) {
+  const rollouts = new Map(); const locks = new Set();
+  for (const p of paths) {
+    const r = CODEX_ROLLOUT_RE.exec(p); if (r) rollouts.set(p, r[1].toLowerCase());
+    const l = CODEX_LOCK_RE.exec(p); if (l) locks.add(l[1].toLowerCase());
+  }
+  if (rollouts.size === 0) return { status: 'source_unavailable', reason: 'no_open_rollout' };
+  if (rollouts.size > 1) return { status: 'source_unavailable', reason: 'ambiguous_rollouts', candidates: rollouts.size };
+  const [[transcriptPath, sessionId]] = rollouts.entries();
+  if (!locks.has(sessionId)) return { status: 'source_unavailable', reason: 'writer_lock_mismatch', sessionId };
+  return { status: 'ok', transcriptPath, sessionId };
+}
+
+// Validates a rollout header against the session id and working directory it must belong to.
+// Only identity fields are kept; instructions, account and model fields are never copied.
+export function parseCodexRolloutHeader(line, { sessionId, project }) {
+  let row;
+  try { row = JSON.parse(line); } catch { return { ok: false, reason: 'header_unparseable' }; }
+  const p = row?.payload;
+  if (row?.type !== 'session_meta' || !p || typeof p !== 'object') return { ok: false, reason: 'header_not_session_meta' };
+  if (p.id !== sessionId || p.session_id !== sessionId) return { ok: false, reason: 'header_session_mismatch' };
+  if (typeof p.cwd !== 'string') return { ok: false, reason: 'header_cwd_missing' };
+  return { ok: true, cwd: p.cwd, identity: { originator: typeof p.originator === 'string' ? p.originator : null, source: typeof p.source === 'string' ? p.source : null, cliVersion: typeof p.cli_version === 'string' ? p.cli_version : null, headerTimestamp: typeof row.timestamp === 'string' ? row.timestamp : null }, headerSha: crypto.createHash('sha256').update(line).digest('hex') };
+}
+
+export async function readCodexRolloutHeader(file, { sessionId, project }) {
+  let handle;
+  try { handle = await fs.open(file, 'r'); } catch (error) { return { ok: false, reason: error.code === 'ENOENT' ? 'rollout_missing' : 'rollout_unreadable' }; }
+  try {
+    const stat = await handle.stat();
+    const buffer = Buffer.alloc(Math.min(stat.size, CODEX_HEADER_BYTES));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, bytesRead).toString('utf8');
+    const nl = text.indexOf('\n');
+    if (nl < 0) return { ok: false, reason: bytesRead >= CODEX_HEADER_BYTES ? 'header_oversized' : 'header_incomplete' };
+    const parsed = parseCodexRolloutHeader(text.slice(0, nl), { sessionId, project });
+    if (!parsed.ok) return parsed;
+    let real = parsed.cwd; try { real = await fs.realpath(parsed.cwd); } catch { /* compare raw */ }
+    if (real !== project) return { ok: false, reason: 'header_cwd_mismatch', cwd: real };
+    return { ...parsed, dev: stat.dev, ino: stat.ino, size: stat.size };
+  } finally { await handle?.close(); }
 }
 
 export class SessionStore {
@@ -336,7 +412,7 @@ export class SessionService {
       invariant(typeof providerSessionId === 'string' && UUID.test(providerSessionId), 'invalid_session', 'providerSessionId must be the provider’s session UUID.');
       return agent.kind === 'claude' ? { kind: 'claude', sessionId: providerSessionId.toLowerCase(), source: 'operator', transcriptPath: null } : null;
     }
-    if (agent.kind !== 'claude') return null;
+    if (agent.kind !== 'claude') return null; // Codex is located from the live process chain (see _codexNativeSource), never from argv guesses
     const argv = typeof agent.args === 'string' ? agent.args.split(/\s+/) : [];
     for (let i = 0; i < argv.length - 1; i++) if (['--resume', '-r', '--session-id'].includes(argv[i]) && UUID.test(argv[i + 1])) return { kind: 'claude', sessionId: argv[i + 1].toLowerCase(), source: 'process_args', transcriptPath: null };
     return null;
@@ -360,6 +436,14 @@ export class SessionService {
     invariant(principal.projects.some(p => project === p || project.startsWith(`${p}${path.sep}`)), 'project_not_allowed', 'The agent works outside the principal’s projects.', { project, projects: principal.projects });
     invariant(principal.agents.includes(agent.kind), 'agent_not_allowed', 'The principal may not drive this agent kind.', { agent: agent.kind });
     const sessionId = id || `ses-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
+    // Native source: Claude from argv or the operator's uuid; Codex only from the exact live process
+    // chain's open rollout, validated against its header. No guess, no scan.
+    let providerSession = SessionService.providerSessionFor(agent, providerSessionId);
+    let nativeDiagnostic = null;
+    if (agent.kind === 'codex') {
+      const found = await this._codexNativeSource(agent, project, providerSessionId === null ? null : providerSessionId.toLowerCase());
+      if (found.status === 'ok') providerSession = found.providerSession; else nativeDiagnostic = found;
+    }
     // One pane, one binding: the uniqueness check and the create happen under the bind lock and
     // the pane's own lock, so a send or unbind on that pane cannot interleave with the rebind.
     const record = await withLock(path.join(this.root, 'locks', 'access-sessions-bind'), () => withLock(this._paneLock(pane), async () => {
@@ -367,10 +451,29 @@ export class SessionService {
       return this.sessions.create({
         id: sessionId, bindingId: crypto.randomBytes(8).toString('hex'), principalId, principalIncarnation: principal.incarnation ?? null, label, paneId: pane, target: target.target, panePid: target.panePid, tmuxSocket: this.tmux.socket,
         agent: { kind: agent.kind, pid: agent.pid, startedAt: agent.startedAt, comm: agent.comm }, project, allowKeys,
-        providerSession: SessionService.providerSessionFor(agent, providerSessionId),
+        providerSession, ...(nativeDiagnostic ? { nativeDiagnostic } : {}),
       });
     }, { timeoutMs: 15000 }), { timeoutMs: 15000 });
-    return this._public(record, { ok: true });
+    return { ...this._public(record, { ok: true }), native: providerSession ? { kind: providerSession.kind, sessionId: providerSession.sessionId, source: providerSession.source } : { status: nativeDiagnostic?.status || 'source_unavailable', reason: nativeDiagnostic?.reason || 'no_native_source', fallback: 'session.ready (screen)' } };
+  }
+
+  // Codex native source for one bound process chain: the rollout the live native process holds
+  // open (together with the matching writer lock), whose header names this session and this
+  // checkout. An operator-supplied uuid must match it; it never stands in for the file.
+  async _codexNativeSource(agent, project, expectedSessionId = null) {
+    if (typeof this.processes.openFiles !== 'function') return { status: 'source_unavailable', reason: 'open_files_unsupported' };
+    const table = await this.processes.table();
+    const pids = typeof this.processes.descendants === 'function' ? this.processes.descendants(agent.pid, table) : [agent.pid];
+    const paths = []; let looked = false;
+    for (const pid of pids) { const files = await this.processes.openFiles(pid); if (files === null) continue; looked = true; for (const f of files) paths.push({ pid, path: f }); }
+    if (!looked) return { status: 'source_unavailable', reason: 'lsof_unavailable' };
+    const picked = codexRolloutFromOpenFiles(paths.map(p => p.path));
+    if (picked.status !== 'ok') return picked;
+    if (expectedSessionId && picked.sessionId !== expectedSessionId) return { status: 'source_unavailable', reason: 'operator_session_mismatch', discovered: picked.sessionId };
+    const header = await readCodexRolloutHeader(picked.transcriptPath, { sessionId: picked.sessionId, project });
+    if (!header.ok) return { status: 'source_unavailable', reason: header.reason, sessionId: picked.sessionId };
+    const writerPid = paths.find(p => p.path === picked.transcriptPath)?.pid ?? agent.pid;
+    return { status: 'ok', providerSession: { kind: 'codex', sessionId: picked.sessionId, source: expectedSessionId ? 'operator+open_files' : 'open_files', transcriptPath: picked.transcriptPath, identity: { ...header.identity, dev: header.dev, ino: header.ino, writerPid, headerSha: header.headerSha } } };
   }
 
   _paneLock(paneId) { return path.join(this.root, 'locks', `access-pane-${String(paneId).replace(/[^0-9]/g, '') || 'x'}`); }

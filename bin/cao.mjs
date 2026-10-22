@@ -149,6 +149,7 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access principal adopt-jobs --id ID   (operator: assign this principal's pre-identity jobs to its current incarnation)
   access session discover [--tmux-socket NAME]       (operator: which tmux panes run claude/codex)
   access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT] [--tmux-socket NAME] [--provider-session UUID]
+      (native source: Claude from --resume/--session-id or --provider-session; Codex only from the rollout the live process holds open, header-validated; --provider-session must match it)
   access session list --principal ID
   access session status --principal ID --session ID
   access session send --principal ID --session ID --key KEY (--text TEXT | --text-file FILE | --keys Enter)

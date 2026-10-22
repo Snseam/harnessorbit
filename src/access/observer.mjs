@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { invariant } from '../errors.mjs';
 import { readJson, writeJsonAtomic } from '../state.mjs';
-import { classifyScreen } from './sessions.mjs';
+import { classifyScreen, readCodexRolloutHeader } from './sessions.mjs';
 
 // Automatic end-of-turn signal for bound live sessions, in two grades:
 //
@@ -31,6 +31,8 @@ import { classifyScreen } from './sessions.mjs';
 // it. Nothing here types into a session or edits any agent's hook configuration.
 
 const END_TURN = 'end_turn';
+// Codex event_msg payload types seen as ordinary progress rows in the sampled rollout (not terminals).
+const CODEX_NON_TERMINAL = new Set(['task_started', 'task_complete', 'agent_message', 'agent_message_delta', 'agent_reasoning', 'agent_reasoning_delta', 'agent_reasoning_section_break', 'token_count', 'item_started', 'item_updated', 'item_completed', 'exec_command_begin', 'exec_command_output_delta', 'exec_command_end', 'mcp_tool_call_begin', 'mcp_tool_call_end', 'patch_apply_begin', 'patch_apply_end', 'plan_update', 'web_search_begin', 'web_search_end']);
 const MAX_TAIL_BYTES = 8 * 1048576;
 const SCAN_CHUNK = 1048576;
 const OBSERVATION_VERSION = 2;
@@ -103,25 +105,68 @@ export class SessionObserver {
     return -1;
   }
 
-  // Reads new complete lines of the Claude transcript since the cursor. Returns end_turn message
+  // Where a provider's native record lives. Claude: the transcript under the Claude home for this
+  // checkout and session. Codex: only the rollout the live process chain was seen holding open at
+  // bind; there is no derived path and never a guess.
+  _nativeFile(record) {
+    const provider = record.providerSession;
+    if (provider.kind === 'claude') return provider.transcriptPath || claudeTranscriptPath(this.claudeHome, record.project, provider.sessionId);
+    return typeof provider.transcriptPath === 'string' ? provider.transcriptPath : null;
+  }
+
+  // Reads new complete lines of the provider's native record since the cursor. Returns finished-turn
   // identities (deduplicated), the new cursor, and what happened to the source.
   async _nativeTurns(record, observation, at) {
     const provider = record.providerSession;
-    const file = provider.transcriptPath || claudeTranscriptPath(this.claudeHome, record.project, provider.sessionId);
+    const file = this._nativeFile(record);
+    if (!file) return { status: 'source_unavailable', turns: [], cursor: observation.nativeCursor ?? null, identity: observation.nativeIdentity ?? null, baselineAt: observation.nativeBaselineAt ?? null };
     let stat;
     try { stat = await fs.stat(file); } catch { return { status: 'missing', turns: [], cursor: observation.nativeCursor ?? null, identity: observation.nativeIdentity ?? null, baselineAt: observation.nativeBaselineAt ?? null }; }
     const identity = { dev: stat.dev, ino: stat.ino };
     const sameIdentity = !observation.nativeIdentity || (observation.nativeIdentity.dev === identity.dev && observation.nativeIdentity.ino === identity.ino);
-    if (observation.nativeCursor === null || observation.nativeCursor === undefined) return { status: 'baseline', turns: [], cursor: stat.size, identity, baselineAt: at }; // no history replay
+    if (observation.nativeCursor === null || observation.nativeCursor === undefined) {
+      // No history replay. A Codex rollout is also re-validated by its header before the baseline is taken.
+      if (provider.kind === 'codex') { const header = await readCodexRolloutHeader(file, { sessionId: provider.sessionId, project: record.project }); if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor: null, identity: null, baselineAt: null }; }
+      return { status: 'baseline', turns: [], cursor: stat.size, identity, baselineAt: at };
+    }
     const baselineAt = observation.nativeBaselineAt ?? at;
     if (!sameIdentity) {
-      // A replaced file is a new source generation: read it from its start, but only rows written
-      // after observation began are candidates; older rows are history and are never emitted.
+      // A replaced file is a new source generation. For Codex the new file must still carry this
+      // session's header for this checkout; otherwise nothing is read and the operator rebinds.
+      if (provider.kind === 'codex') { const header = await readCodexRolloutHeader(file, { sessionId: provider.sessionId, project: record.project }); if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor: observation.nativeCursor, identity: observation.nativeIdentity, baselineAt, reset: 'identity_changed' }; }
+      // Read it from its start, but only rows written after observation began are candidates; older
+      // rows are history and are never emitted.
       return { ...(await this._readRows(file, 0, stat.size, provider, baselineAt, observation)), status: 'reset', identity, baselineAt, reset: 'identity_changed' };
     }
-    if (stat.size < observation.nativeCursor) return { status: 'reset', turns: [], cursor: stat.size, identity, baselineAt, reset: 'shrunk' };
+    if (stat.size < observation.nativeCursor) {
+      if (provider.kind === 'codex') { const header = await readCodexRolloutHeader(file, { sessionId: provider.sessionId, project: record.project }); if (!header.ok) return { status: 'source_identity_mismatch', reason: header.reason, turns: [], cursor: observation.nativeCursor, identity, baselineAt, reset: 'shrunk' }; }
+      return { status: 'reset', turns: [], cursor: stat.size, identity, baselineAt, reset: 'shrunk' };
+    }
     if (stat.size === observation.nativeCursor) return { status: 'unchanged', turns: [], cursor: stat.size, identity, baselineAt };
     return { ...(await this._readRows(file, observation.nativeCursor, stat.size, provider, baselineAt, observation)), identity, baselineAt };
+  }
+
+  // One provider's finished-turn rule over one parsed row. Returns null for every row that is not
+  // the provider's own terminal success marker: assistant text, tool rows, item completions, token
+  // counts, turn starts and any unsampled terminal variant never finish a turn here.
+  static finishedTurn(provider, row) {
+    if (!row || typeof row !== 'object') return null;
+    if (provider.kind === 'claude') {
+      if (row.type !== 'assistant' || row.isSidechain || row.message?.stop_reason !== END_TURN) return null;
+      if (typeof row.sessionId === 'string' && row.sessionId !== provider.sessionId) return null;
+      const messageId = row.message?.id;
+      if (typeof messageId !== 'string' || !messageId) return null;
+      return { key: messageId, signal: { source: 'native_end_turn', provider: 'claude', providerSessionId: provider.sessionId, providerMessageId: messageId }, timestamp: typeof row.timestamp === 'string' ? row.timestamp : null };
+    }
+    if (provider.kind === 'codex') {
+      // Observed Codex CLI 0.163.0 normal completion: top-level event_msg whose payload.type is
+      // task_complete with a non-empty turn_id. msg_* response ids are not turn ids and are not used.
+      if (row.type !== 'event_msg' || row.payload?.type !== 'task_complete') return null;
+      const turnId = row.payload.turn_id;
+      if (typeof turnId !== 'string' || !turnId.trim()) return null;
+      return { key: `codex:${provider.sessionId}:${turnId}`, signal: { source: 'native_task_complete', provider: 'codex', providerSessionId: provider.sessionId, providerTurnId: turnId, nativeTerminal: 'event_msg:task_complete', outcome: 'completed' }, timestamp: typeof row.timestamp === 'string' ? row.timestamp : null };
+    }
+    return null;
   }
 
   async _readRows(file, cursor, size, provider, baselineAt, observation) {
@@ -145,19 +190,23 @@ export class SessionObserver {
       const complete = text.slice(0, lastNewline + 1);
       const consumed = Buffer.byteLength(complete);
       const turns = new Map();
+      let otherTerminals = 0;
       for (const line of complete.split('\n')) {
         if (!line) continue;
         if (line.length > MAX_TAIL_BYTES) { skipped += 1; continue; }
         let row; try { row = JSON.parse(line); } catch { continue; }
-        if (row?.type !== 'assistant' || row.isSidechain || row?.message?.stop_reason !== END_TURN) continue;
-        if (typeof row.sessionId === 'string' && row.sessionId !== provider.sessionId) continue;
-        const messageId = row.message?.id;
-        if (typeof messageId !== 'string' || !messageId) continue;
-        const timestamp = typeof row.timestamp === 'string' ? row.timestamp : null;
-        if (baselineAt && timestamp && timestamp < baselineAt) continue; // history relative to observation start
-        if (!turns.has(messageId)) turns.set(messageId, { providerMessageId: messageId, providerTimestamp: timestamp });
+        const finished = SessionObserver.finishedTurn(provider, row);
+        if (!finished) {
+          // Codex event_msg rows that are neither a start nor the sampled completion are counted as
+          // unverified outcomes (failure/cancel formats were not sampled); they never become success.
+          if (provider.kind === 'codex' && row?.type === 'event_msg' && typeof row.payload?.type === 'string' && !CODEX_NON_TERMINAL.has(row.payload.type)) otherTerminals += 1;
+          continue;
+        }
+        if (baselineAt && finished.timestamp && finished.timestamp < baselineAt) continue; // history relative to observation start
+        if (!turns.has(finished.key)) turns.set(finished.key, { key: finished.key, signal: { ...finished.signal, providerTimestamp: finished.timestamp } });
       }
       if (skipped) observation.oversizedSkipped = (observation.oversizedSkipped || 0) + skipped;
+      if (otherTerminals) observation.unverifiedTerminals = (observation.unverifiedTerminals || 0) + otherTerminals;
       return { status: 'read', turns: [...turns.values()], cursor: cursor + consumed, skipped };
     } finally { await handle.close(); }
   }
@@ -173,19 +222,20 @@ export class SessionObserver {
       let state;
       try { await this.sessions._identity(record); state = classifyScreen(record.agent.kind, await this.sessions.tmux.captureScreen(record.paneId)).state; }
       catch (error) { results.push({ sessionId: record.id, skipped: error.code || 'identity_failed' }); continue; }
-      const native = record.providerSession?.kind === 'claude' && typeof record.providerSession.sessionId === 'string';
-      let nativeStatus = null;
+      const native = ['claude', 'codex'].includes(record.providerSession?.kind) && typeof record.providerSession.sessionId === 'string';
+      let nativeStatus = native ? null : (record.nativeDiagnostic ? `unavailable:${record.nativeDiagnostic.reason || record.nativeDiagnostic.status}` : 'unavailable');
       if (native) {
         const read = await this._nativeTurns(record, observation, at);
-        nativeStatus = read.status;
-        if (read.status === 'reset') observation.nativeResets += 1;
+        nativeStatus = read.status === 'source_identity_mismatch' ? `source_identity_mismatch:${read.reason}` : read.status;
+        if (read.status === 'reset' || read.status === 'source_identity_mismatch') observation.nativeResets += 1;
         if (read.status === 'baseline') observation.nativeBaselineAt = read.baselineAt;
-        observation.nativeCursor = read.cursor;
-        observation.nativeIdentity = read.identity ?? observation.nativeIdentity;
+        if (read.status !== 'source_identity_mismatch') { observation.nativeCursor = read.cursor; observation.nativeIdentity = read.identity ?? observation.nativeIdentity; }
+        else observation.nativeMismatch = { at, reason: read.reason };
         for (const turn of read.turns) {
-          const transitionId = SessionObserver.turnId(record.bindingId, turn.providerMessageId);
+          // Claude keeps its identity (binding + provider message id); Codex is keyed by provider, session and native turn id.
+          const transitionId = SessionObserver.turnId(record.bindingId, turn.key);
           if (observation.lastEmitted[transitionId] || observation.pending.some(p => p.transitionId === transitionId)) continue;
-          observation.pending.push({ type: 'agent.turn_finished', transitionId, observedAt: at, signal: { source: 'native_end_turn', provider: 'claude', providerSessionId: record.providerSession.sessionId, providerMessageId: turn.providerMessageId, providerTimestamp: turn.providerTimestamp } });
+          observation.pending.push({ type: 'agent.turn_finished', transitionId, observedAt: at, signal: turn.signal });
         }
       }
       // Screen fallback: a working → ready transition is a session.ready observation only.
@@ -205,7 +255,7 @@ export class SessionObserver {
         if (outcome.done) { observation.pending = observation.pending.filter(p => p.transitionId !== pending.transitionId); if (!outcome.error) observation.lastEmitted[pending.transitionId] = at; }
         await writeJsonAtomic(this._file(record.id), observation);
       }
-      results.push({ sessionId: record.id, state, native: native ? nativeStatus : 'unavailable', emitted: emitted.length ? emitted : null });
+      results.push({ sessionId: record.id, state, native: nativeStatus, emitted: emitted.length ? emitted : null });
       if (emitted.length) this.log({ sessionId: record.id, emitted });
     }
     return results;
