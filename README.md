@@ -301,6 +301,8 @@ Plain `npm run smoke` only prints instructions. Live smoke tests use your config
 | [Architecture](docs/architecture.md)                         | CLI, state store, Herdr runtime, Git isolation, verification, profiled execution    |
 | [Execution profiles and routing](docs/execution-profiles.md) | Profile CRUD, secrets, CC Switch import, routing, gateway lifecycle                 |
 | [Local Agent Monitor](docs/monitor.md)                       | Read-only local dashboard for HarnessOrbit, Codex, and Claude metadata                       |
+| [Agent access layer](docs/access.md)                         | Principals, MCP server and job tools that let remote agents drive the local CLIs    |
+| [Access layer roadmap](docs/access-roadmap.md) | Stage-1 state, boundaries and the stage-2 cooperation-events contract summary for the three-party work. |
 | [Task states and recovery](docs/states.md)                   | Result contract, retries, interaction, checkout and integration holds               |
 | [Supervision and performance](docs/supervision.md)           | Foreground controller, preflight, report submission, deadlines and timing evidence  |
 | [Resources and calibration](docs/resources.md)               | Native/NVM discovery, CC Switch Pi profiles, isolated probes and cached evidence    |

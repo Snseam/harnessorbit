@@ -33,6 +33,15 @@ import { WorkflowRegistry } from '../src/workflows.mjs';
 import { runInternalBenchmark, createInternalBenchmarkPlan } from '../src/internal-benchmark.mjs';
 import { replayShadowTraces } from '../src/shadow-replay.mjs';
 import { DeterministicDecisionProvider, JevDecisionProvider } from '../src/decision-provider.mjs';
+import { PrincipalStore } from '../src/access/principals.mjs';
+import { AccessService, AccessAudit } from '../src/access/service.mjs';
+import { startAccessServer } from '../src/access/server.mjs';
+import { SessionService, SessionStore, Tmux } from '../src/access/sessions.mjs';
+import { MemoryService, MemoryRouteStore, memoryProviderFromEnv } from '../src/access/memory.mjs';
+import { JobStore } from '../src/access/jobs.mjs';
+import { CoopService } from '../src/access/coop.mjs';
+import { SessionObserver } from '../src/access/observer.mjs';
+import { Dispatcher, defaultAdapters } from '../src/access/dispatch.mjs';
 
 export const help = `HarnessOrbit 0.1.0
 
@@ -121,6 +130,55 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   gateway stop --id ID
   gateway list
 
+  access principal create --id ID --project PATH[,PATH] [--agents codex,claude]
+             [--allow-integrate] [--rate-limit 60] [--label TEXT] [--kind grok|claude_code|codex|human|other]   (prints the token once)
+  access principal list
+  access principal remove --id ID
+  access serve [--port 0] [--host 127.0.0.1]   (foreground MCP server; Ctrl-C stops it)
+  access describe --principal ID
+  access submit --principal ID --file JOB.json
+  access status --principal ID --job ID [--no-advance]
+  access approve --principal ID --job ID            (integrate; principal needs --allow-integrate)
+  access answer --principal ID --job ID (--text TEXT | --text-file FILE | --keys Enter,y)
+  access cancel --principal ID --job ID [--reason TEXT]
+  access result --principal ID --job ID [--patch]
+  access retry --principal ID --job ID [--feedback TEXT | --feedback-file FILE]
+  access events --principal ID [--job ID] [--since CURSOR] [--limit 100]
+  access principal update --id ID (--allow-sessions | --deny-sessions | --allow-integrate | --deny-integrate)
+  access principal migrate --id ID      (operator, once: give a pre-identity principal its incarnation)
+  access principal adopt-jobs --id ID   (operator: assign this principal's pre-identity jobs to its current incarnation)
+  access session discover [--tmux-socket NAME]       (operator: which tmux panes run claude/codex)
+  access session bind --principal ID --pane %N [--id NAME] [--allow-keys] [--label TEXT] [--tmux-socket NAME] [--provider-session UUID] [--allow-queue --queue-profile claude-queue-2.1.306]
+      (native source: Claude from --resume/--session-id or --provider-session; Codex only from the rollout the live process holds open, header-validated; --provider-session must match it)
+  access session list --principal ID
+  access session status --principal ID --session ID
+  access session send --principal ID --session ID --key KEY (--text TEXT | --text-file FILE | --keys Enter) [--mode idle_only|queue]
+  access session read --principal ID --session ID [--cursor CURSOR] [--max-lines 120]
+  access session unbind --principal ID --session ID   (or --operator to drop any binding by id)
+  access memory recall --principal ID (--session ID | --job ID) --question TEXT [--top-k 5] [--authority agent|orchestrator]
+  access coop resolve --event UUID --consumer ID --as accepted|resend [--note TEXT]   (operator: settle an unresolved delivery)
+  access memory begin --principal ID (--session ID | --job ID) --operation ID [--authority agent|orchestrator]
+  access memory checkpoint --principal ID (--session ID | --job ID) --operation ID [--file CHECKPOINT.json] [--attestation EVENT-UUID]
+  (orchestrator carrier needs HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER=1 on the host after "memy connection orchestrator enable")
+  access memory pending [--principal ID]
+  access memory route bind --host-project PATH --expect-project UUID --provider-checkout PATH (--argv-json '["docker","exec",…]' | --argv-file FILE) [--label TEXT]   (operator: route one host project to an exact provider argv)
+  access memory route unbind --host-project PATH | list | show --host-project PATH
+  access recipient register --id ID --kind inbox --principal ID [--task-refs harnessorbit:job/,…] [--sources ID,…] [--types work.reported,…] [--label TEXT]
+  access recipient register --id ID --kind grok-native-webhook --endpoint https://… --secret-file FILE [scopes…]
+  access recipient register --id ID --kind codex-app-server --socket PATH --thread ID [scopes…]
+  access recipient list | access recipient revoke --id ID
+  access coop report --principal ID --key KEY --type TYPE --task REF [--payload-file FILE] [--evidence-file FILE] [--correlation ID] [--causation EVENT-UUID]
+  access coop inbox --principal ID [--cursor N | --cursor-v2 TOKEN] [--limit 50]
+  access coop store init                            (host: create an empty cooperation store with a fresh generation)
+  access coop store migrate --from-v1 [--resume]    (host, writers stopped: bring a pre-protocol store under the committed boundary)
+  access coop store inspect                         (host: read-only store status, boundary and pending recovery)
+  access coop import run-events --job ID [--limit 50] [--dry-run]   (host: import stable-ID attempt facts of the job’s own run as history.imported; never a job action)
+  access coop ack --principal ID --event UUID --epoch EPOCH
+  access coop deliveries                            (operator: pending non-inbox deliveries)
+  access coop dispatch [--once] [--interval-ms 5000] [--allow-http-loopback]   (operator: deliver pending events through registered transports)
+  access observe [--once] [--interval-ms 5000] [--tmux-socket NAME]   (emit agent.turn_finished on observed working → ready)
+  (memory provider: HARNESSORBIT_MEMORY_PROVIDER=memy-handoff-cli [HARNESSORBIT_MEMY_BIN=memy]; unset = unconfigured)
+
 Global: --state-dir PATH (outside project), --help, --json
 Results are JSON unless usage --table is selected. Keys can be comma-separated.
 dispatch submits once; collect waits without resubmitting.
@@ -172,8 +230,34 @@ const optionsByCommand = {
   'monitor start': ['project', 'run', 'all', 'open', 'id', 'port', 'coordinator', 'codex-home', 'claude-home'],
   'monitor status': ['id'], 'monitor stop': ['id'],
   'monitor snapshot': ['project', 'run', 'all', 'coordinator', 'codex-home', 'claude-home'],
+  'access principal create': ['id', 'project', 'agents', 'allow-integrate', 'rate-limit', 'label', 'kind'],
+  'access principal list': [], 'access principal remove': ['id'],
+  'access serve': ['port', 'host', 'tmux-socket'],
+  'access describe': ['principal'], 'access submit': ['principal', 'file'], 'access status': ['principal', 'job', 'no-advance'],
+  'access approve': ['principal', 'job'], 'access answer': ['principal', 'job', 'text', 'text-file', 'keys'],
+  'access cancel': ['principal', 'job', 'reason'], 'access result': ['principal', 'job', 'patch'],
+  'access retry': ['principal', 'job', 'feedback', 'feedback-file'], 'access events': ['principal', 'job', 'since', 'limit'],
+  'access principal update': ['id', 'allow-sessions', 'deny-sessions', 'allow-integrate', 'deny-integrate'],
+  'access principal adopt-jobs': ['id'], 'access principal migrate': ['id'],
+  'access session discover': ['tmux-socket'],
+  'access session bind': ['principal', 'pane', 'id', 'allow-keys', 'label', 'tmux-socket', 'provider-session', 'allow-queue', 'queue-profile'],
+  'access session list': ['principal', 'tmux-socket'], 'access session status': ['principal', 'session', 'tmux-socket'],
+  'access session send': ['principal', 'session', 'key', 'text', 'text-file', 'keys', 'tmux-socket', 'mode'],
+  'access session read': ['principal', 'session', 'cursor', 'max-lines', 'tmux-socket'],
+  'access session unbind': ['principal', 'session', 'operator', 'tmux-socket'],
+  'access memory recall': ['principal', 'session', 'job', 'question', 'top-k', 'authority'],
+  'access memory begin': ['principal', 'session', 'job', 'operation', 'authority'],
+  'access memory checkpoint': ['principal', 'session', 'job', 'operation', 'file', 'attestation'],
+  'access memory pending': ['principal'], 'access memory route bind': ['host-project', 'expect-project', 'provider-checkout', 'argv-json', 'argv-file', 'label'], 'access memory route unbind': ['host-project'], 'access memory route list': [], 'access memory route show': ['host-project'],
+  'access recipient register': ['id', 'kind', 'principal', 'endpoint', 'secret-file', 'socket', 'thread', 'task-refs', 'sources', 'types', 'label'],
+  'access recipient list': [], 'access recipient revoke': ['id'],
+  'access coop report': ['principal', 'key', 'type', 'task', 'payload-file', 'evidence-file', 'conversation', 'correlation', 'causation'],
+  'access coop inbox': ['principal', 'cursor', 'cursor-v2', 'limit'], 'access coop store init': [], 'access coop store migrate': ['from-v1', 'resume'], 'access coop store inspect': [], 'access coop import run-events': ['job', 'limit', 'dry-run'], 'access coop ack': ['principal', 'event', 'epoch'], 'access coop deliveries': [],
+  'access coop dispatch': ['once', 'interval-ms', 'allow-http-loopback'],
+  'access coop resolve': ['event', 'consumer', 'as', 'note'],
+  'access observe': ['once', 'interval-ms', 'tmux-socket'],
 };
-const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness']);
+const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop', 'access coop store', 'access coop import', 'access memory route']);
 
 export function parseArgs(argv) {
   const values = {};
@@ -187,7 +271,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive'].includes(name)
+    const booleanOption = ['help', 'json', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive', 'allow-integrate', 'no-advance', 'patch', 'allow-sessions', 'deny-sessions', 'deny-integrate', 'allow-keys', 'operator', 'required', 'once', 'allow-http-loopback', 'from-v1', 'resume', 'dry-run', 'allow-queue'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -281,6 +365,218 @@ export async function main(argv = process.argv.slice(2)) {
     case 'monitor start': {
       const monitor = await new MonitorManager({ root: profiles.root }).start({ ...await monitorScope(), id: o.id || 'default', port: o.port === undefined ? 0 : Number(o.port) });
       return { ...monitor, browserOpened: o.open ? await openMonitor(monitor.url) : false };
+    }
+    case 'access principal create': {
+      const projects = required('project').split(',').map(value => path.resolve(value.trim())).filter(Boolean);
+      const rateLimit = o['rate-limit'] === undefined ? 60 : Number(o['rate-limit']);
+      const created = await new PrincipalStore({ root: profiles.root }).create({
+        id: required('id'), projects, agents: o.agents ? o.agents.split(',').map(value => value.trim()) : ['codex', 'claude'],
+        permissions: { integrate: !!o['allow-integrate'] }, rateLimitPerMinute: rateLimit, label: o.label || null, kind: o.kind || 'other',
+      });
+      return { ...created, note: 'Store this token now; HarnessOrbit keeps only its hash and cannot show it again.' };
+    }
+    case 'access principal list': return { principals: await new PrincipalStore({ root: profiles.root }).list() };
+    case 'access principal migrate': return new PrincipalStore({ root: profiles.root }).migrate(required('id'));
+    case 'access principal adopt-jobs': return new AccessService({ root: profiles.root, orchestrator, driver: 'inline' }).adoptLegacyJobs(required('id'));
+    case 'access principal update': {
+      const permissions = {};
+      if (o['allow-sessions']) permissions.sessions = true;
+      if (o['deny-sessions']) permissions.sessions = false;
+      if (o['allow-integrate']) permissions.integrate = true;
+      if (o['deny-integrate']) permissions.integrate = false;
+      if (!Object.keys(permissions).length) throw new OrchestratorError('invalid_arguments', 'Name at least one permission change.');
+      return { principal: await new PrincipalStore({ root: profiles.root }).update(required('id'), { permissions }) };
+    }
+    case 'access session discover':
+    case 'access session bind':
+    case 'access session list':
+    case 'access session status':
+    case 'access session send':
+    case 'access session read':
+    case 'access session unbind': {
+      const principals = new PrincipalStore({ root: profiles.root });
+      const sessions = new SessionService({ root: profiles.root, principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
+      const audit = new AccessAudit({ root: profiles.root });
+      const tool = command.slice('access session '.length);
+      if (tool === 'discover') return sessions.discover();
+      if (tool === 'bind') return sessions.bind({ principalId: required('principal'), pane: required('pane'), id: o.id || null, allowKeys: !!o['allow-keys'], label: o.label || null, providerSessionId: o['provider-session'] || null, allowQueue: !!o['allow-queue'], queueProfile: o['queue-profile'] || null });
+      if (tool === 'unbind' && o.operator) return { id: required('session'), removed: await sessions.unbindAsOperator(o.session) };
+      const principal = await principals.get(required('principal'));
+      if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
+      const startedAt = Date.now();
+      const auditName = tool === 'list' ? 'sessions' : `session_${tool}`;
+      try {
+        let result;
+        if (tool === 'list') result = await sessions.list(principal);
+        else if (tool === 'status') result = await sessions.status(principal, { sessionId: required('session') });
+        else if (tool === 'read') result = await sessions.read(principal, { sessionId: required('session'), cursor: o.cursor, ...(o['max-lines'] === undefined ? {} : { maxLines: Number(o['max-lines']) }) });
+        else if (tool === 'unbind') result = await sessions.unbind(principal, { sessionId: required('session') });
+        else {
+          const sources = ['text', 'text-file', 'keys'].filter(key => o[key] !== undefined);
+          if (sources.length !== 1) throw new OrchestratorError('invalid_arguments', 'Supply exactly one of --text, --text-file, or --keys.');
+          const input = o.keys !== undefined ? { keys: String(o.keys).split(',').map(v => v.trim()).filter(Boolean) } : { text: o['text-file'] ? await read(o['text-file']) : o.text };
+          result = await sessions.send(principal, { sessionId: required('session'), idempotencyKey: required('key'), ...input, ...(o.mode ? { mode: o.mode } : {}) });
+        }
+        await audit.record({ principalId: principal.id, transport: 'cli', tool: auditName, sessionId: o.session || null, ok: true, durationMs: Date.now() - startedAt });
+        return result;
+      } catch (error) {
+        await audit.record({ principalId: principal.id, transport: 'cli', tool: auditName, sessionId: o.session || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
+        throw error;
+      }
+    }
+    case 'access principal remove': return { id: required('id'), removed: await new PrincipalStore({ root: profiles.root }).remove(o.id) };
+    case 'access serve': {
+      const service = new AccessService({ root: profiles.root, orchestrator, driver: 'background' });
+      const sessions = new SessionService({ root: profiles.root, principals: service.principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
+      const provider = memoryProviderFromEnv();
+      const coop = new CoopService({ root: profiles.root, principals: service.principals, jobs: service.jobs, sessions: sessions.sessions, orchestrator });
+      const memory = new MemoryService({ root: profiles.root, provider, principals: service.principals, sessions: sessions.sessions, jobs: service.jobs, orchestrator, coop, orchestratorCarrier: process.env.HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER === '1' });
+      const port = o.port === undefined ? 0 : Number(o.port);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new OrchestratorError('invalid_arguments', '--port must be an integer from 0 to 65535.');
+      const started = await startAccessServer({ service, sessions, memory, coop, port, host: o.host || '127.0.0.1' });
+      process.stdout.write(`${JSON.stringify({ ok: true, data: { endpoint: started.endpoint, port: started.port, pid: process.pid, memoryProvider: provider.name, note: 'Serving. Expose the endpoint through your own tunnel or tailnet; callers need a principal token.' } })}\n`);
+      await new Promise(resolve => { const stop = () => { started.close(); resolve(); }; process.once('SIGINT', stop); process.once('SIGTERM', stop); });
+      return { stopped: true, endpoint: started.endpoint };
+    }
+    case 'access describe':
+    case 'access submit':
+    case 'access status':
+    case 'access approve':
+    case 'access answer':
+    case 'access cancel':
+    case 'access result':
+    case 'access retry':
+    case 'access events': {
+      const principal = await new PrincipalStore({ root: profiles.root }).get(required('principal'));
+      if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
+      const service = new AccessService({ root: profiles.root, orchestrator, driver: 'inline' });
+      const audit = new AccessAudit({ root: profiles.root });
+      const tool = command.slice('access '.length);
+      const startedAt = Date.now();
+      const answerInput = async () => {
+        const sources = ['text', 'text-file', 'keys'].filter(key => o[key] !== undefined);
+        if (sources.length !== 1) throw new OrchestratorError('invalid_arguments', 'Supply exactly one of --text, --text-file, or --keys.');
+        if (o.keys !== undefined) return { keys: String(o.keys).split(',').map(value => value.trim()).filter(Boolean) };
+        return { text: o['text-file'] ? await read(o['text-file']) : o.text };
+      };
+      try {
+        const result = tool === 'describe' ? service.describe(principal)
+          : tool === 'submit' ? await service.submit(principal, await readProfile(required('file')))
+            : tool === 'status' ? await service.status(principal, { jobId: required('job'), advance: !o['no-advance'] })
+              : tool === 'approve' ? await service.approve(principal, { jobId: required('job') })
+                : tool === 'answer' ? await service.answer(principal, { jobId: required('job'), ...(await answerInput()) })
+                  : tool === 'cancel' ? await service.cancel(principal, { jobId: required('job'), reason: o.reason })
+                    : tool === 'retry' ? await service.retry(principal, { jobId: required('job'), feedback: o['feedback-file'] ? await read(o['feedback-file']) : o.feedback })
+                      : tool === 'events' ? await service.events(principal, { jobId: o.job, since: o.since, ...(o.limit === undefined ? {} : { limit: Number(o.limit) }) })
+                        : await service.result(principal, { jobId: required('job'), includePatch: !!o.patch });
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.job?.id || o.job || null, ok: true, durationMs: Date.now() - startedAt });
+        return result;
+      } catch (error) {
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: o.job || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
+        throw error;
+      }
+    }
+    case 'access memory route bind':
+    case 'access memory route unbind':
+    case 'access memory route list':
+    case 'access memory route show': {
+      const routes = new MemoryRouteStore({ root: profiles.root });
+      const verb = command.slice('access memory route '.length);
+      if (verb === 'list') return routes.list();
+      if (verb === 'show') return routes.show({ hostProject: path.resolve(required('host-project')) });
+      if (verb === 'unbind') return routes.unbind({ hostProject: path.resolve(required('host-project')) });
+      if (o['argv-json'] !== undefined && o['argv-file'] !== undefined) throw new OrchestratorError('invalid_arguments', 'Pass either --argv-json or --argv-file, not both.');
+      let argv;
+      try { argv = o['argv-file'] !== undefined ? JSON.parse(await read(o['argv-file'])) : JSON.parse(required('argv-json')); }
+      catch (error) { if (error instanceof OrchestratorError) throw error; throw new OrchestratorError('invalid_arguments', 'argv must be a JSON array of strings.'); }
+      return routes.bind({ hostProject: path.resolve(required('host-project')), argv, providerCheckout: required('provider-checkout'), expectedProjectId: required('expect-project'), label: o.label || null });
+    }
+    case 'access memory recall':
+    case 'access memory begin':
+    case 'access memory checkpoint':
+    case 'access memory pending': {
+      const principals = new PrincipalStore({ root: profiles.root });
+      const memorySessions = new SessionStore({ root: profiles.root });
+      const memoryJobs = new JobStore({ root: profiles.root });
+      const memory = new MemoryService({ root: profiles.root, provider: memoryProviderFromEnv(), principals, sessions: memorySessions, jobs: memoryJobs, orchestrator, coop: new CoopService({ root: profiles.root, principals, jobs: memoryJobs, sessions: memorySessions, orchestrator }), orchestratorCarrier: process.env.HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER === '1' });
+      const tool = command.slice('access memory '.length);
+      if (tool === 'pending') return memory.pending(o.principal ? { id: o.principal } : null);
+      const principal = await principals.get(required('principal'));
+      if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
+      const audit = new AccessAudit({ root: profiles.root });
+      const startedAt = Date.now();
+      const target = { sessionId: o.session, jobId: o.job };
+      try {
+        const result = tool === 'recall'
+          ? await memory.recall(principal, { ...target, question: required('question'), ...(o['top-k'] === undefined ? {} : { topK: Number(o['top-k']) }), ...(o.authority ? { authority: o.authority } : {}) })
+          : tool === 'begin'
+            ? await memory.begin(principal, { ...target, operationId: required('operation'), ...(o.authority ? { authority: o.authority } : {}) })
+            : await memory.checkpoint(principal, { ...target, operationId: required('operation'), ...(o.file ? await readProfile(o.file) : {}), ...(o.attestation ? { attestationEventId: o.attestation } : {}) });
+        await audit.record({ principalId: principal.id, transport: 'cli', tool: `memory_${tool}`, jobId: o.job || null, sessionId: o.session || null, ok: true, code: result.status, durationMs: Date.now() - startedAt });
+        return result;
+      } catch (error) {
+        await audit.record({ principalId: principal.id, transport: 'cli', tool: `memory_${tool}`, jobId: o.job || null, sessionId: o.session || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
+        throw error;
+      }
+    }
+    case 'access recipient register':
+    case 'access recipient list':
+    case 'access recipient revoke':
+    case 'access coop report':
+    case 'access coop inbox':
+    case 'access coop ack':
+    case 'access coop deliveries':
+    case 'access coop dispatch':
+    case 'access coop resolve':
+    case 'access coop store init':
+    case 'access coop store migrate':
+    case 'access coop store inspect':
+    case 'access coop import run-events':
+    case 'access observe': {
+      const principals = new PrincipalStore({ root: profiles.root });
+      const sessionStore = new SessionStore({ root: profiles.root });
+      const coop = new CoopService({ root: profiles.root, principals, jobs: new JobStore({ root: profiles.root }), sessions: sessionStore, orchestrator });
+      const split = value => (value === undefined ? [] : String(value).split(',').map(v => v.trim()).filter(Boolean));
+      if (command === 'access recipient register') return coop.registerRecipient({ id: required('id'), kind: required('kind'), principalId: o.principal || null, endpoint: o.endpoint || null, secretFile: o['secret-file'] ? path.resolve(o['secret-file']) : null, socketPath: o.socket ? path.resolve(o.socket) : null, threadId: o.thread || null, taskRefs: split(o['task-refs']), sources: split(o.sources), types: split(o.types), label: o.label || null });
+      if (command === 'access recipient list') return coop.listRecipients();
+      if (command === 'access recipient revoke') return coop.revokeRecipient(required('id'));
+      if (command === 'access coop store init') return coop.store.init();
+      if (command === 'access coop store migrate') return coop.store.migrate({ fromV1: !!o['from-v1'], resume: !!o.resume });
+      if (command === 'access coop store inspect') return coop.store.inspect();
+      if (command === 'access coop import run-events') return coop.importRunEvents({ jobId: required('job'), ...(o.limit === undefined ? {} : { limit: Number(o.limit) }), dryRun: !!o['dry-run'] });
+      if (command === 'access coop deliveries') return { deliveries: await coop.pendingDeliveries() };
+      if (command === 'access coop resolve') return coop.resolveDelivery({ eventId: required('event'), consumerId: required('consumer'), as: required('as'), note: o.note || null });
+      if (command === 'access coop dispatch') {
+        const dispatcher = new Dispatcher({ root: profiles.root, coop, principals, adapters: defaultAdapters({ grok: { allowHttpLoopback: !!o['allow-http-loopback'] } }) });
+        if (o.once) return { results: await dispatcher.tick() };
+        process.once('SIGINT', () => dispatcher.stop()); process.once('SIGTERM', () => dispatcher.stop());
+        await dispatcher.run({ intervalMs: o['interval-ms'] === undefined ? 5000 : Number(o['interval-ms']) });
+        return { stopped: true };
+      }
+      if (command === 'access observe') {
+        const sessions = new SessionService({ root: profiles.root, principals, tmux: new Tmux({ socket: o['tmux-socket'] || null }) });
+        const observer = new SessionObserver({ root: profiles.root, sessions, coop, intervalMs: o['interval-ms'] === undefined ? 5000 : Number(o['interval-ms']), log: entry => process.stderr.write(`${JSON.stringify(entry)}\n`) });
+        if (o.once) return { results: await observer.tick() };
+        process.once('SIGINT', () => observer.stop()); process.once('SIGTERM', () => observer.stop());
+        await observer.run();
+        return { stopped: true };
+      }
+      const principal = await principals.get(required('principal'));
+      if (!principal) throw new OrchestratorError('principal_not_found', 'Principal does not exist.');
+      const audit = new AccessAudit({ root: profiles.root });
+      const tool = `coop_${command.slice('access coop '.length)}`;
+      const startedAt = Date.now();
+      try {
+        let result;
+        if (tool === 'coop_report') result = await coop.report(principal, { idempotencyKey: required('key'), type: required('type'), task: { ref: required('task') }, ...(o['payload-file'] ? { payload: await readProfile(o['payload-file']) } : {}), ...(o['evidence-file'] ? { evidenceRefs: await readProfile(o['evidence-file']) } : {}), conversationRef: o.conversation, correlationId: o.correlation, causationId: o.causation }, { via: 'cli' });
+        else if (tool === 'coop_inbox') result = await coop.inbox(principal, { ...(o.cursor === undefined ? {} : { cursor: Number(o.cursor) }), ...(o['cursor-v2'] === undefined ? {} : { cursorV2: o['cursor-v2'] }), ...(o.limit === undefined ? {} : { limit: Number(o.limit) }) });
+        else result = await coop.ack(principal, { eventId: required('event'), epoch: required('epoch') });
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: result?.event?.eventId || o.event || null, ok: true, durationMs: Date.now() - startedAt });
+        return result;
+      } catch (error) {
+        await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: o.event || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
+        throw error;
+      }
     }
     case 'monitor status': return new MonitorManager({ root: profiles.root }).status(o.id || 'default');
     case 'monitor stop': return new MonitorManager({ root: profiles.root }).stop(o.id || 'default');
