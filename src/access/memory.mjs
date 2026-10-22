@@ -336,10 +336,15 @@ export class MemoryService {
   // and principal are authorized again and the route snapshot is taken; both are used only for this
   // call, and the gate is held through the bounded provider call. `frozen` (from an admission) must
   // equal the current route or the operation is refused rather than moved to another provider.
-  async _routed(principal, selector, firstTarget, frozen, fn) {
+  async _routed(principal, selector, firstTarget, frozen, fn, { operationId = null, bound = [] } = {}) {
     return this.routes.gate(firstTarget.project, async () => {
       const { target, principal: current } = await this._target(principal, selector);
-      invariant(target.kind === firstTarget.kind && target.id === firstTarget.id && target.project === firstTarget.project && target.agent === firstTarget.agent && (target.bindingId ?? null) === (firstTarget.bindingId ?? null), 'permission_denied', 'The target changed while waiting for the memory gate.');
+      // The complete target identity, including a job's current attempt (intentRevision) and a
+      // session's binding, must be what it was before the wait; and every durable record this
+      // operation already holds (admission, pending, receipt) must still name this exact identity.
+      // An operation admitted at one attempt is never re-admitted or saved under a later one.
+      invariant(target.kind === firstTarget.kind && target.id === firstTarget.id && target.project === firstTarget.project && target.agent === firstTarget.agent && (target.bindingId ?? null) === (firstTarget.bindingId ?? null) && (target.intentRevision ?? null) === (firstTarget.intentRevision ?? null), 'operation_conflict', 'The target’s identity changed while waiting for the memory gate (re-bound, or the job moved to another attempt); nothing was sent. Begin a new operation for the current identity.', { operationId, before: { intentRevision: firstTarget.intentRevision ?? null, bindingId: firstTarget.bindingId ?? null }, now: { intentRevision: target.intentRevision ?? null, bindingId: target.bindingId ?? null } });
+      for (const record of bound) this._sameOwner(record, current, target, operationId);
       const resolution = await this.routes.lookup(target.project);
       if (frozen !== undefined) invariant(MemoryRouteStore.sameFrozen(frozen, MemoryRouteStore.frozen(resolution.snapshot && resolution.kind === 'route' ? resolution.snapshot : null)) && !(frozen === null && resolution.kind === 'disabled'), 'memory_route_changed', 'The provider route for this project changed (bound, rebound or unbound) since this operation was admitted; the operation is refused and is never moved to another provider. Begin a new operation if appropriate.', { status: 'memory_route_changed', frozen: frozen ? { routeId: frozen.routeId, revision: frozen.revision } : null, current: resolution.snapshot ? { routeId: resolution.snapshot.routeId, revision: resolution.snapshot.revision, enabled: resolution.snapshot.enabled } : null });
       if (resolution.kind === 'disabled') throw routeError('memory_route_disabled', 'This project’s provider route is unbound (disabled); the same-machine default is not used for a project that was mapped.', { status: 'memory_route_disabled', routeId: resolution.snapshot.routeId, revision: resolution.snapshot.revision, operatorAction: 'access memory route bind …' });
@@ -492,7 +497,7 @@ export class MemoryService {
           }
         }
         return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, operationId: op, target: this._publicTarget(fresh), authority, route: routeInfo, writeGeneration: result.writeGeneration ?? null, repeated: Boolean(existing), latencyMs: result.latencyMs ?? null, note: result.status === 'admitted' ? 'Admitted. Gather the handoff content now and save it with memory_checkpoint under this operationId.' : 'Not admitted; no checkpoint can be saved under this operationId until begin succeeds.' };
-      });
+      }, { operationId: op, bound: existing ? [existing] : [] });
     });
   }
 
@@ -648,9 +653,9 @@ export class MemoryService {
         let result;
         try { result = await withTimeout(provider.save({ project: target.project, agent: carrier, operationId: op, canonical: frozen.canonical, document: frozen.document, timeoutMs: this.timeoutMs, expectProject }), this.timeoutMs + 2500, provider.name); }
         catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
-        if (route && result?.status === 'saved' && (!result.projectId || result.projectId.toLowerCase() !== route.expectedProjectId)) result = { status: 'error', reason: 'protocol', detail: 'The save receipt names a different Memy Project than this project’s route expects; not recorded as saved.' };
+        if (route && result?.status === 'saved' && (!result.projectId || String(result.projectId).toLowerCase() !== route.expectedProjectId)) result = { status: 'error', reason: 'protocol', detail: 'The save receipt names a different Memy Project than this project’s route expects; not recorded as saved.' };
         return result;
-      });
+      }, { operationId: op, bound: [index, pending, admission].filter(Boolean) });
       let result = normalizeProviderResult('save', sent);
       // A receipt must describe the admission this operation was begun under.
       if (result.status === 'saved' && ((admission.projectId && result.projectId && admission.projectId !== result.projectId) || (Number.isInteger(admission.writeGeneration) && Number.isInteger(result.writeGeneration) && admission.writeGeneration !== result.writeGeneration))) {

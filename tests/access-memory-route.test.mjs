@@ -281,3 +281,61 @@ test('a provider that cannot take an argv route answers unconfigured/provider_no
   assert.equal((await memory.recall(f.principal, { jobId: f.jobA, question: 'what was decided?' })).reason, 'provider_not_routable');
   assert.equal((await memory.begin(f.principal, { jobId: f.jobB, operationId: 'op-o' })).status, 'admitted');
 });
+
+test('gate-wait identity: a job that moved to a new attempt while a repeat begin, a checkpoint or a pending retry waited for the project gate is refused inside the gate with no provider launch and unchanged admission/pending bytes; an unchanged waiter and a fresh operation at the new attempt proceed', async t => {
+  const f = await setup(t);
+  let revision = 1;
+  const inspector = { inspect: async () => ({ attempt: { number: revision, id: `attempt-${revision}`, status: 'running' } }) };
+  const memory = new MemoryService({ root: f.stateRoot, provider: f.provider, principals: f.principals, sessions: f.sessions, jobs: f.access.jobs, orchestrator: inspector, timeoutMs: 800 });
+  await memory.routes.bind({ hostProject: f.project, argv: f.argvA, providerCheckout: '/x', expectedProjectId: PROJECT_A });
+  const launches = () => f.command.calls.length;
+  // Hold the project gate; start the call and wait until it has passed its pre-gate checks and asks
+  // for the gate; change the attempt exactly then; release. Deterministic, no timing assumptions.
+  const during = async (fn, change) => {
+    const original = memory.routes.gate.bind(memory.routes);
+    let enter, release, queued;
+    const entered = new Promise(r => { enter = r; }); const gate = new Promise(r => { release = r; }); const requested = new Promise(r => { queued = r; });
+    const held = original(f.project, async () => { enter(); await gate; });
+    await entered;
+    memory.routes.gate = (project, inner, opts) => { queued(); memory.routes.gate = original; return original(project, inner, opts); };
+    const waiting = fn();
+    await requested;
+    await change();
+    release(); await held;
+    return waiting;
+  };
+  // 1. Repeat begin of an operation admitted at attempt 1 while the job advances to attempt 2.
+  assert.equal((await memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w1' })).status, 'admitted');
+  const admission1 = await fs.readFile(f.admissionFile('op-w1'));
+  let before = launches();
+  await assert.rejects(during(() => memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w1' }), async () => { revision = 2; }), e => e.code === 'operation_conflict' && e.details.before.intentRevision === 1 && e.details.now.intentRevision === 2);
+  assert.equal(launches(), before, 'no provider launch');
+  assert.ok(Buffer.compare(await fs.readFile(f.admissionFile('op-w1')), admission1) === 0, 'admission bytes unchanged: still attempt 1');
+  assert.equal(JSON.parse(admission1.toString()).target.intentRevision, 1);
+  // 2. First checkpoint of an operation admitted at attempt 2 while the job advances to attempt 3: refused, no pending record, no launch.
+  assert.equal((await memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w2' })).status, 'admitted');
+  before = launches();
+  await assert.rejects(during(() => memory.checkpoint(f.principal, { jobId: f.jobA, operationId: 'op-w2', ...body() }), async () => { revision = 3; }), e => e.code === 'operation_conflict');
+  assert.equal(launches(), before); assert.equal(await fs.readFile(f.pendingFile('op-w2'), 'utf8').catch(e => e.code), 'ENOENT');
+  // 3. Pending retry: an operation with a pending save (provider hung) whose job advances during the wait keeps its pending bytes.
+  assert.equal((await memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w3' })).status, 'admitted');
+  f.command.hooks.saveMode = 'hang';
+  assert.equal((await memory.checkpoint(f.principal, { jobId: f.jobA, operationId: 'op-w3', ...body() })).status, 'pending');
+  f.command.hooks.saveMode = 'ok';
+  const pending3 = await fs.readFile(f.pendingFile('op-w3'));
+  before = launches();
+  await assert.rejects(during(() => memory.checkpoint(f.principal, { jobId: f.jobA, operationId: 'op-w3' }), async () => { revision = 4; }), e => e.code === 'operation_conflict');
+  assert.equal(launches(), before); assert.ok(Buffer.compare(await fs.readFile(f.pendingFile('op-w3')), pending3) === 0, 'pending bytes unchanged');
+  // Controls: an unchanged-identity waiter proceeds (repeat begin repeated, checkpoint saved); a fresh operation at the new attempt is admitted and saved.
+  assert.equal((await memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w4' })).status, 'admitted');
+  const repeated = await during(() => memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w4' }), async () => {});
+  assert.equal(repeated.status, 'admitted'); assert.equal(repeated.repeated, true);
+  const saved = await during(() => memory.checkpoint(f.principal, { jobId: f.jobA, operationId: 'op-w4', ...body() }), async () => {});
+  assert.equal(saved.status, 'saved');
+  revision = 5;
+  assert.equal((await memory.begin(f.principal, { jobId: f.jobA, operationId: 'op-w5' })).status, 'admitted');
+  assert.equal(JSON.parse(await fs.readFile(f.admissionFile('op-w5'), 'utf8')).target.intentRevision, 5);
+  assert.equal((await memory.checkpoint(f.principal, { jobId: f.jobA, operationId: 'op-w5', ...body() })).status, 'saved');
+  // Recall during an attempt change is also refused rather than answered for a different identity.
+  await assert.rejects(during(() => memory.recall(f.principal, { jobId: f.jobA, question: 'what was decided?' }), async () => { revision = 6; }), e => e.code === 'operation_conflict');
+});

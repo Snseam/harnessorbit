@@ -226,12 +226,16 @@ test('a checkpoint the provider cannot confirm stays pending with frozen bytes, 
   assert.equal(later.reason, 'collection_changed');
   assert.equal(denying.calls.filter(c => c.tool === 'save').length, saves + 1, 'denial is re-asked of the provider, never answered from a local cache');
   // A permission revoked while another checkpoint holds the lock is honoured before sending.
-  const slowProvider = new ScriptedProvider({ save: () => new Promise(resolve => setTimeout(() => resolve({ status: 'saved', memoryIds: ['slow'] }), 400)) });
+  // The first checkpoint must be past every authorization check and inside the provider call before
+  // the permission is revoked, so the provider itself signals that moment (a timer would race the
+  // in-gate re-authorization under load and make the first call correctly refuse instead).
+  let saveStarted; const saveInFlight = new Promise(r => { saveStarted = r; });
+  const slowProvider = new ScriptedProvider({ save: () => { saveStarted(); return new Promise(resolve => setTimeout(() => resolve({ status: 'saved', memoryIds: ['slow'] }), 400)); } });
   const race = await setup(t, { provider: slowProvider, timeoutMs: 2000 });
   const r1 = await race.access.submit(race.principal, job(race.project));
   await race.memory.begin(race.principal, { jobId: r1.job.id, operationId: 'race' });
   const a = race.memory.checkpoint(race.principal, { jobId: r1.job.id, operationId: 'race', ...body() });
-  await new Promise(r => setTimeout(r, 50));
+  await saveInFlight;
   const b = race.memory.checkpoint(race.principal, { jobId: r1.job.id, operationId: 'race', ...body() });
   await race.principals.update(race.principal.id, { permissions: { submit: false } });
   assert.equal((await a).status, 'saved');
