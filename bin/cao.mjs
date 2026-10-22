@@ -37,7 +37,7 @@ import { PrincipalStore } from '../src/access/principals.mjs';
 import { AccessService, AccessAudit } from '../src/access/service.mjs';
 import { startAccessServer } from '../src/access/server.mjs';
 import { SessionService, SessionStore, Tmux } from '../src/access/sessions.mjs';
-import { MemoryService, memoryProviderFromEnv } from '../src/access/memory.mjs';
+import { MemoryService, MemoryRouteStore, memoryProviderFromEnv } from '../src/access/memory.mjs';
 import { JobStore } from '../src/access/jobs.mjs';
 import { CoopService } from '../src/access/coop.mjs';
 import { SessionObserver } from '../src/access/observer.mjs';
@@ -161,6 +161,8 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   access memory checkpoint --principal ID (--session ID | --job ID) --operation ID [--file CHECKPOINT.json] [--attestation EVENT-UUID]
   (orchestrator carrier needs HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER=1 on the host after "memy connection orchestrator enable")
   access memory pending [--principal ID]
+  access memory route bind --host-project PATH --expect-project UUID --provider-checkout PATH (--argv-json '["docker","exec",…]' | --argv-file FILE) [--label TEXT]   (operator: route one host project to an exact provider argv)
+  access memory route unbind --host-project PATH | list | show --host-project PATH
   access recipient register --id ID --kind inbox --principal ID [--task-refs harnessorbit:job/,…] [--sources ID,…] [--types work.reported,…] [--label TEXT]
   access recipient register --id ID --kind grok-native-webhook --endpoint https://… --secret-file FILE [scopes…]
   access recipient register --id ID --kind codex-app-server --socket PATH --thread ID [scopes…]
@@ -246,7 +248,7 @@ const optionsByCommand = {
   'access memory recall': ['principal', 'session', 'job', 'question', 'top-k', 'authority'],
   'access memory begin': ['principal', 'session', 'job', 'operation', 'authority'],
   'access memory checkpoint': ['principal', 'session', 'job', 'operation', 'file', 'attestation'],
-  'access memory pending': ['principal'],
+  'access memory pending': ['principal'], 'access memory route bind': ['host-project', 'expect-project', 'provider-checkout', 'argv-json', 'argv-file', 'label'], 'access memory route unbind': ['host-project'], 'access memory route list': [], 'access memory route show': ['host-project'],
   'access recipient register': ['id', 'kind', 'principal', 'endpoint', 'secret-file', 'socket', 'thread', 'task-refs', 'sources', 'types', 'label'],
   'access recipient list': [], 'access recipient revoke': ['id'],
   'access coop report': ['principal', 'key', 'type', 'task', 'payload-file', 'evidence-file', 'conversation', 'correlation', 'causation'],
@@ -255,7 +257,7 @@ const optionsByCommand = {
   'access coop resolve': ['event', 'consumer', 'as', 'note'],
   'access observe': ['once', 'interval-ms', 'tmux-socket'],
 };
-const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop', 'access coop store', 'access coop import']);
+const namespaces = new Set(['source', 'profile', 'secret', 'route', 'gateway', 'monitor', 'skill', 'mode', 'performance', 'result', 'resources', 'calibration', 'host', 'harness', 'access', 'access principal', 'access session', 'access memory', 'access recipient', 'access coop', 'access coop store', 'access coop import', 'access memory route']);
 
 export function parseArgs(argv) {
   const values = {};
@@ -473,6 +475,21 @@ export async function main(argv = process.argv.slice(2)) {
         await audit.record({ principalId: principal.id, transport: 'cli', tool, jobId: o.job || null, ok: false, code: error.code, durationMs: Date.now() - startedAt });
         throw error;
       }
+    }
+    case 'access memory route bind':
+    case 'access memory route unbind':
+    case 'access memory route list':
+    case 'access memory route show': {
+      const routes = new MemoryRouteStore({ root: profiles.root });
+      const verb = command.slice('access memory route '.length);
+      if (verb === 'list') return routes.list();
+      if (verb === 'show') return routes.show({ hostProject: path.resolve(required('host-project')) });
+      if (verb === 'unbind') return routes.unbind({ hostProject: path.resolve(required('host-project')) });
+      if (o['argv-json'] !== undefined && o['argv-file'] !== undefined) throw new OrchestratorError('invalid_arguments', 'Pass either --argv-json or --argv-file, not both.');
+      let argv;
+      try { argv = o['argv-file'] !== undefined ? JSON.parse(await read(o['argv-file'])) : JSON.parse(required('argv-json')); }
+      catch (error) { if (error instanceof OrchestratorError) throw error; throw new OrchestratorError('invalid_arguments', 'argv must be a JSON array of strings.'); }
+      return routes.bind({ hostProject: path.resolve(required('host-project')), argv, providerCheckout: required('provider-checkout'), expectedProjectId: required('expect-project'), label: o.label || null });
     }
     case 'access memory recall':
     case 'access memory begin':

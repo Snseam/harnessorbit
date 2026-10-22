@@ -52,6 +52,10 @@ Design `phase2b-import-design.md` (accepted by root after two revisions, `phase2
 
 Decision `codex-native-adapter-decision.md`, evidence `review/codex-native-signal-capture-20261021-234834-619faf/` (CLI 0.163.0, two normal turns). Delivered: bounded source discovery at bind (`src/access/sessions.mjs`: exact live process chain's open rollout plus matching writer lock, header-validated session id and cwd, diagnostics otherwise), a provider-discriminated native reader in `src/access/observer.mjs` (Codex `event_msg`/`task_complete` with native `turn_id`; Claude unchanged), and the Codex `providerTurnId` variant of `agent.turn_finished` in `coop.observe`. Not done, by evidence: failure and cancellation outcomes (not sampled; any unsampled terminal is counted as unverified, never success), desktop-owner ingress, resume syntax parsing. Fixture evidence: `tests/access-observer-codex.test.mjs`; the real CLI turn → inbox → ACK → restart acceptance is root's.
 
+## Memy provider routing (this branch)
+
+Decision `orbit-memy-provider-routing-decision.md`, note `orbit-memy-provider-routing-design.md`, release `orbit-memy-provider-route-implementation-release.md`. Delivered: `MemoryRouteStore` and the operator CLI `access memory route bind|unbind|list|show` (exact argv, declared provider checkout, expected Memy Project, routeId and revision per bind, disabled on unbind); per-project invocation gate shared by mutations and provider calls; `--expect-project` on every routed handoff call plus Orbit's own Project check; route frozen into admissions and revalidated before every side effect (`memory_route_changed`); malformed store fails closed. Same-machine default unchanged for unmapped projects. Root owns the real container CLI → real Memy → retained host session flow. Fixture evidence: `tests/access-memory-route.test.mjs`.
+
 ## Operating rules during the work
 
 - The access service already running on this host (port 7777, access layer 0.3.0) is not restarted, and its old jobs are not integrated or migrated, until the operator decides.

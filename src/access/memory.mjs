@@ -100,10 +100,16 @@ export class MemyHandoffCliProvider {
     this.name = 'memy-handoff-cli'; this.configured = true; this.argv = argv; this.timeoutMs = timeoutMs; this.command = command;
   }
 
-  async _run(subcommand, args, { cwd, input, timeoutMs = this.timeoutMs } = {}) {
+  // The same CLI contract through another exact argv prefix (an operator route): same command runner,
+  // same timeout, nothing else inherited.
+  withArgv(argv) { return new MemyHandoffCliProvider({ argv, timeoutMs: this.timeoutMs, command: this.command }); }
+
+  async _run(subcommand, args, { cwd, input, timeoutMs = this.timeoutMs, expectProject = null } = {}) {
     const startedAt = Date.now();
     let result;
-    try { result = await this.command([...this.argv, 'handoff', subcommand, ...args, '--timeout-ms', String(timeoutMs)], { cwd, input, timeoutMs: timeoutMs + 2000, maxBytes: 262144 }); }
+    // --expect-project is Memy's own guard: the trusted route's Project id, never a caller value.
+    const expect = expectProject ? ['--expect-project', expectProject] : [];
+    try { result = await this.command([...this.argv, 'handoff', subcommand, ...args, ...expect, '--timeout-ms', String(timeoutMs)], { cwd, input, timeoutMs: timeoutMs + 2000, maxBytes: 262144 }); }
     catch (error) {
       const latencyMs = Date.now() - startedAt;
       if (error?.code === 'command_spawn_failed') return { status: 'unconfigured', reason: 'setup_unavailable', detail: 'The memy CLI is not installed on this host.', latencyMs };
@@ -141,18 +147,18 @@ export class MemyHandoffCliProvider {
     return json;
   }
 
-  async status({ project, agent } = {}) {
+  async status({ project, agent, expectProject = null } = {}) {
     const who = handoffAgent(agent);
     if (!who) return { status: 'unconfigured', reason: 'agent_unsupported', detail: `Memy handoff supports claude and codex sessions; ${agent} is not integrated.` };
-    return this._validated(await this._run('status', ['--agent', who.flag], { cwd: project }), 'status');
+    return this._validated(await this._run('status', ['--agent', who.flag], { cwd: project, expectProject }), 'status');
   }
 
-  async recall({ project, agent, question, topK = 5, exclude = [], timeoutMs = this.timeoutMs } = {}) {
+  async recall({ project, agent, question, topK = 5, exclude = [], timeoutMs = this.timeoutMs, expectProject = null } = {}) {
     const who = handoffAgent(agent);
     if (!who) return { status: 'unconfigured', reason: 'agent_unsupported', detail: `Memy handoff supports claude and codex sessions; ${agent} is not integrated.`, items: [] };
     const args = ['--agent', who.flag, '--query', question, '--top-k', String(topK), '--max-bytes', String(MAX_RECALL_BYTES)];
     for (const id of exclude) args.push('--exclude', id);
-    const json = normalizeProviderResult('recall', this._validated(await this._run('recall', args, { cwd: project, timeoutMs }), 'recall'));
+    const json = normalizeProviderResult('recall', this._validated(await this._run('recall', args, { cwd: project, timeoutMs, expectProject }), 'recall'));
     if (json.status !== 'ok') return { status: json.status, reason: json.reason ?? null, detail: json.detail ?? null, items: [], latencyMs: json.latencyMs };
     const items = (Array.isArray(json.items) ? json.items : []).map(item => ({
       id: item.memory_id ?? null, content: clip(String(item.content ?? ''), MAX_ITEM_CHARS), type: item.memory_type ?? null, score: typeof item.score === 'number' ? item.score : null,
@@ -161,21 +167,128 @@ export class MemyHandoffCliProvider {
     return { status: json.degraded ? 'degraded' : 'ok', reason: null, items, omitted: json.omitted ?? null, notice: json.notice ?? null, projectId: json.project_id ?? null, latencyMs: json.latencyMs };
   }
 
-  async begin({ project, agent, operationId, timeoutMs = this.timeoutMs } = {}) {
+  async begin({ project, agent, operationId, timeoutMs = this.timeoutMs, expectProject = null } = {}) {
     const who = handoffAgent(agent);
     if (!who) return { status: 'unconfigured', reason: 'agent_unsupported', detail: `Memy handoff supports claude and codex sessions; ${agent} is not integrated.` };
     const operationUuid = uuidFromOperationId(operationId);
-    const json = normalizeProviderResult('begin', this._validated(await this._run('begin', ['--agent', who.flag, '--operation-id', operationUuid], { cwd: project, timeoutMs }), 'begin', { operationUuid }));
+    const json = normalizeProviderResult('begin', this._validated(await this._run('begin', ['--agent', who.flag, '--operation-id', operationUuid], { cwd: project, timeoutMs, expectProject }), 'begin', { operationUuid }));
     return { status: json.status, reason: json.reason ?? null, detail: json.detail ?? null, projectId: json.project_id ?? null, writeGeneration: json.write_generation ?? null, latencyMs: json.latencyMs };
   }
 
   // stdin is the canonical checkpoint JSON; a retry must send the same bytes under the same id.
-  async save({ project, agent, operationId, canonical, timeoutMs = this.timeoutMs } = {}) {
+  async save({ project, agent, operationId, canonical, timeoutMs = this.timeoutMs, expectProject = null } = {}) {
     const who = handoffAgent(agent);
     if (!who) return { status: 'unconfigured', reason: 'agent_unsupported', detail: `Memy handoff supports claude and codex sessions; ${agent} is not integrated.` };
     const operationUuid = uuidFromOperationId(operationId);
-    const json = normalizeProviderResult('save', this._validated(await this._run('save', ['--agent', who.flag, '--operation-id', operationUuid], { cwd: project, input: `${canonical}\n`, timeoutMs }), 'save', { operationUuid }));
+    const json = normalizeProviderResult('save', this._validated(await this._run('save', ['--agent', who.flag, '--operation-id', operationUuid], { cwd: project, input: `${canonical}\n`, timeoutMs, expectProject }), 'save', { operationUuid }));
     return { status: json.status, reason: json.reason ?? null, detail: json.detail ?? null, projectId: json.project_id ?? null, memoryIds: Array.isArray(json.memory_ids) ? json.memory_ids : [], deduplicated: json.deduplicated === true, writeGeneration: json.write_generation ?? null, latencyMs: json.latencyMs };
+  }
+}
+
+// Operator-only provider routing: an exact canonical host project may be mapped to another exact
+// argv prefix (for example `docker exec -i --workdir … <container> memy`), a declared provider
+// checkout and the Memy Project id that checkout must resolve to. Unmapped projects keep the
+// same-machine default. The store is host state written only by the operator CLI; bots have no
+// setter, and no request field can name an executable, a path or a Project. A store that exists
+// but cannot be read or does not validate fails every memory operation closed: a parse failure is
+// never "unmapped".
+export const ROUTE_SCHEMA_VERSION = 1;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const routeError = (code, message, details) => new OrchestratorError(code, message, details);
+
+export class MemoryRouteStore {
+  constructor({ root } = {}) {
+    invariant(typeof root === 'string' && root.length > 0, 'invalid_state_root', 'Memory route store root is required.');
+    this.root = path.resolve(root);
+    this.file = path.join(this.root, 'access', 'memory', 'routes.json');
+  }
+
+  // One gate per canonical host project, shared by bind/unbind and by every provider invocation for
+  // that project: an admitted call finishes on its frozen route before a mutation lands, and a
+  // mutation that landed is seen by every later call. Unrelated projects are independent.
+  gate(project, fn, { timeoutMs = 60000 } = {}) { return withLock(path.join(this.root, 'locks', `access-memory-gate-${sha(project).slice(0, 24)}`), fn, { timeoutMs }); }
+  _lock(fn) { return withLock(path.join(this.root, 'locks', 'access-memory-routes'), fn, { timeoutMs: 15000 }); }
+
+  static validateRecord(record, key) {
+    const bad = detail => { throw routeError('memory_route_invalid', `Route for ${key} is invalid: ${detail}.`, { status: 'memory_route_invalid', hostProject: key, operatorAction: 'access memory route show / bind again' }); };
+    if (!record || typeof record !== 'object') bad('not an object');
+    if (typeof record.routeId !== 'string' || !UUID_RE.test(record.routeId)) bad('routeId is not a uuid');
+    if (!Number.isInteger(record.revision) || record.revision < 1) bad('revision is not a positive integer');
+    if (record.hostProject !== key) bad('hostProject does not match its key');
+    if (!Array.isArray(record.argv) || record.argv.length === 0 || !record.argv.every(a => typeof a === 'string' && a.length > 0)) bad('argv is not a non-empty array of non-empty strings');
+    if (typeof record.providerCheckout !== 'string' || !record.providerCheckout.length) bad('providerCheckout is missing');
+    if (typeof record.expectedProjectId !== 'string' || !UUID_RE.test(record.expectedProjectId)) bad('expectedProjectId is not a uuid');
+    if (typeof record.enabled !== 'boolean') bad('enabled is not a boolean');
+    return record;
+  }
+
+  static argvHash(argv) { return sha(JSON.stringify(argv)); }
+  static snapshot(record) { return { routeId: record.routeId, revision: record.revision, hostProject: record.hostProject, argv: [...record.argv], providerCheckout: record.providerCheckout, expectedProjectId: record.expectedProjectId, argvHash: MemoryRouteStore.argvHash(record.argv), enabled: record.enabled, label: record.label ?? null }; }
+  static frozen(snapshot) { return snapshot ? { routeId: snapshot.routeId, revision: snapshot.revision, expectedProjectId: snapshot.expectedProjectId, argvHash: snapshot.argvHash } : null; }
+  static sameFrozen(a, b) { return (a ?? null) === null ? (b ?? null) === null : Boolean(b) && a.routeId === b.routeId && a.revision === b.revision && a.expectedProjectId === b.expectedProjectId && a.argvHash === b.argvHash; }
+
+  // Absent file: no routes (same-machine default everywhere). Present but unreadable, unparseable or
+  // off-schema: fail closed for every project.
+  async load() {
+    let text;
+    try { text = await fs.readFile(this.file, 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return { schemaVersion: ROUTE_SCHEMA_VERSION, routes: {} }; throw routeError('memory_route_store_invalid', 'The memory route store could not be read; no memory operation runs until the operator restores it.', { status: 'memory_route_store_invalid', cause: error.code, operatorAction: 'inspect and restore access/memory/routes.json' }); }
+    let doc;
+    try { doc = JSON.parse(text); } catch { doc = null; }
+    if (!doc || typeof doc !== 'object' || doc.schemaVersion !== ROUTE_SCHEMA_VERSION || !doc.routes || typeof doc.routes !== 'object' || Array.isArray(doc.routes)) throw routeError('memory_route_store_invalid', 'The memory route store is malformed; no memory operation runs until the operator restores it. A malformed store is never treated as unmapped.', { status: 'memory_route_store_invalid', operatorAction: 'inspect and restore access/memory/routes.json' });
+    return doc;
+  }
+
+  // The resolution for one canonical project, as one immutable snapshot.
+  async lookup(project) {
+    const doc = await this.load();
+    const record = doc.routes[project];
+    if (!record) return { kind: 'unmapped', snapshot: null };
+    const snapshot = MemoryRouteStore.snapshot(MemoryRouteStore.validateRecord(record, project));
+    return { kind: snapshot.enabled ? 'route' : 'disabled', snapshot };
+  }
+
+  static async canonicalProject(hostProject) {
+    invariant(typeof hostProject === 'string' && path.isAbsolute(hostProject), 'invalid_route', 'hostProject must be an absolute path.');
+    let real;
+    try { real = await fs.realpath(hostProject); invariant((await fs.stat(real)).isDirectory(), 'invalid_route', 'hostProject must be a directory.'); }
+    catch (error) { if (error instanceof OrchestratorError) throw error; invariant(false, 'invalid_route', 'hostProject does not exist on this host.', { hostProject }); }
+    return real;
+  }
+
+  // Operator bind: a new routeId every time, revision +1 even for identical content.
+  async bind({ hostProject, argv, providerCheckout, expectedProjectId, label = null } = {}) {
+    const key = await MemoryRouteStore.canonicalProject(hostProject);
+    invariant(Array.isArray(argv) && argv.length > 0 && argv.length <= 64 && argv.every(a => typeof a === 'string' && a.length > 0 && a.length <= 1024), 'invalid_route', 'argv must be a non-empty array of non-empty strings (exact tokens; no shell).');
+    invariant(typeof providerCheckout === 'string' && providerCheckout.length > 0 && providerCheckout.length <= 1024, 'invalid_route', 'providerCheckout is required (the checkout inside the provider environment that corresponds to this host project).');
+    invariant(typeof expectedProjectId === 'string' && UUID_RE.test(expectedProjectId), 'invalid_route', 'expectedProjectId must be the Memy Project UUID.');
+    invariant(label === null || (typeof label === 'string' && label.length <= 120), 'invalid_route', 'label must be at most 120 characters.');
+    return this.gate(key, () => this._lock(async () => {
+      const doc = await this.load();
+      const previous = doc.routes[key] || null;
+      const record = { routeId: crypto.randomUUID(), revision: (previous?.revision || 0) + 1, hostProject: key, argv: [...argv], providerCheckout, expectedProjectId: expectedProjectId.toLowerCase(), label, enabled: true, createdAt: previous?.createdAt || now(), updatedAt: now(), disabledAt: null };
+      doc.routes[key] = record;
+      await writeJsonAtomic(this.file, doc);
+      return this.public(record, { argv: true });
+    }));
+  }
+
+  async unbind({ hostProject } = {}) {
+    const key = await MemoryRouteStore.canonicalProject(hostProject);
+    return this.gate(key, () => this._lock(async () => {
+      const doc = await this.load();
+      const record = doc.routes[key];
+      invariant(record, 'memory_route_not_found', `No route is bound for ${key}.`, { hostProject: key });
+      if (record.enabled) { record.enabled = false; record.disabledAt = now(); record.updatedAt = now(); await writeJsonAtomic(this.file, doc); }
+      return this.public(record);
+    }));
+  }
+
+  async list() { const doc = await this.load(); return { routes: Object.values(doc.routes).map(r => this.public(r)) }; }
+  async show({ hostProject } = {}) { const key = await MemoryRouteStore.canonicalProject(hostProject); const doc = await this.load(); const record = doc.routes[key]; invariant(record, 'memory_route_not_found', `No route is bound for ${key}.`, { hostProject: key }); return this.public(record, { argv: true }); }
+
+  public(record, { argv = false } = {}) {
+    return { routeId: record.routeId, revision: record.revision, hostProject: record.hostProject, providerCheckout: record.providerCheckout, expectedProjectId: record.expectedProjectId, label: record.label ?? null, enabled: record.enabled, createdAt: record.createdAt, updatedAt: record.updatedAt, disabledAt: record.disabledAt ?? null, argvHash: MemoryRouteStore.argvHash(record.argv), ...(argv ? { argv: [...record.argv] } : {}) };
   }
 }
 
@@ -208,7 +321,7 @@ export class MemoryService {
   // orchestratorCarrier is the host operator's explicit choice to allow Memy's distinct
   // orchestrator grant (`--agent orchestrator`) for checkpoints that no Claude/Codex session grant
   // carries. Off by default; never a fallback for an agent-carried operation or vice versa.
-  constructor({ root, provider = new NullMemoryProvider(), principals, sessions, jobs, orchestrator, coop = null, orchestratorCarrier = false, timeoutMs = 8000 } = {}) {
+  constructor({ root, provider = new NullMemoryProvider(), principals, sessions, jobs, orchestrator, coop = null, orchestratorCarrier = false, timeoutMs = 8000, routes = null } = {}) {
     invariant(typeof root === 'string' && root.length > 0, 'invalid_state_root', 'Memory service root is required.');
     invariant(principals, 'invalid_principals', 'Memory service requires a principal store.');
     this.root = path.resolve(root);
@@ -216,12 +329,34 @@ export class MemoryService {
     this.orchestratorCarrier = orchestratorCarrier === true;
     this.timeoutMs = timeoutMs;
     this.directory = path.join(this.root, 'access', 'memory');
+    this.routes = routes || new MemoryRouteStore({ root: this.root });
+  }
+
+  // Runs one provider call under the target project's invocation gate. Inside the gate the target
+  // and principal are authorized again and the route snapshot is taken; both are used only for this
+  // call, and the gate is held through the bounded provider call. `frozen` (from an admission) must
+  // equal the current route or the operation is refused rather than moved to another provider.
+  async _routed(principal, selector, firstTarget, frozen, fn) {
+    return this.routes.gate(firstTarget.project, async () => {
+      const { target, principal: current } = await this._target(principal, selector);
+      invariant(target.kind === firstTarget.kind && target.id === firstTarget.id && target.project === firstTarget.project && target.agent === firstTarget.agent && (target.bindingId ?? null) === (firstTarget.bindingId ?? null), 'permission_denied', 'The target changed while waiting for the memory gate.');
+      const resolution = await this.routes.lookup(target.project);
+      if (frozen !== undefined) invariant(MemoryRouteStore.sameFrozen(frozen, MemoryRouteStore.frozen(resolution.snapshot && resolution.kind === 'route' ? resolution.snapshot : null)) && !(frozen === null && resolution.kind === 'disabled'), 'memory_route_changed', 'The provider route for this project changed (bound, rebound or unbound) since this operation was admitted; the operation is refused and is never moved to another provider. Begin a new operation if appropriate.', { status: 'memory_route_changed', frozen: frozen ? { routeId: frozen.routeId, revision: frozen.revision } : null, current: resolution.snapshot ? { routeId: resolution.snapshot.routeId, revision: resolution.snapshot.revision, enabled: resolution.snapshot.enabled } : null });
+      if (resolution.kind === 'disabled') throw routeError('memory_route_disabled', 'This project’s provider route is unbound (disabled); the same-machine default is not used for a project that was mapped.', { status: 'memory_route_disabled', routeId: resolution.snapshot.routeId, revision: resolution.snapshot.revision, operatorAction: 'access memory route bind …' });
+      let provider = this.provider; let route = null;
+      if (resolution.kind === 'route') {
+        route = resolution.snapshot;
+        provider = typeof this.provider.withArgv === 'function' ? this.provider.withArgv(route.argv) : null;
+      }
+      return fn({ target, current, provider, route, expectProject: route ? route.expectedProjectId : null, routeInfo: route ? { routeId: route.routeId, revision: route.revision, expectedProjectId: route.expectedProjectId } : null });
+    });
   }
 
   describe(principal) {
     return {
       provider: this.provider.name, configured: this.provider.configured === true, experimental: this.provider.experimental === true,
       ...(this.provider.configured ? {} : { reason: this.provider.reason || null, detail: this.provider.detail || null }),
+      routing: { mode: 'operator-mapped per canonical host project', default: 'same-machine provider for unmapped projects', note: 'Routes are host state set by the operator CLI (access memory route …); requests carry no executable, path or Project.' },
       tools: ['memory_recall', 'memory_begin', 'memory_checkpoint'], contract: 'memy.handoff.v1',
       authorities: { default: 'agent', orchestratorCarrier: this.orchestratorCarrier, note: 'agent: the bound Claude/Codex session’s own grant. orchestrator: Memy’s distinct orchestrator grant, only when the host enabled it; needs attestationEventId (a cooperation event you reported about the target). Fixed at begin; never a fallback.' },
       allowed: { sessions: principal.permissions.sessions === true, jobs: principal.permissions.submit !== false },
@@ -289,15 +424,20 @@ export class MemoryService {
     invariant(Number.isInteger(topK) && topK >= 1 && topK <= MAX_RECALL_ITEMS, 'invalid_memory_request', `topK must be an integer from 1 to ${MAX_RECALL_ITEMS}.`, { field: 'topK' });
     invariant(Array.isArray(exclude) && exclude.length <= 50 && exclude.every(id => typeof id === 'string' && /^[A-Za-z0-9:_-]{1,64}$/.test(id)), 'invalid_memory_request', 'exclude must list up to 50 memory ids.', { field: 'exclude' });
     invariant(MEMORY_AUTHORITIES.includes(authority), 'invalid_memory_request', 'authority must be agent or orchestrator.', { field: 'authority' });
-    const { target } = await this._target(principal, { sessionId, jobId });
+    const { target: first } = await this._target(principal, { sessionId, jobId });
     if (authority === 'orchestrator' && !this.orchestratorCarrier) {
-      return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: 'unconfigured', reason: 'orchestrator_carrier_unavailable', detail: 'The host operator has not enabled Memy’s orchestrator carrier; no session grant is borrowed for recall.', target: this._publicTarget(target), authority, question: q, items: [], truncated: false, omitted: null, trust: 'untrusted_evidence', note: 'Not recalled.' };
+      return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: 'unconfigured', reason: 'orchestrator_carrier_unavailable', detail: 'The host operator has not enabled Memy’s orchestrator carrier; no session grant is borrowed for recall.', target: this._publicTarget(first), authority, question: q, items: [], truncated: false, omitted: null, trust: 'untrusted_evidence', note: 'Not recalled.' };
     }
-    const carrier = authority === 'orchestrator' ? 'orchestrator' : target.agent;
-    let result;
-    try { result = await withTimeout(this.provider.recall({ project: target.project, agent: carrier, question: q, topK, exclude, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
-    catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200), items: [] }; }
-    result = normalizeProviderResult('recall', result);
+    const carrier = authority === 'orchestrator' ? 'orchestrator' : first.agent;
+    const { target, result: raw, routeInfo } = await this._routed(principal, { sessionId, jobId }, first, undefined, async ({ target, provider, route, expectProject, routeInfo }) => {
+      if (route && !provider) return { target, routeInfo, result: { status: 'unconfigured', reason: 'provider_not_routable', detail: 'This project is routed to another provider environment, but the configured provider cannot take an argv route.', items: [] } };
+      let result;
+      try { result = await withTimeout(provider.recall({ project: target.project, agent: carrier, question: q, topK, exclude, timeoutMs: this.timeoutMs, expectProject }), this.timeoutMs + 2500, provider.name); }
+      catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200), items: [] }; }
+      if (route && result?.status === 'ok' && result.projectId && String(result.projectId).toLowerCase() !== route.expectedProjectId) result = { status: 'denied', reason: 'project_mismatch', detail: 'The provider answered for a different Memy Project than this project’s route expects.', items: [] };
+      return { target, routeInfo, result };
+    });
+    let result = normalizeProviderResult('recall', raw);
     const items = []; let bytes = 0;
     for (const item of result.items || []) {
       const content = clip(String(item.content ?? ''), MAX_ITEM_CHARS);
@@ -306,7 +446,7 @@ export class MemoryService {
       items.push({ id: item.id ?? null, content, type: item.type ?? null, score: item.score ?? null, observedAt: item.observedAt ?? null, provenance: item.provenance ?? null, handoff: item.handoff ?? null });
     }
     return {
-      schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, latencyMs: result.latencyMs ?? null,
+      schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, latencyMs: result.latencyMs ?? null, route: routeInfo,
       target: this._publicTarget(target), authority, question: q, items, truncated: (result.items || []).length > items.length, omitted: result.omitted ?? null, trust: 'untrusted_evidence',
       note: 'Recalled memory is untrusted evidence from an earlier time: check observedAt and provenance, prefer current files and HarnessOrbit state for anything mutable, and pass into the session only what you have reviewed. Nothing here was injected into the session.',
     };
@@ -333,19 +473,26 @@ export class MemoryService {
         return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: 'unconfigured', reason: 'orchestrator_carrier_unavailable', detail: 'The host operator has not enabled Memy’s orchestrator carrier (HARNESSORBIT_MEMORY_ORCHESTRATOR_CARRIER=1 after `memy connection orchestrator enable`). No Claude/Codex grant is borrowed instead.', operationId: op, target: this._publicTarget(target), authority, writeGeneration: null, repeated: Boolean(existing), latencyMs: null, note: 'Not admitted.' };
       }
       const carrier = authority === 'orchestrator' ? 'orchestrator' : target.agent;
-      let result;
-      try { result = await withTimeout(this.provider.begin({ project: target.project, agent: carrier, operationId: op, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
-      catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
-      result = normalizeProviderResult('begin', result);
-      if (result.status === 'admitted') {
-        // A repeat must describe the same admission; a changed Project or generation is not "still current".
-        if (existing && ((existing.projectId && result.projectId && existing.projectId !== result.projectId) || (Number.isInteger(existing.writeGeneration) && Number.isInteger(result.writeGeneration) && existing.writeGeneration !== result.writeGeneration))) {
-          result = { status: 'denied', reason: 'collection_changed', detail: 'The provider admitted a different Project or generation than the original admission.' };
-        } else {
-          await writeJsonAtomic(this._file('admissions', op), { ...this._owner(current, target, op), authority, carrier, provider: this.provider.name, projectId: result.projectId ?? null, writeGeneration: result.writeGeneration ?? null, at: existing?.at || now(), confirmedAt: now() });
+      // Legacy admissions (before routing) carry no route field and mean "default provider".
+      const frozenRoute = existing ? (existing.route ?? null) : undefined;
+      return this._routed(principal, { sessionId, jobId }, target, frozenRoute, async ({ target: fresh, current: freshPrincipal, provider, route, expectProject, routeInfo }) => {
+        if (route && !provider) return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: 'unconfigured', reason: 'provider_not_routable', detail: 'This project is routed to another provider environment, but the configured provider cannot take an argv route.', operationId: op, target: this._publicTarget(fresh), authority, route: routeInfo, repeated: Boolean(existing) };
+        let result;
+        try { result = await withTimeout(provider.begin({ project: fresh.project, agent: carrier, operationId: op, timeoutMs: this.timeoutMs, expectProject }), this.timeoutMs + 2500, provider.name); }
+        catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
+        result = normalizeProviderResult('begin', result);
+        // A routed admission must be for the Project the route expects; otherwise nothing is admitted here.
+        if (route && result.status === 'admitted' && (!result.projectId || String(result.projectId).toLowerCase() !== route.expectedProjectId)) result = { status: 'denied', reason: 'project_mismatch', detail: 'The provider admitted a different Memy Project than this project’s route expects; no admission recorded.' };
+        if (result.status === 'admitted') {
+          // A repeat must describe the same admission; a changed Project or generation is not "still current".
+          if (existing && ((existing.projectId && result.projectId && existing.projectId !== result.projectId) || (Number.isInteger(existing.writeGeneration) && Number.isInteger(result.writeGeneration) && existing.writeGeneration !== result.writeGeneration))) {
+            result = { status: 'denied', reason: 'collection_changed', detail: 'The provider admitted a different Project or generation than the original admission.' };
+          } else {
+            await writeJsonAtomic(this._file('admissions', op), { ...this._owner(freshPrincipal, fresh, op), authority, carrier, provider: this.provider.name, route: MemoryRouteStore.frozen(route), projectId: result.projectId ?? null, writeGeneration: result.writeGeneration ?? null, at: existing?.at || now(), confirmedAt: now() });
+          }
         }
-      }
-      return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, operationId: op, target: this._publicTarget(target), authority, writeGeneration: result.writeGeneration ?? null, repeated: Boolean(existing), latencyMs: result.latencyMs ?? null, note: result.status === 'admitted' ? 'Admitted. Gather the handoff content now and save it with memory_checkpoint under this operationId.' : 'Not admitted; no checkpoint can be saved under this operationId until begin succeeds.' };
+        return { schemaVersion: MEMORY_SCHEMA_VERSION, provider: this.provider.name, status: result.status, reason: result.reason ?? null, detail: result.detail ?? null, operationId: op, target: this._publicTarget(fresh), authority, route: routeInfo, writeGeneration: result.writeGeneration ?? null, repeated: Boolean(existing), latencyMs: result.latencyMs ?? null, note: result.status === 'admitted' ? 'Admitted. Gather the handoff content now and save it with memory_checkpoint under this operationId.' : 'Not admitted; no checkpoint can be saved under this operationId until begin succeeds.' };
+      });
     });
   }
 
@@ -487,15 +634,24 @@ export class MemoryService {
         const document = this._document(supplied, target, current, machine, now(), { authority, attestation });
         frozen = { document, canonical: JSON.stringify(document), payloadHash: suppliedHash, attemptStatus: machine.attemptStatus, authority };
       }
-      const base = { ...this._owner(current, target, op), authority, carrier, provider: this.provider.name, payloadHash: frozen.payloadHash };
-      // Durable first, send second: if this process dies after the provider accepted the bytes,
-      // the retry still finds the same observed_at and content on disk.
+      const base = { ...this._owner(current, target, op), authority, carrier, provider: this.provider.name, route: admission.route ?? null, payloadHash: frozen.payloadHash };
+      // The route is revalidated under the project gate immediately before the side effect: the
+      // admission's frozen route must still be the current one, or nothing is sent and the pending
+      // bytes (if any) stay exactly as they are. Only then is the pending record written and the
+      // provider called, with the gate held through the call.
       const attempts = (pending?.attempts || index?.attempts || 0) + 1;
-      await writeJsonAtomic(this._file('pending', op), { ...base, frozen, at: pending?.at || index?.at || now(), lastAttemptAt: now(), lastStatus: 'in_flight', lastReason: null, attempts });
-      let result;
-      try { result = await withTimeout(this.provider.save({ project: target.project, agent: carrier, operationId: op, canonical: frozen.canonical, document: frozen.document, timeoutMs: this.timeoutMs }), this.timeoutMs + 2500, this.provider.name); }
-      catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
-      result = normalizeProviderResult('save', result);
+      const sent = await this._routed(principal, { sessionId: input.sessionId, jobId: input.jobId }, target, admission.route ?? null, async ({ provider, route, expectProject }) => {
+        if (route && !provider) return { status: 'unconfigured', reason: 'provider_not_routable', detail: 'This project is routed to another provider environment, but the configured provider cannot take an argv route.' };
+        // Durable first, send second: if this process dies after the provider accepted the bytes,
+        // the retry still finds the same observed_at and content on disk.
+        await writeJsonAtomic(this._file('pending', op), { ...base, frozen, at: pending?.at || index?.at || now(), lastAttemptAt: now(), lastStatus: 'in_flight', lastReason: null, attempts });
+        let result;
+        try { result = await withTimeout(provider.save({ project: target.project, agent: carrier, operationId: op, canonical: frozen.canonical, document: frozen.document, timeoutMs: this.timeoutMs, expectProject }), this.timeoutMs + 2500, provider.name); }
+        catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200) }; }
+        if (route && result?.status === 'saved' && (!result.projectId || result.projectId.toLowerCase() !== route.expectedProjectId)) result = { status: 'error', reason: 'protocol', detail: 'The save receipt names a different Memy Project than this project’s route expects; not recorded as saved.' };
+        return result;
+      });
+      let result = normalizeProviderResult('save', sent);
       // A receipt must describe the admission this operation was begun under.
       if (result.status === 'saved' && ((admission.projectId && result.projectId && admission.projectId !== result.projectId) || (Number.isInteger(admission.writeGeneration) && Number.isInteger(result.writeGeneration) && admission.writeGeneration !== result.writeGeneration))) {
         result = { status: 'error', reason: 'protocol', detail: 'The save receipt names a different Project or write generation than this operation’s admission; not recorded as saved.' };
