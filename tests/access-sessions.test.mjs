@@ -402,38 +402,78 @@ test('CLI: --json is a global boolean flag, so it may precede another option; it
   assert.deepEqual(parseArgs(['access', 'session', 'list', '--principal', 'grok', '--json']).values, { principal: 'grok', json: true });
 });
 
-test('tmux pane listing is locale-independent: a printable sentinel separates fields, underscores in names and paths are preserved, and an unparseable line is an error rather than a pane', async () => {
-  const lines = [];
-  const fake = async argv => { lines.push(argv); return { code: 0, stdout: `%0<cao-sep>my_session<cao-sep>0<cao-sep>1<cao-sep>4242<cao-sep>0<cao-sep>17<cao-sep>claude<cao-sep>/Users/x/my_project_dir\n%7<cao-sep>s2<cao-sep>3<cao-sep>0<cao-sep>99<cao-sep>1<cao-sep>0<cao-sep>sh<cao-sep>/tmp/with<cao-sep>sentinel\n`, stderr: '' }; };
-  const tmux = new Tmux({ socket: null, command: fake });
+test('tmux pane listing reads each free-form field on its own and verifies it round-trip: a delimiter-looking session name or command, tabs, newlines and CJK in a path are exact; a value tmux does not confirm is an explicit error, never a guessed pane', async () => {
+  // A miniature tmux: ids, a numeric line per pane, a free-form field per request, and the
+  // #{==:#{field},literal} comparison evaluated against the stored (possibly lossy-rendered) value.
+  const panesOf = (store, { lossy = false } = {}) => async argv => {
+    const a = argv.slice(argv.indexOf('tmux') + 1).filter(x => x !== '-u' && x !== '-L' && !/^cao-/.test(x));
+    const render = v => (lossy ? String(v).replace(/[^\x20-\x7e]/g, '_') : String(v));
+    if (a[0] === 'list-panes') return { code: 0, stdout: Object.keys(store).map(id => `${id}\n`).join(''), stderr: '' };
+    const id = a[a.indexOf('-t') + 1]; const fmt = a[a.indexOf('-F') + 1]; const p = store[id];
+    if (fmt === '#{pane_pid} #{pane_dead} #{history_size} #{window_index} #{pane_index}') return { code: 0, stdout: `${p.pid} ${p.dead} ${p.history} ${p.window} ${p.index}\n`, stderr: '' };
+    const eq = /^#\{==:#\{(\w+)\},([\s\S]*)\}$/.exec(fmt);
+    if (eq) { const literal = eq[2].replace(/#\}/g, '}').replace(/#,/g, ',').replace(/##/g, '#'); return { code: 0, stdout: `${String(p[eq[1]]) === literal ? 1 : 0}\n`, stderr: '' }; }
+    const field = /^#\{(\w+)\}$/.exec(fmt)[1];
+    return { code: 0, stdout: `${render(p[field])}\n`, stderr: '' };
+  };
+  const odd = { '%1': { pid: 13321, dead: 0, history: 0, window: 1, index: 0, session_name: 'alias<cao-sep>1<cao-sep>0', pane_current_command: 'x<cao-sep>z', pane_current_path: '/tmp/中文 目录/with\ttab\nand newline/#,}' }, '%0': { pid: 13312, dead: 0, history: 7, window: 0, index: 0, session_name: 'control', pane_current_command: 'sleep', pane_current_path: '/Users/x/my_project_dir' } };
+  const tmux = new Tmux({ socket: null, command: panesOf(odd) });
   const panes = await tmux.listPanes();
-  assert.deepEqual(panes[0], { paneId: '%0', target: 'my_session:0.1', panePid: 4242, dead: false, currentCommand: 'claude', currentPath: '/Users/x/my_project_dir', historySize: 17 });
-  assert.equal(panes[1].currentPath, '/tmp/with<cao-sep>sentinel', 'the last field keeps everything, even the sentinel');
-  assert.ok(!lines[0].join(' ').includes('\t'), 'no control character is used as a separator');
-  // Output in the shape a sanitising client produces for the old tab format (underscores): refused, not misread as pane "%0_claude_95599".
-  const sanitised = new Tmux({ socket: null, command: async () => ({ code: 0, stdout: '%0_claude-ho_95599\n', stderr: '' }) });
-  await assert.rejects(sanitised.listPanes(), e => e.code === 'tmux_format_unparsed');
-  const partial = new Tmux({ socket: null, command: async () => ({ code: 0, stdout: 'garbage<cao-sep>s<cao-sep>0<cao-sep>0<cao-sep>1<cao-sep>0<cao-sep>0<cao-sep>sh<cao-sep>/\n', stderr: '' }) });
-  await assert.rejects(partial.listPanes(), e => e.code === 'tmux_format_unparsed');
+  assert.deepEqual(panes.find(x => x.paneId === '%1'), { paneId: '%1', target: 'alias<cao-sep>1<cao-sep>0:1.0', panePid: 13321, dead: false, currentCommand: 'x<cao-sep>z', currentPath: '/tmp/中文 目录/with\ttab\nand newline/#,}', historySize: 0 }, 'review 0834c session_delimiter and command_delimiter shapes read exactly');
+  assert.deepEqual(panes.find(x => x.paneId === '%0'), { paneId: '%0', target: 'control:0.0', panePid: 13312, dead: false, currentCommand: 'sleep', currentPath: '/Users/x/my_project_dir', historySize: 7 });
+  // A client that rewrites bytes (the C-locale rendering) fails the round trip: explicit error, no pane.
+  await assert.rejects(new Tmux({ socket: null, command: panesOf(odd, { lossy: true }) }).listPanes(), e => e.code === 'tmux_value_unverifiable' && e.details.field === 'pane_current_path' && e.details.paneId === '%1');
+  // A value ending in a newline is still exact: tmux appends exactly one terminator and the round trip confirms the rest.
+  const trailing = { '%0': { ...odd['%0'], pane_current_path: '/tmp/dir\n' } };
+  assert.equal((await new Tmux({ socket: null, command: panesOf(trailing) }).listPanes())[0].currentPath, '/tmp/dir\n');
+  // A mismatch tmux reports (any stale or rewritten value) is refused.
+  const mismatch = { '%0': { ...odd['%0'] } }; const liar = panesOf(mismatch);
+  await assert.rejects(new Tmux({ socket: null, command: async argv => { const r = await liar(argv); return argv.some(a => a.startsWith('#{==:')) ? { code: 0, stdout: '0\n', stderr: '' } : r; } }).listPanes(), e => e.code === 'tmux_value_unverifiable');
+  // Non-ids and non-numeric facts are refused.
+  await assert.rejects(new Tmux({ socket: null, command: async argv => (argv.includes('list-panes') ? { code: 0, stdout: '%0_claude-ho_95599\n', stderr: '' } : { code: 0, stdout: '1 0 0 0 0\n', stderr: '' }) }).listPanes(), e => e.code === 'tmux_format_unparsed');
+  await assert.rejects(new Tmux({ socket: null, command: async argv => (argv.includes('list-panes') ? { code: 0, stdout: '%0\n', stderr: '' } : { code: 0, stdout: 'x 0 0 0 0\n', stderr: '' }) }).listPanes(), e => e.code === 'tmux_format_unparsed');
+  // A pane that closes between the id listing and its reads is skipped as vanished, not reported as a parse error.
+  let listed = 0;
+  const vanishing = async argv => { if (argv.includes('list-panes')) { listed += 1; return { code: 0, stdout: listed === 1 ? '%0\n%9\n' : '%0\n', stderr: '' }; } if (argv.includes('%9')) return { code: 0, stdout: '', stderr: '' }; return panesOf(odd)(argv); };
+  const survivors = await new Tmux({ socket: null, command: vanishing }).listPanes();
+  assert.deepEqual(survivors.map(p => p.paneId), ['%0']);
+  assert.equal(Tmux.formatLiteral('a#b,c}d{e'), 'a##b#,c#}d{e');
+  assert.ok(new Tmux({ socket: 'x' }).argv('list-panes').includes('-u'), 'the client is asked for UTF-8 rendering');
 });
 
-test('real tmux: discover under LC_ALL=C and under the default environment reads the same panes, with underscores in the session name and path intact', { skip: !HAVE_TMUX }, async t => {
+test('real tmux: a session named with the old delimiter, a command named with it, and CJK, tab and newline directories are read exactly by a default client and by a clean LC_ALL=C client; discover is read-only', { skip: !HAVE_TMUX }, async t => {
   const f = await fixture(); t.after(f.remove);
-  const dir = path.join(f.base, 'proj_with_underscore'); await fs.mkdir(dir);
+  const mk = async name => { const d = path.join(f.base, name); await fs.mkdir(d); return fs.realpath(d); };
+  const cjk = await mk('目录_中文'); const tab = await mk('with\ttab'); const nl = await mk('with\nnewline'); const plain = await mk('proj_with_underscore'); const odd = await mk('odd#,}chars');
+  // tmux reports the foreground process's own name, so the delimiter-named command has to be a real
+  // executable with that name (a script shows as its shell; copied system binaries do not run on macOS,
+  // a copied node lacks its @rpath libraries). A tiny C program is compiled when a compiler exists.
+  const bin = path.join(f.base, 'bin'); await fs.mkdir(bin); const exe = path.join(bin, 'x<cao-sep>z');
+  let commandCase = true;
+  try { await fs.writeFile(path.join(bin, 'sleeper.c'), '#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n'); execFileSync('cc', ['-o', exe, path.join(bin, 'sleeper.c')], { stdio: 'pipe' }); } catch { commandCase = false; }
   const socket = `cao-test-${crypto.randomBytes(4).toString('hex')}`;
-  execFileSync('tmux', ['-L', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'under_score', '-x', '80', '-y', '20', '-c', dir, 'sh'], { stdio: 'pipe' });
+  execFileSync('tmux', ['-L', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'alias<cao-sep>1<cao-sep>0', '-x', '80', '-y', '20', '-c', plain, 'sleep 60'], { stdio: 'pipe' });
   t.after(() => { try { execFileSync('tmux', ['-L', socket, 'kill-server'], { stdio: 'pipe' }); } catch { /* gone */ } });
+  // new-window's command goes through a shell, so the delimiter-named executable is single-quoted for it;
+  // its -c argument is expanded as a tmux format, so a literal # in the directory is written ## when creating the pane.
+  for (const [d, cmd] of [[cjk, 'sleep 60'], [tab, 'sleep 60'], [nl, 'sleep 60'], [odd, 'sleep 60'], ...(commandCase ? [[plain, `'${exe}'`]] : [])]) execFileSync('tmux', ['-L', socket, 'new-window', '-d', '-c', d.replace(/#/g, '##'), cmd], { stdio: 'pipe' });
+  const expected = commandCase ? 6 : 5;
   const { runCommand } = await import('../src/process.mjs');
   const underC = new Tmux({ socket, command: (argv, opts) => runCommand(argv, { ...opts, env: { PATH: process.env.PATH, LC_ALL: 'C' } }) });
   const normal = new Tmux({ socket });
-  // The pane process has to have exec'd its shell before the two listings are compared (on a slow
-  // runner the first listing can still see tmux itself and its own cwd).
-  await waitFor(async () => (await normal.listPanes())[0]?.currentCommand === 'sh');
+  await waitFor(async () => { const p = await normal.listPanes(); return p.length === expected && p.every(x => x.currentCommand !== 'tmux'); });
   const [a, b] = await Promise.all([underC.listPanes(), normal.listPanes()]);
-  assert.equal(a.length, 1); assert.deepEqual(a, b, 'same panes whatever the client locale');
-  assert.equal(a[0].target, 'under_score:0.0'); assert.ok(a[0].currentPath.endsWith('proj_with_underscore')); assert.match(a[0].paneId, /^%\d+$/); assert.ok(Number.isInteger(a[0].panePid));
+  assert.deepEqual(a, b, 'identical under both client environments');
+  const byPath = Object.fromEntries(a.map(p => [p.currentPath, p]));
+  assert.ok(byPath[cjk] && byPath[tab] && byPath[nl] && byPath[odd], `CJK, tab, newline and #,} paths read exactly: ${Object.keys(byPath).join(' | ')}`);
+  assert.ok(a.every(p => p.target.startsWith('alias<cao-sep>1<cao-sep>0:')), 'the delimiter-looking session name is intact');
+  assert.ok(a.every(p => /^%\d+$/.test(p.paneId) && Number.isInteger(p.panePid) && p.panePid > 0));
+  if (commandCase) {
+    const cmdPane = a.find(p => p.currentCommand === 'x<cao-sep>z');
+    assert.ok(cmdPane, `command named with the delimiter read exactly: ${a.map(p => p.currentCommand).join(' | ')}`); assert.equal(cmdPane.currentPath, plain);
+  } else t.diagnostic('no C compiler: the delimiter-named command case is covered by the fake tmux test only');
   const principals = new PrincipalStore({ root: f.stateRoot });
   const service = new SessionService({ root: f.stateRoot, principals, tmux: underC });
   const discovered = await service.discover();
-  assert.equal(discovered.panes.length, 1); assert.equal(discovered.panes[0].paneId, a[0].paneId); assert.equal(discovered.panes[0].agent, null, 'a plain shell is not an agent; discover is read-only');
+  assert.equal(discovered.panes.length, expected); assert.ok(discovered.panes.every(p => p.agent === null), 'sleep is not an agent; discover is read-only');
 });

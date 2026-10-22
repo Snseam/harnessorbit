@@ -276,7 +276,11 @@ export class Tmux {
     this.socket = socket; this.binary = binary; this.command = command;
   }
 
-  argv(...rest) { return [this.binary, ...(this.socket ? ['-L', this.socket] : []), ...rest]; }
+  // -u asks the client to treat its terminal and output as UTF-8 regardless of the environment it
+  // was started in; without it a client in a C/POSIX locale rewrites non-ASCII and control bytes
+  // of format output as "_". This changes only how this client renders, never the host locale or
+  // the server's configuration.
+  argv(...rest) { return [this.binary, '-u', ...(this.socket ? ['-L', this.socket] : []), ...rest]; }
 
   async run(args, { timeoutMs = 5000 } = {}) {
     const result = await this.command(this.argv(...args), { timeoutMs, maxBytes: 4 * 1048576 });
@@ -284,24 +288,43 @@ export class Tmux {
     return result.stdout;
   }
 
-  // Machine-readable pane listing. tmux's format output may rewrite control characters (a tab
-  // separator included) as "_" depending on the client's locale, so fields are separated by a
-  // printable ASCII sentinel that no pane id, session name, command or number can contain, the one
-  // free-form field (the working directory) comes last so it may contain anything, and every fixed
-  // field is validated. A line that does not parse is an error, never a pane with a made-up id.
-  // Underscores in names and paths are left exactly as they are. Not covered: a working directory
-  // whose name itself contains the sentinel string.
+  // Machine-readable pane listing without a delimiter inside free-form values. Pane ids are listed
+  // one per line and validated. For each pane, the numeric fields come as one line of digits (also
+  // validated), and each free-form field (session name, current command, working directory) is read
+  // on its own and then verified round-trip: tmux is asked whether the field equals the value we
+  // read, with the value escaped into its format language. A value tmux does not confirm (a client
+  // that rewrote bytes, a value whose own trailing newline cannot be distinguished from the line
+  // terminator, any other mismatch) is an explicit error, never an accepted identity or path.
+  // Underscores, CJK, tabs, inner newlines and the format characters # , } are preserved exactly.
+  static formatLiteral(value) { return String(value).replace(/#/g, '##').replace(/,/g, '#,').replace(/}/g, '#}'); }
+
+  async _paneField(paneId, field) {
+    const out = await this.run(['display-message', '-p', '-t', paneId, '-F', `#{${field}}`]);
+    const value = out.endsWith('\n') ? out.slice(0, -1) : out;
+    const confirmed = (await this.run(['display-message', '-p', '-t', paneId, '-F', `#{==:#{${field}},${Tmux.formatLiteral(value)}}`])).trim();
+    invariant(confirmed === '1', 'tmux_value_unverifiable', `tmux did not confirm the ${field} of pane ${paneId} as read; refusing to use an unverified value (a non-UTF-8 client, or a value ending in a newline, cannot be read faithfully).`, { paneId, field });
+    return value;
+  }
+
   async listPanes() {
-    const SEP = '<cao-sep>';
-    const out = await this.run(['list-panes', '-a', '-F', ['#{pane_id}', '#{session_name}', '#{window_index}', '#{pane_index}', '#{pane_pid}', '#{pane_dead}', '#{history_size}', '#{pane_current_command}', '#{pane_current_path}'].join(SEP)]);
-    return out.split('\n').filter(Boolean).map(line => {
-      const parts = line.split(SEP);
-      const [paneId, session, window, index, pid, dead, history, command, ...rest] = parts;
-      const cwd = rest.join(SEP);
-      const valid = parts.length >= 9 && /^%\d+$/.test(paneId) && /^\d+$/.test(window) && /^\d+$/.test(index) && /^\d+$/.test(pid) && /^[01]$/.test(dead) && /^\d+$/.test(history) && typeof session === 'string' && session.length > 0;
-      invariant(valid, 'tmux_format_unparsed', 'tmux list-panes returned a line that does not match the requested format; refusing to guess pane identities.', { line: line.slice(0, 160) });
-      return { paneId, target: `${session}:${window}.${index}`, panePid: Number(pid), dead: dead === '1', currentCommand: command, currentPath: cwd, historySize: Number(history) };
-    });
+    const ids = (await this.run(['list-panes', '-a', '-F', '#{pane_id}'])).split('\n').filter(Boolean);
+    const panes = [];
+    for (const paneId of ids) {
+      invariant(/^%\d+$/.test(paneId), 'tmux_format_unparsed', 'tmux list-panes returned something that is not a pane id; refusing to guess pane identities.', { line: paneId.slice(0, 160) });
+      let numbers;
+      try { numbers = (await this.run(['display-message', '-p', '-t', paneId, '-F', '#{pane_pid} #{pane_dead} #{history_size} #{window_index} #{pane_index}'])).trim(); }
+      catch (error) { if (error.code === 'tmux_failed') numbers = ''; else throw error; }
+      if (numbers === '') {
+        // A pane that closed between the id listing and its reads is simply gone; anything else empty is an error.
+        const still = (await this.run(['list-panes', '-a', '-F', '#{pane_id}'])).split('\n').includes(paneId);
+        if (!still) continue;
+      }
+      const m = /^(\d+) ([01]) (\d+) (\d+) (\d+)$/.exec(numbers);
+      invariant(m, 'tmux_format_unparsed', `tmux returned non-numeric pane facts for ${paneId}.`, { paneId, line: numbers.slice(0, 160) });
+      const [session, command, cwd] = await Promise.all([this._paneField(paneId, 'session_name'), this._paneField(paneId, 'pane_current_command'), this._paneField(paneId, 'pane_current_path')]);
+      panes.push({ paneId, target: `${session}:${m[4]}.${m[5]}`, panePid: Number(m[1]), dead: m[2] === '1', currentCommand: command, currentPath: cwd, historySize: Number(m[3]) });
+    }
+    return panes;
   }
 
   async pane(paneId) {
