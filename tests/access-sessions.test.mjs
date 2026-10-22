@@ -426,6 +426,9 @@ test('real tmux: discover under LC_ALL=C and under the default environment reads
   const { runCommand } = await import('../src/process.mjs');
   const underC = new Tmux({ socket, command: (argv, opts) => runCommand(argv, { ...opts, env: { PATH: process.env.PATH, LC_ALL: 'C' } }) });
   const normal = new Tmux({ socket });
+  // The pane process has to have exec'd its shell before the two listings are compared (on a slow
+  // runner the first listing can still see tmux itself and its own cwd).
+  await waitFor(async () => (await normal.listPanes())[0]?.currentCommand === 'sh');
   const [a, b] = await Promise.all([underC.listPanes(), normal.listPanes()]);
   assert.equal(a.length, 1); assert.deepEqual(a, b, 'same panes whatever the client locale');
   assert.equal(a[0].target, 'under_score:0.0'); assert.ok(a[0].currentPath.endsWith('proj_with_underscore')); assert.match(a[0].paneId, /^%\d+$/); assert.ok(Number.isInteger(a[0].panePid));
