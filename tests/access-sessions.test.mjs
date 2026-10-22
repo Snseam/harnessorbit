@@ -393,3 +393,44 @@ test('review regressions: a pre-identity principal cannot use live sessions unti
   assert.equal((await sessions.status(ready, { sessionId: 'bound' })).state, 'idle');
   assert.equal(tmux.sent.length, 0);
 });
+
+test('CLI: --json is a global boolean flag, so it may precede another option; it takes no value and other commands keep their options', () => {
+  assert.deepEqual(parseArgs(['access', 'session', 'discover', '--json', '--tmux-socket', 'default']).values, { json: true, 'tmux-socket': 'default' });
+  assert.deepEqual(parseArgs(['access', 'session', 'discover', '--tmux-socket', 'default', '--json']).values, { json: true, 'tmux-socket': 'default' });
+  assert.throws(() => parseArgs(['access', 'session', 'discover', '--json=1']), e => e.code === 'invalid_arguments', '--json takes no value');
+  assert.throws(() => parseArgs(['access', 'session', 'discover', '--json', '--json']), e => e.code === 'invalid_arguments');
+  assert.deepEqual(parseArgs(['access', 'session', 'list', '--principal', 'grok', '--json']).values, { principal: 'grok', json: true });
+});
+
+test('tmux pane listing is locale-independent: a printable sentinel separates fields, underscores in names and paths are preserved, and an unparseable line is an error rather than a pane', async () => {
+  const lines = [];
+  const fake = async argv => { lines.push(argv); return { code: 0, stdout: `%0<cao-sep>my_session<cao-sep>0<cao-sep>1<cao-sep>4242<cao-sep>0<cao-sep>17<cao-sep>claude<cao-sep>/Users/x/my_project_dir\n%7<cao-sep>s2<cao-sep>3<cao-sep>0<cao-sep>99<cao-sep>1<cao-sep>0<cao-sep>sh<cao-sep>/tmp/with<cao-sep>sentinel\n`, stderr: '' }; };
+  const tmux = new Tmux({ socket: null, command: fake });
+  const panes = await tmux.listPanes();
+  assert.deepEqual(panes[0], { paneId: '%0', target: 'my_session:0.1', panePid: 4242, dead: false, currentCommand: 'claude', currentPath: '/Users/x/my_project_dir', historySize: 17 });
+  assert.equal(panes[1].currentPath, '/tmp/with<cao-sep>sentinel', 'the last field keeps everything, even the sentinel');
+  assert.ok(!lines[0].join(' ').includes('\t'), 'no control character is used as a separator');
+  // Output in the shape a sanitising client produces for the old tab format (underscores): refused, not misread as pane "%0_claude_95599".
+  const sanitised = new Tmux({ socket: null, command: async () => ({ code: 0, stdout: '%0_claude-ho_95599\n', stderr: '' }) });
+  await assert.rejects(sanitised.listPanes(), e => e.code === 'tmux_format_unparsed');
+  const partial = new Tmux({ socket: null, command: async () => ({ code: 0, stdout: 'garbage<cao-sep>s<cao-sep>0<cao-sep>0<cao-sep>1<cao-sep>0<cao-sep>0<cao-sep>sh<cao-sep>/\n', stderr: '' }) });
+  await assert.rejects(partial.listPanes(), e => e.code === 'tmux_format_unparsed');
+});
+
+test('real tmux: discover under LC_ALL=C and under the default environment reads the same panes, with underscores in the session name and path intact', { skip: !HAVE_TMUX }, async t => {
+  const f = await fixture(); t.after(f.remove);
+  const dir = path.join(f.base, 'proj_with_underscore'); await fs.mkdir(dir);
+  const socket = `cao-test-${crypto.randomBytes(4).toString('hex')}`;
+  execFileSync('tmux', ['-L', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'under_score', '-x', '80', '-y', '20', '-c', dir, 'sh'], { stdio: 'pipe' });
+  t.after(() => { try { execFileSync('tmux', ['-L', socket, 'kill-server'], { stdio: 'pipe' }); } catch { /* gone */ } });
+  const { runCommand } = await import('../src/process.mjs');
+  const underC = new Tmux({ socket, command: (argv, opts) => runCommand(argv, { ...opts, env: { PATH: process.env.PATH, LC_ALL: 'C' } }) });
+  const normal = new Tmux({ socket });
+  const [a, b] = await Promise.all([underC.listPanes(), normal.listPanes()]);
+  assert.equal(a.length, 1); assert.deepEqual(a, b, 'same panes whatever the client locale');
+  assert.equal(a[0].target, 'under_score:0.0'); assert.ok(a[0].currentPath.endsWith('proj_with_underscore')); assert.match(a[0].paneId, /^%\d+$/); assert.ok(Number.isInteger(a[0].panePid));
+  const principals = new PrincipalStore({ root: f.stateRoot });
+  const service = new SessionService({ root: f.stateRoot, principals, tmux: underC });
+  const discovered = await service.discover();
+  assert.equal(discovered.panes.length, 1); assert.equal(discovered.panes[0].paneId, a[0].paneId); assert.equal(discovered.panes[0].agent, null, 'a plain shell is not an agent; discover is read-only');
+});

@@ -284,10 +284,22 @@ export class Tmux {
     return result.stdout;
   }
 
+  // Machine-readable pane listing. tmux's format output may rewrite control characters (a tab
+  // separator included) as "_" depending on the client's locale, so fields are separated by a
+  // printable ASCII sentinel that no pane id, session name, command or number can contain, the one
+  // free-form field (the working directory) comes last so it may contain anything, and every fixed
+  // field is validated. A line that does not parse is an error, never a pane with a made-up id.
+  // Underscores in names and paths are left exactly as they are. Not covered: a working directory
+  // whose name itself contains the sentinel string.
   async listPanes() {
-    const out = await this.run(['list-panes', '-a', '-F', '#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_dead}\t#{pane_current_command}\t#{pane_current_path}\t#{history_size}']);
+    const SEP = '<cao-sep>';
+    const out = await this.run(['list-panes', '-a', '-F', ['#{pane_id}', '#{session_name}', '#{window_index}', '#{pane_index}', '#{pane_pid}', '#{pane_dead}', '#{history_size}', '#{pane_current_command}', '#{pane_current_path}'].join(SEP)]);
     return out.split('\n').filter(Boolean).map(line => {
-      const [paneId, session, window, index, pid, dead, command, cwd, history] = line.split('\t');
+      const parts = line.split(SEP);
+      const [paneId, session, window, index, pid, dead, history, command, ...rest] = parts;
+      const cwd = rest.join(SEP);
+      const valid = parts.length >= 9 && /^%\d+$/.test(paneId) && /^\d+$/.test(window) && /^\d+$/.test(index) && /^\d+$/.test(pid) && /^[01]$/.test(dead) && /^\d+$/.test(history) && typeof session === 'string' && session.length > 0;
+      invariant(valid, 'tmux_format_unparsed', 'tmux list-panes returned a line that does not match the requested format; refusing to guess pane identities.', { line: line.slice(0, 160) });
       return { paneId, target: `${session}:${window}.${index}`, panePid: Number(pid), dead: dead === '1', currentCommand: command, currentPath: cwd, historySize: Number(history) };
     });
   }

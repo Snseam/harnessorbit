@@ -178,6 +178,9 @@ By default `session_send` accepts text only while the session is idle. A binding
 
 ### Operator commands
 
+`--json` is a global boolean flag and may appear anywhere on the line (`access session discover --json --tmux-socket default`). Pane discovery asks tmux for a machine-readable listing separated by a printable sentinel rather than tabs: a tmux client started with a non-UTF-8 or empty locale environment (for example `env -i LC_ALL=C`) rewrites control characters in format output as `_`, which would otherwise turn a whole line into a bogus pane id. Underscores in session names, commands and paths are preserved as they are, the working directory is the last field so it may contain anything, and a line that does not match the requested format is a `tmux_format_unparsed` error, never a guessed pane. The host's locale is not changed.
+
+
 ```sh
 node bin/harnessorbit.mjs access session discover
 node bin/harnessorbit.mjs access session bind --principal grok --pane %3 --id claude-main
