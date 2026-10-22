@@ -15,7 +15,11 @@ import { fixture, FakeHerdr } from './helpers.mjs';
 // (projects/<encoded cwd>/<session>.jsonl) written by the test, a fake pane. No real Claude, no
 // real transcript of this host is read.
 
-const row = (type, extra = {}) => JSON.stringify({ type, uuid: `u-${Math.random().toString(36).slice(2)}`, timestamp: '2026-10-22T00:00:00.000Z', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', isSidechain: false, ...extra }) + '\n';
+// Transcript timestamps are relative to the wall clock: the observer treats rows older than its
+// baseline as history, so a fixed date would turn into history once the real clock passed it.
+const T0 = Date.now() + 3600_000;
+const ts = ms => new Date(T0 + ms).toISOString();
+const row = (type, extra = {}) => JSON.stringify({ type, uuid: `u-${Math.random().toString(36).slice(2)}`, timestamp: ts(0), sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', isSidechain: false, ...extra }) + '\n';
 const assistant = (messageId, stopReason, extra = {}) => row('assistant', { message: { id: messageId, role: 'assistant', stop_reason: stopReason, content: [{ type: 'text', text: 'SECRET BODY NEVER LEAVES' }] }, ...extra });
 
 async function setup(t) {
@@ -53,7 +57,7 @@ test('the native end-turn signal: one agent.turn_finished per provider message i
   results = await observer.tick();
   assert.equal(results[0].native, 'read');
   assert.equal(results[0].emitted, null, 'tool_use rows are not turn boundaries, even while the screen looks ready');
-  await fs.appendFile(transcript, assistant('msg_2', 'end_turn', { timestamp: '2026-10-22T00:01:00.000Z' }) + assistant('msg_2', 'end_turn', { timestamp: '2026-10-22T00:01:00.100Z' }));
+  await fs.appendFile(transcript, assistant('msg_2', 'end_turn', { timestamp: ts(60000) }) + assistant('msg_2', 'end_turn', { timestamp: ts(60100) }));
   results = await observer.tick();
   assert.equal(results[0].emitted.length, 1, 'two content rows with one message id are one logical turn');
   const turn = results[0].emitted[0];
@@ -67,7 +71,7 @@ test('the native end-turn signal: one agent.turn_finished per provider message i
   assert.equal(event.payload.observation, 'native_end_turn');
   assert.equal(event.payload.providerMessageId, 'msg_2');
   assert.equal(event.payload.providerSessionId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
-  assert.equal(event.payload.providerTimestamp, '2026-10-22T00:01:00.000Z');
+  assert.equal(event.payload.providerTimestamp, ts(60000));
   assert.ok(!JSON.stringify(event).includes('SECRET BODY'), 'message bodies never leave the file');
   // A torn tail is left for the next read; completing it emits exactly once.
   const partial = assistant('msg_3', 'end_turn');
@@ -156,8 +160,8 @@ test('review regressions: an oversized complete line is skipped with a recorded 
   const { transcript, codex, coop, observer, stateRoot } = await setup(t);
   await fs.writeFile(transcript, '');
   assert.equal((await observer.tick())[0].native, 'baseline');
-  const huge = JSON.stringify({ type: 'assistant', uuid: 'u-huge', timestamp: '2026-10-22T00:00:01.000Z', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', isSidechain: false, message: { id: 'msg_huge', role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'text', text: 'X'.repeat(8 * 1048576 + 4096) }] } }) + '\n';
-  await fs.appendFile(transcript, huge + assistant('msg_after', 'end_turn', { timestamp: '2026-10-22T00:00:02.000Z' }));
+  const huge = JSON.stringify({ type: 'assistant', uuid: 'u-huge', timestamp: ts(1000), sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', isSidechain: false, message: { id: 'msg_huge', role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'text', text: 'X'.repeat(8 * 1048576 + 4096) }] } }) + '\n';
+  await fs.appendFile(transcript, huge + assistant('msg_after', 'end_turn', { timestamp: ts(2000) }));
   const first = await observer.tick();
   assert.equal(first[0].native, 'skipped_oversized');
   assert.equal(first[0].emitted, null);
@@ -173,7 +177,7 @@ test('review regressions: an oversized complete line is skipped with a recorded 
 test('review regressions: a same-size replacement is a new source generation (reset), its post-baseline turn is recovered once, and narrowed project or agent scope blocks native emission', async t => {
   const { transcript, codex, coop, observer, stateRoot, sessions, grok, project, base } = await setup(t);
   const principals = new PrincipalStore({ root: stateRoot });
-  await fs.writeFile(transcript, assistant('msg_a', 'end_turn', { timestamp: '2026-10-22T00:00:00.000Z', pad: 'x'.repeat(200) }));
+  await fs.writeFile(transcript, assistant('msg_a', 'end_turn', { timestamp: ts(0), pad: 'x'.repeat(200) }));
   assert.equal((await observer.tick())[0].native, 'baseline');
   const baselineSize = (await fs.stat(transcript)).size;
   // Rotate: rename the file away and write a replacement of exactly the same size with a new post-baseline turn.
