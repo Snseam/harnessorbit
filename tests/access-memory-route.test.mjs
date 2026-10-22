@@ -26,7 +26,7 @@ const envelope = (sub, fields) => ({ schema: 'memy.handoff.v1', command: sub, ..
 
 // The fake CLI answers per the handoff contract; which Project it "is" depends on the argv prefix.
 function fakeCommand(projectFor = () => PROJECT_DEFAULT) {
-  const calls = []; const hooks = { onSave: null, saveMode: 'ok' };
+  const calls = []; const hooks = { onSave: null, saveMode: 'ok', recall: null };
   const fn = async (argv, opts) => {
     const at = argv.indexOf('handoff'); const sub = argv[at + 1]; const prefix = argv.slice(0, at);
     const value = flag => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : null);
@@ -36,7 +36,7 @@ function fakeCommand(projectFor = () => PROJECT_DEFAULT) {
     if (sub === 'save' && hooks.saveMode === 'hang') return new Promise(() => {});
     if (sub === 'save' && hooks.onSave) await hooks.onSave(call);
     const out = sub === 'status' ? envelope('status', { status: 'ok', project_id: project, collection: { write_enabled: true, write_generation: 1 } })
-      : sub === 'recall' ? envelope('recall', { status: 'ok', project_id: project, items: [] })
+      : sub === 'recall' ? (hooks.recall ? hooks.recall(envelope('recall', { status: 'ok', project_id: project, items: [] }), call) : envelope('recall', { status: 'ok', project_id: project, items: [] }))
         : sub === 'begin' ? envelope('begin', { status: 'admitted', operation_id: call.operationId, project_id: project, write_generation: 1 })
           : envelope('save', { status: 'saved', operation_id: call.operationId, project_id: project, write_generation: 1, memory_ids: [crypto.randomUUID()], deduplicated: false });
     return { code: 0, stdout: `${JSON.stringify(out)}\n`, stderr: '' };
@@ -338,4 +338,42 @@ test('gate-wait identity: a job that moved to a new attempt while a repeat begin
   assert.equal((await memory.checkpoint(f.principal, { jobId: f.jobA, operationId: 'op-w5', ...body() })).status, 'saved');
   // Recall during an attempt change is also refused rather than answered for a different identity.
   await assert.rejects(during(() => memory.recall(f.principal, { jobId: f.jobA, question: 'what was decided?' }), async () => { revision = 6; }), e => e.code === 'operation_conflict');
+});
+
+test('routed recall: a degraded answer from another Project is denied with no items, a same-Project degraded answer is delivered as degraded, a routed answer without project_id is a protocol error, and unmapped recall is unaffected', async t => {
+  const { memory, principal, project, jobA, jobB, routes, argvA, command } = await setup(t);
+  await routes.bind({ hostProject: project, argv: argvA, providerCheckout: '/x', expectedProjectId: PROJECT_A });
+  const item = { memory_id: crypto.randomUUID(), content: 'SOURCE OF ANOTHER PROJECT', memory_type: 'handoff', provenance: { source: 'test' } };
+  // Review case R2-degraded: valid memy.handoff.v1 recall receipt, status ok, degraded true, project_id B while the route expects A.
+  command.hooks.recall = out => ({ ...out, degraded: true, project_id: PROJECT_B, items: [item] });
+  const foreign = await memory.recall(principal, { jobId: jobA, question: 'what is known?' });
+  assert.equal(foreign.status, 'denied'); assert.equal(foreign.reason, 'project_mismatch'); assert.deepEqual(foreign.items, []); assert.equal(foreign.truncated, false);
+  assert.ok(!JSON.stringify(foreign).includes('SOURCE OF ANOTHER PROJECT'), 'no foreign item content reaches the caller');
+  assert.equal(foreign.route.expectedProjectId, PROJECT_A);
+  // Non-degraded ok from the other Project: same refusal.
+  command.hooks.recall = out => ({ ...out, project_id: PROJECT_B, items: [item] });
+  assert.equal((await memory.recall(principal, { jobId: jobA, question: 'what is known?' })).reason, 'project_mismatch');
+  // Control: same Project, degraded, keeps working as degraded with its items.
+  command.hooks.recall = out => ({ ...out, degraded: true, project_id: PROJECT_A, items: [item], notice: 'partial index' });
+  const same = await memory.recall(principal, { jobId: jobA, question: 'what is known?' });
+  assert.equal(same.status, 'degraded'); assert.equal(same.items.length, 1); assert.equal(same.items[0].content, item.content); assert.equal(same.route.expectedProjectId, PROJECT_A);
+  // Control: same Project, ok.
+  command.hooks.recall = out => ({ ...out, items: [item] });
+  assert.equal((await memory.recall(principal, { jobId: jobA, question: 'what is known?' })).status, 'ok');
+  // A routed answer without project_id cannot be delivered: protocol error, no items (even when degraded, even with items).
+  for (const shape of [out => { const { project_id: _p, ...rest } = out; return { ...rest, items: [item] }; }, out => { const { project_id: _p, ...rest } = out; return { ...rest, degraded: true, items: [item] }; }]) {
+    command.hooks.recall = shape;
+    const missing = await memory.recall(principal, { jobId: jobA, question: 'what is known?' });
+    assert.equal(missing.status, 'error'); assert.equal(missing.reason, 'protocol'); assert.deepEqual(missing.items, []);
+  }
+  // Unmapped project: the same-machine default is unchanged by routing, degraded or not, whatever project_id it reports.
+  command.hooks.recall = out => ({ ...out, degraded: true, project_id: PROJECT_B, items: [item] });
+  const unmapped = await memory.recall(principal, { jobId: jobB, question: 'what is known?' });
+  assert.equal(unmapped.status, 'degraded'); assert.equal(unmapped.items.length, 1); assert.equal(unmapped.route, null);
+  assert.ok(!command.calls.filter(c => c.cwd !== project).some(c => c.argv.includes('--expect-project')));
+  // Existing protocol refusals for missing or invalid project_id on status/begin/save are untouched.
+  command.hooks.recall = null;
+  const routed = memory.provider.withArgv(argvA);
+  const st = await routed.status({ project, agent: 'claude', expectProject: PROJECT_A });
+  assert.equal(st.status, 'ok');
 });

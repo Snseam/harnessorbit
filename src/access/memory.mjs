@@ -439,7 +439,13 @@ export class MemoryService {
       let result;
       try { result = await withTimeout(provider.recall({ project: target.project, agent: carrier, question: q, topK, exclude, timeoutMs: this.timeoutMs, expectProject }), this.timeoutMs + 2500, provider.name); }
       catch (error) { result = { status: 'error', reason: 'protocol', detail: clip(String(error?.code || error?.message || 'provider failed'), 200), items: [] }; }
-      if (route && result?.status === 'ok' && result.projectId && String(result.projectId).toLowerCase() !== route.expectedProjectId) result = { status: 'denied', reason: 'project_mismatch', detail: 'The provider answered for a different Memy Project than this project’s route expects.', items: [] };
+      // Every answer that could hand items to the caller (ok or degraded, or anything carrying items)
+      // must name the Project the route expects. A different Project is denied with no items; a
+      // missing Project on a routed recall is a protocol error, never a delivery.
+      if (route && result && (['ok', 'degraded'].includes(result.status) || (Array.isArray(result.items) && result.items.length))) {
+        if (!result.projectId) result = { status: 'error', reason: 'protocol', detail: 'The provider’s recall answer carries no project_id; a routed recall cannot be delivered without it.', items: [] };
+        else if (String(result.projectId).toLowerCase() !== route.expectedProjectId) result = { status: 'denied', reason: 'project_mismatch', detail: 'The provider answered for a different Memy Project than this project’s route expects.', items: [] };
+      }
       return { target, routeInfo, result };
     });
     let result = normalizeProviderResult('recall', raw);
