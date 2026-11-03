@@ -3,17 +3,43 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { StorageService } from './storage.mjs';
 import { MonitorCollector } from './collector.mjs';
 import { writeJsonAtomic } from '../state.mjs';
 import { publicSnapshot } from './model.mjs';
 
 const assetDirectory = fileURLToPath(new URL('../../web/monitor/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html; charset=utf-8']], ['/index.html', ['index.html', 'text/html; charset=utf-8']], ['/app.mjs', ['app.mjs', 'text/javascript; charset=utf-8']], ['/styles.css', ['styles.css', 'text/css; charset=utf-8']], ['/conversations.mjs', ['conversations.mjs', 'text/javascript; charset=utf-8']], ['/conversations.css', ['conversations.css', 'text/css; charset=utf-8']]]);
+for (const [file, mime] of [['storage.html', 'text/html'], ['storage.mjs', 'text/javascript'], ['storage.css', 'text/css']]) {
+  assets.set('/' + file, [file, mime + '; charset=utf-8']);
+}
 const sameSecret = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const bearer = req => typeof req.headers.authorization === 'string' ? /^Bearer (.+)$/.exec(req.headers.authorization)?.[1] : null;
 const proof = secret => createHash('sha256').update(secret).digest('hex');
 
-export async function startMonitorServer({ token, ownerToken, port = 0, collector, refreshMs = 2000, assetsRoot = assetDirectory } = {}) {
+const storageErrors = new Map([['storage_ineligible', 409], ['storage_changed', 409], ['storage_plan_expired', 410]]);
+const MAX_STORAGE_BODY = 1024;
+async function readStorageId(req, field) {
+  const idPattern = field === 'id' ? /^[0-9a-f]{32}$/ : /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(req.headers['content-type'] || '')) return { status: 415, error: 'json_required' };
+  const oversized = { status: 413, error: 'body_too_large' };
+  if (Number(req.headers['content-length']) > MAX_STORAGE_BODY) return oversized;
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    size += chunk.length;
+    if (size > MAX_STORAGE_BODY) return oversized;
+    chunks.push(chunk);
+  }
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (body && Object.keys(body).length === 1 && Object.hasOwn(body, field) &&
+        typeof body[field] === 'string' && idPattern.test(body[field])) return { id: body[field] };
+  } catch { /* Invalid input receives the same public error. */ }
+  return { status: 400, error: 'invalid_storage_request' };
+}
+
+export async function startMonitorServer({ token, ownerToken, all = false, storageToken, storageService, port = 0, collector, refreshMs = 2000, assetsRoot = assetDirectory } = {}) {
   if (!token || !ownerToken) throw new Error('Monitor authentication is required.');
   let snapshot = null, collection = null, closed = false;
   let collectedAt = 0;
@@ -54,6 +80,32 @@ export async function startMonitorServer({ token, ownerToken, port = 0, collecto
         json(res, 200, { stopping: true });
         setImmediate(() => close()); return;
       }
+      if (['/api/storage', '/api/storage/plan', '/api/storage/execute'].includes(url.pathname)) {
+        if (all !== true || !storageService) return json(res, 403, { error: 'storage_requires_all' });
+        if (url.pathname === '/api/storage') {
+          if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' });
+          if (!sameSecret(bearer(req), token)) return json(res, 401, { error: 'unauthorized' });
+          try { return json(res, 200, await storageService.audit()); }
+          catch { return json(res, 503, { error: 'storage_unavailable' }); }
+        }
+        if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+        if (!storageToken) return json(res, 403, { error: 'storage_read_only' });
+        if (!sameSecret(bearer(req), storageToken)) return json(res, 401, { error: 'unauthorized' });
+        if ((origin && origin !== 'http://' + req.headers.host) ||
+            (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin')) {
+          return json(res, 403, { error: 'origin_rejected' });
+        }
+        const planning = url.pathname === '/api/storage/plan';
+        const input = await readStorageId(req, planning ? 'id' : 'planId');
+        if (input.error) return json(res, input.status, { error: input.error });
+        try {
+          const result = planning ? await storageService.plan(input.id) : await storageService.execute(input.id);
+          return json(res, 200, result);
+        } catch (error) {
+          const status = storageErrors.get(error?.code);
+          return json(res, status || 503, { error: status ? error.code : 'storage_unavailable' });
+        }
+      }
       if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'read_only' });
       if (url.pathname === '/api/snapshot') {
         if (!sameSecret(bearer(req), token)) return json(res, 401, { error: 'unauthorized' });
@@ -89,7 +141,11 @@ async function main() {
   if (position < 0 || !process.argv[position + 1]) throw new Error('Monitor config is required.');
   const config = JSON.parse(await fs.readFile(process.argv[position + 1], 'utf8'));
   const collector = new MonitorCollector(config);
-  const service = await startMonitorServer({ token: config.token, ownerToken: config.ownerToken, port: config.port, collector });
+  const all = config.all === true && !config.project && !config.runId;
+  const storageService = all ? new StorageService(config.root) : null;
+  const service = await startMonitorServer({ token: config.token, ownerToken: config.ownerToken, port: config.port,
+    all, storageService, storageToken: all && config.manageStorage === true ? config.storageToken : null, collector });
+
   await writeJsonAtomic(config.readyFile, { pid: process.pid, endpoint: service.endpoint, ownerProof: proof(config.ownerToken) });
   process.once('SIGTERM', service.close);
   process.once('SIGINT', service.close);

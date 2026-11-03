@@ -1,6 +1,7 @@
 import { createConversationView } from './conversations.mjs';
 
 let conversationView = null;
+export const STORAGE_TOKEN_KEY = 'cao.monitor.storageToken';
 const TOKEN_KEY = 'cao.monitor.token';
 const LANG_KEY = 'cao.monitor.lang';
 const POLL_MS = 2000;
@@ -30,6 +31,7 @@ const COPY = {
     skip: 'Skip to activity',
     appName: 'CAO · Agent Monitor',
     title: 'CAO · Agent Monitor',
+    storage: 'Storage',
     language: 'Language',
     refresh: 'Refresh',
     retry: 'Retry',
@@ -183,6 +185,7 @@ const COPY = {
     skip: '跳到活动列表',
     appName: 'CAO · Agent 看板',
     title: 'CAO · Agent 看板',
+    storage: '存储',
     language: '语言',
     refresh: '刷新',
     retry: '重试',
@@ -365,8 +368,12 @@ export function captureTokenFromLocation(location, history, storage) {
   const raw = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
   const params = new URLSearchParams(raw);
   const token = params.get('token');
-  if (token) {
-    storage.setItem(TOKEN_KEY, token);
+  const manage = params.get('storageToken');
+  if (params.has('token') || params.has('storageToken')) {
+    if (token) storage.setItem(TOKEN_KEY, token);
+    if (manage) storage.setItem(STORAGE_TOKEN_KEY, manage);
+    else storage.removeItem(STORAGE_TOKEN_KEY);
+    params.delete('storageToken');
     params.delete('token');
     const rest = params.toString();
     history.replaceState(null, '', `${location.pathname}${location.search}${rest ? `#${rest}` : ''}`);
@@ -920,6 +927,7 @@ function setConnection(next) {
 }
 
 function renderScope(snapshot) {
+  document.getElementById('storage-link').hidden = snapshot?.scope.mode !== 'all';
   const line = document.getElementById('scope-line');
   if (!snapshot) {
     line.textContent = '';
