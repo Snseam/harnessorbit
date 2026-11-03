@@ -74,6 +74,18 @@ Scope options:
 
 Use the same `--state-dir` for monitor commands and HarnessOrbit runs you want to observe. A run created in one state directory is invisible to a monitor started with another state directory.
 
+## Storage
+
+Open the Storage page from a monitor started with `--all` to inspect disk use under its configured state directory. Each sample records the day and bytes observed. Open the page on successive days to see changes. Protected items include working trees, attachments and authoritative run records.
+
+To review and delete eligible exports, start a management view locally:
+
+```bash
+node bin/harnessorbit.mjs monitor start --all --manage-storage --id storage --open
+```
+
+Select an eligible export, review its name and size, then confirm removal. Eligible files are timestamped status or inspect JSON exports directly under the matching work directory. The scanner validates the export against its closed run and limits each JSON read to 64 MiB. Sizes count allocated blocks. Daily samples include monitor metadata as measured before the new sample is written. If interrupted during removal, inspect the private recovery manifest and held export under the state directory’s `.storage-monitor/hold-*/`. If the file changes after preview, refresh and review it again. The management link grants permission to delete eligible files on this machine. Keep it private. The ordinary monitor status link grants read access.
+
 ## Project and Conversation views
 
 The UI starts in the Project view. Project view shows the current project scope selected by the CLI and keeps the existing project/run/task grouping. Conversation view focuses on one Codex conversation and its agent graph. You can switch between the views in the page; there is no separate CLI view flag.
@@ -86,7 +98,7 @@ Titles and names come from explicit native metadata when available. HarnessOrbit
 
 ## Security model
 
-The monitor server binds to `127.0.0.1` and rejects unexpected Host, Origin, query-token, and write requests. `monitor start` returns a URL with the UI token in the fragment, for example:
+The monitor server binds to `127.0.0.1` and rejects unexpected Host, Origin, and query-token requests. `monitor start` returns a URL with the UI token in the fragment, for example:
 
 ```text
 http://127.0.0.1:49152/#token=...
@@ -94,7 +106,7 @@ http://127.0.0.1:49152/#token=...
 
 The fragment is not sent in HTTP requests. The browser UI stores it in `sessionStorage` and sends it as an Authorization header for `/api/snapshot`. Internal health and stop endpoints use a separate owner token stored in the HarnessOrbit state directory.
 
-The page is read-only. `monitor stop` calls the monitor's owner stop endpoint; it does not stop Herdr, Codex, Claude, HarnessOrbit tasks, subagents, terminals, or provider requests.
+The agent activity page is read-only. `monitor stop` calls the monitor's owner stop endpoint; it does not stop Herdr, Codex, Claude, HarnessOrbit tasks, subagents, terminals, or provider requests.
 
 ## What data crosses the browser boundary
 

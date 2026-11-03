@@ -74,6 +74,18 @@ Scope 参数：
 
 monitor 命令和要观察的 HarnessOrbit runs 必须使用同一个 `--state-dir`。在一个 state directory 创建的 run，对另一个 state directory 启动的 monitor 不可见。
 
+## 存储
+
+使用 `--all` 启动看板后，从「存储」入口查看当前状态目录的磁盘用量。页面按采样日期记录占用，跨日查看后可比较变化。工作树、附件和权威任务记录列入受保护空间。
+
+要主动删除可回收的导出文件，在本机启动管理视图：
+
+```bash
+node bin/harnessorbit.mjs monitor start --all --manage-storage --id storage --open
+```
+
+选择可回收的导出文件，预览名称和大小后确认删除。候选文件限于对应工作目录直属的、按时间戳命名的 status 或 inspect JSON 导出。系统核实所属 run 已关闭，每份 JSON 最多读取 64 MiB。页面按已分配的磁盘块统计大小，每日样本包含写入本次样本前测得的看板数据。如果删除被中断，可在状态目录的 `.storage-monitor/hold-*/` 中查看恢复清单和隔离文件。如果文件在预览后发生变化，需要刷新并重新预览。管理链接具有删除权限，请仅在本机使用。常规 `monitor status` 链接提供只读访问。
+
 ## Project view 与 Conversation view
 
 UI 默认进入 Project view。Project view 显示 CLI 选定的当前项目 scope，并保留 project/run/task 分组。Conversation view 聚焦一个 Codex 对话及其 agent graph。两种视图在页面内切换；没有单独的 CLI view 参数。
@@ -86,7 +98,7 @@ Conversation view 可以显示当前 monitor 关联的 Codex 对话，也可以�
 
 ## 安全模型
 
-monitor server 只绑定 `127.0.0.1`，并拒绝异常 Host、Origin、query-token 和写请求。`monitor start` 返回的 URL 会把 UI token 放在 fragment 中，例如：
+monitor server 只绑定 `127.0.0.1`，并拒绝异常 Host、Origin 和 query-token 请求。`monitor start` 返回的 URL 会把 UI token 放在 fragment 中，例如：
 
 ```text
 http://127.0.0.1:49152/#token=...
@@ -94,7 +106,7 @@ http://127.0.0.1:49152/#token=...
 
 fragment 不会随 HTTP 请求发送。浏览器 UI 会把它保存到 `sessionStorage`，并用 Authorization header 请求 `/api/snapshot`。内部 health/stop endpoint 使用另一个 owner token，该 token 保存在 HarnessOrbit state directory 中。
 
-页面是只读的。`monitor stop` 调用 monitor 的 owner stop endpoint；它不会停止 Herdr、Codex、Claude、HarnessOrbit task、subagent、terminal 或 provider 请求。
+Agent 活动页是只读的。`monitor stop` 调用 monitor 的 owner stop endpoint；它不会停止 Herdr、Codex、Claude、HarnessOrbit task、subagent、terminal 或 provider 请求。
 
 ## 浏览器收到哪些数据
 

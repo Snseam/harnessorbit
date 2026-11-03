@@ -93,7 +93,7 @@ The legacy node bin/cao.mjs entrypoint remains supported.
   mode status [--thread ID]
   mode disable [--thread ID]
 
-  monitor start [--project PATH | --run ID | --all] [--open] [--id NAME] [--port 0]
+  monitor start [--project PATH | --run ID | --all [--manage-storage]] [--open] [--id NAME] [--port 0]
   monitor status [--id NAME]
   monitor stop [--id NAME]
   monitor snapshot [--project PATH | --run ID | --all]
@@ -169,7 +169,7 @@ const optionsByCommand = {
   'mode enable': ['thread', 'project', 'agent', 'profile', 'max-parallel', 'max-attempts', 'strategy', 'preference', 'calibration-policy', 'probe-budget-ms'],
   'mode status': ['thread'], 'mode disable': ['thread'],
   'gateway start': ['profile', 'id', 'allow-shared'], 'gateway status': ['id'], 'gateway stop': ['id'], 'gateway list': [],
-  'monitor start': ['project', 'run', 'all', 'open', 'id', 'port', 'coordinator', 'codex-home', 'claude-home'],
+  'monitor start': ['project', 'run', 'all', 'manage-storage', 'open', 'id', 'port', 'coordinator', 'codex-home', 'claude-home'],
   'monitor status': ['id'], 'monitor stop': ['id'],
   'monitor snapshot': ['project', 'run', 'all', 'coordinator', 'codex-home', 'claude-home'],
 };
@@ -187,7 +187,7 @@ export function parseArgs(argv) {
     }
     const [name, ...inlineParts] = token.slice(2).split('=');
     if (Object.hasOwn(values, name)) throw new OrchestratorError('invalid_arguments', `Duplicate option: --${name}`);
-    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive'].includes(name)
+    const booleanOption = ['help', 'today', 'table', 'default', 'clear', 'allow-shared', 'stdin', 'all', 'manage-storage', 'open', 'integrate', 'repair-reports', 'quick', 'refresh', 'confirm-stopped', 'retry', 'ack-stopped', 'record', 'no-host', 'adaptive'].includes(name)
       || (name === 'output' && command !== 'harness benchmark');
     if (booleanOption) {
       if (inlineParts.length) throw new OrchestratorError('invalid_arguments', `--${name} takes no value`);
@@ -222,6 +222,7 @@ export async function main(argv = process.argv.slice(2)) {
   const orchestrator = new Orchestrator({ stateRoot: o['state-dir'], herdr: new Herdr({ binary: process.env.CAO_HERDR_BIN || 'herdr' }) });
   const taskArgs = () => [required('run'), required('task')];
   const monitorScope = async () => {
+    if (o['manage-storage'] && !o.all) throw new OrchestratorError('invalid_arguments', '--manage-storage requires --all.');
     if (o.all && (o.project || o.run)) throw new OrchestratorError('invalid_arguments', '--all cannot be combined with --project or --run.');
     let project = o.project ? await fs.realpath(path.resolve(o.project)) : null;
     if (o.run) {
@@ -279,7 +280,7 @@ export async function main(argv = process.argv.slice(2)) {
       } finally { process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt); }
     }
     case 'monitor start': {
-      const monitor = await new MonitorManager({ root: profiles.root }).start({ ...await monitorScope(), id: o.id || 'default', port: o.port === undefined ? 0 : Number(o.port) });
+      const monitor = await new MonitorManager({ root: profiles.root }).start({ ...await monitorScope(), manageStorage: !!o['manage-storage'], id: o.id || 'default', port: o.port === undefined ? 0 : Number(o.port) });
       return { ...monitor, browserOpened: o.open ? await openMonitor(monitor.url) : false };
     }
     case 'monitor status': return new MonitorManager({ root: profiles.root }).status(o.id || 'default');

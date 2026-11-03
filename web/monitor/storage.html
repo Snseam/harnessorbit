@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Storage · HarnessOrbit</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./storage.css">
+  <script type="module" src="./storage.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#inventory" data-copy="skip">Skip to inventory</a>
+  <header class="top">
+    <div><h1 data-copy="title">Storage</h1><a href="./" data-copy="back">Agent Monitor</a></div>
+    <div class="top-actions">
+      <button id="refresh" data-copy="refresh">Refresh</button>
+      <div class="lang" role="group" aria-labelledby="language">
+        <span class="visually-hidden" id="language" data-copy="language">Language</span>
+        <button id="en" lang="en">EN</button><button id="zh" lang="zh-CN">中文</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <p id="status" role="status"></p>
+    <div id="report" hidden>
+      <section aria-labelledby="usage-title">
+        <h2 id="usage-title" data-copy="usage">Storage usage</h2>
+        <dl class="metrics">
+          <div><dt data-copy="total">Observed size</dt><dd id="total"></dd></div>
+          <div><dt data-copy="eligible">Reclaimable</dt><dd id="eligible"></dd></div>
+          <div><dt data-copy="protected">Protected</dt><dd id="protected"></dd></div>
+        </dl>
+      </section>
+      <section aria-labelledby="history-title">
+        <h2 id="history-title" data-copy="trend">Recorded usage</h2>
+        <div id="history"></div>
+      </section>
+      <section aria-labelledby="inventory">
+        <h2 id="inventory" tabindex="-1" data-copy="items">Storage inventory</h2>
+        <p id="access"></p>
+        <ul id="items"></ul>
+      </section>
+    </div>
+  </main>
+  <dialog id="preview" aria-labelledby="plan-title" aria-describedby="plan-detail">
+    <h2 id="plan-title" data-copy="confirmTitle">Confirm cleanup</h2>
+    <p id="plan-detail"></p>
+    <div class="actions">
+      <button id="cancel" autofocus data-copy="cancel">Cancel</button>
+      <button id="execute" data-copy="execute">Confirm cleanup</button>
+    </div>
+  </dialog>
+</body>
+</html>
